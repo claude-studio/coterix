@@ -1,6 +1,6 @@
 {
   "name": "coterix",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Coterix — an orchestration layer for multi-agent systems.",
   "keywords": [
     "agents",
