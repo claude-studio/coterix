@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"charm.land/bubbles/v2/spinner"
@@ -28,6 +29,17 @@ const (
 	promptResume
 )
 
+// logIcon is a deterministic event-kind hint for the feed icon column. It is
+// injected where the event is appended instead of being inferred from text.
+type logIcon uint8
+
+const (
+	logIconNone logIcon = iota
+	logIconStart
+	logIconDone
+	logIconFail
+)
+
 type logEntry struct {
 	Step    string
 	Role    string
@@ -35,6 +47,8 @@ type logEntry struct {
 	Stream  runner.Stream
 	Text    string
 	Attempt int
+	At      time.Time
+	Icon    logIcon
 }
 
 type artifactsLoadedMsg struct {
@@ -62,6 +76,8 @@ type model struct {
 	activeRole          string
 	activeCLI           string
 	operation           operationKind
+	now                 func() time.Time
+	stages              stageClock
 	logs                []logEntry
 	artifacts           artifactData
 	artifactKey         string
@@ -107,6 +123,7 @@ func newModel(
 		autoQuit:  autoQuit,
 		width:     wideBreakpointWidth,
 		height:    wideBreakpointHeight,
+		now:       time.Now,
 		logs:      make([]logEntry, 0, maxLogLines),
 		spinner:   activity,
 		operation: operationRun,
@@ -149,6 +166,7 @@ func (current model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			if message.err != nil {
 				current.appendSystemLog(
 					runner.StreamStderr,
+					logIconFail,
 					fmt.Sprintf("artifact refresh: %v", message.err),
 				)
 			} else {
@@ -198,6 +216,7 @@ func (current model) updatePipelineEvent(
 		}
 		current.status = *event.Status
 		current.hasStatus = true
+		current.stages.observePhase(event.Status.Phase, current.now())
 		current.artifactKey = artifactStatusKey(current.status)
 		if current.artifactKey == current.artifactLoadedKey ||
 			current.artifactKey == current.artifactLoadingKey {
@@ -214,8 +233,10 @@ func (current model) updatePipelineEvent(
 		current.activeStep = event.Step
 		current.activeRole = event.Role
 		current.activeCLI = event.CLI
+		current.stages.stepStarted(event.Step, current.now())
 		current.appendSystemLog(
 			runner.StreamStdout,
+			logIconStart,
 			fmt.Sprintf("%s · %s started", displayStep(event), event.CLI),
 		)
 	case pipeline.EventStepLog:
@@ -232,6 +253,7 @@ func (current model) updatePipelineEvent(
 	case pipeline.EventAttemptFinished:
 		current.appendAttempt(event)
 	case pipeline.EventStepFinished:
+		current.stages.stepFinished(event.Step, current.now())
 		current.appendStepFinished(event)
 		if current.activeStep == event.Step &&
 			current.activeRole == event.Role {
@@ -256,10 +278,15 @@ func (current model) finishOperation(
 	if result.status.RunID != "" {
 		current.status = result.status
 		current.hasStatus = true
+		current.stages.observePhase(result.status.Phase, current.now())
 	}
 	current.operationErr = result.err
 	if result.err != nil {
-		current.appendSystemLog(runner.StreamStderr, result.err.Error())
+		current.appendSystemLog(
+			runner.StreamStderr,
+			logIconFail,
+			result.err.Error(),
+		)
 	}
 	if current.stopping {
 		return current, tea.Quit
@@ -440,6 +467,9 @@ func (current *model) refreshArtifactRender() {
 }
 
 func (current *model) appendLog(entry logEntry) {
+	if entry.At.IsZero() && current.now != nil {
+		entry.At = current.now()
+	}
 	current.logs = append(current.logs, entry)
 	if overflow := len(current.logs) - maxLogLines; overflow > 0 {
 		copy(current.logs, current.logs[overflow:])
@@ -447,13 +477,18 @@ func (current *model) appendLog(entry logEntry) {
 	}
 }
 
-func (current *model) appendSystemLog(stream runner.Stream, text string) {
+func (current *model) appendSystemLog(
+	stream runner.Stream,
+	icon logIcon,
+	text string,
+) {
 	current.appendLog(logEntry{
 		Step:   "coterix",
 		Role:   "control",
 		CLI:    "coterix",
 		Stream: stream,
 		Text:   text,
+		Icon:   icon,
 	})
 }
 
@@ -474,20 +509,24 @@ func (current *model) appendAttempt(event pipeline.Event) {
 		message += " · " + event.Err.Error()
 	}
 	stream := runner.StreamStdout
+	icon := logIconDone
 	if event.Err != nil || event.Result.Exit != 0 || event.Result.TimedOut {
 		stream = runner.StreamStderr
+		icon = logIconFail
 	}
-	current.appendSystemLog(stream, message)
+	current.appendSystemLog(stream, icon, message)
 }
 
 func (current *model) appendStepFinished(event pipeline.Event) {
 	message := displayStep(event) + " · finished"
 	stream := runner.StreamStdout
+	icon := logIconDone
 	if event.Err != nil {
 		message += " · " + event.Err.Error()
 		stream = runner.StreamStderr
+		icon = logIconFail
 	}
-	current.appendSystemLog(stream, message)
+	current.appendSystemLog(stream, icon, message)
 }
 
 func displayStep(event pipeline.Event) string {

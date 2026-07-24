@@ -14,15 +14,11 @@ import (
 )
 
 const (
-	sidebarWidth                     = 32
-	expandedWordmarkMinSidebarHeight = wideBreakpointHeight
+	sidebarWidth    = 32
+	topBarHeight    = 2
+	wordmarkText    = "C O T E R I X"
+	logTagCellWidth = 6
 )
-
-var expandedWordmarkRows = []string{
-	"███ ███ ███ ███ ██  █ █ █",
-	"█   █ █  █  ██  ██  █  █",
-	"███ ███  █  ███ █ █ █ █ █",
-}
 
 // THESIS: Make a synchronous multi-agent pipeline readable as one live
 // instrument panel, without turning it into chat or session chrome.
@@ -30,9 +26,11 @@ var expandedWordmarkRows = []string{
 // evidence marks, and a single right-hand telemetry rail.
 // STORY: Follow agent output, verify hard/soft gates, then answer the one human
 // action that is actually blocking progress.
-// FIRST VIEWPORT: Wide terminals show feed + 32-cell rail; compact terminals
-// fold that rail into a two-line header above the same feed and status bar.
-// FORM: Operate-mode dashboard, fixed by docs/spec/ui.md.
+// FIRST VIEWPORT: Wide terminals show a brand top bar, a bordered feed card,
+// and a 32-cell rail of PIPELINE/STATUS cards; compact terminals fold that
+// rail into a two-line header above the same feed and status bar.
+// FORM: Operate-mode dashboard, fixed by docs/spec/ui.md
+// (north star: assets/coterix-color-system.png).
 
 type sidebarData struct {
 	RunID            string
@@ -63,7 +61,8 @@ func renderDashboard(current model) string {
 
 	if isWide(width, height) {
 		mainWidth := max(1, width-sidebarWidth)
-		contentHeight := max(1, height-statusHeight)
+		contentHeight := max(1, height-topBarHeight-statusHeight)
+		topBar := renderTopBar(current, width, topBarHeight)
 		main := renderMain(current, mainWidth, contentHeight)
 		sidebar := renderSidebar(
 			current,
@@ -75,20 +74,27 @@ func renderDashboard(current model) string {
 			{
 				X:       0,
 				Y:       0,
+				Width:   width,
+				Height:  topBarHeight,
+				Content: topBar,
+			},
+			{
+				X:       0,
+				Y:       topBarHeight,
 				Width:   mainWidth,
 				Height:  contentHeight,
 				Content: main,
 			},
 			{
 				X:       mainWidth,
-				Y:       0,
+				Y:       topBarHeight,
 				Width:   sidebarWidth,
 				Height:  contentHeight,
 				Content: sidebar,
 			},
 			{
 				X:       0,
-				Y:       contentHeight,
+				Y:       topBarHeight + contentHeight,
 				Width:   width,
 				Height:  statusHeight,
 				Content: statusBar,
@@ -140,7 +146,7 @@ func dashboardMainInnerWidth(width, height int) int {
 
 func renderMain(current model, width, height int) string {
 	innerWidth := max(1, width-4)
-	innerHeight := max(1, height-2)
+	innerHeight := max(1, height-3)
 	var content strings.Builder
 	content.WriteString(
 		current.theme.styles.SectionTitle.Render("╱╱╱ PIPELINE FEED"),
@@ -177,11 +183,30 @@ func renderMain(current model, width, height int) string {
 	}
 
 	visible := visibleLines(content.String(), innerHeight, current.scroll)
-	return current.theme.styles.Main.
-		Width(innerWidth).
-		Height(innerHeight).
-		Padding(1, 2).
-		Render(visible)
+	body := renderMainHeader(current, innerWidth) + "\n" + visible
+	return current.theme.styles.MainCard.
+		Width(max(1, width)).
+		Height(max(1, height)).
+		Padding(0, 1).
+		Render(body)
+}
+
+// renderMainHeader is the feed card's command line: what this dashboard is
+// running on the left, one live signal on the right.
+func renderMainHeader(current model, width int) string {
+	left := current.theme.styles.Secondary.Bold(true).Render("coterix run ") +
+		current.theme.styles.Value.Render(
+			ansi.TruncateWc(
+				strings.Join(strings.Fields(current.request), " "),
+				max(1, width-24),
+				"…",
+			),
+		)
+	right := current.theme.styles.Muted.Render("● idle")
+	if current.isWorking() {
+		right = current.theme.styles.PhaseBusy.Render("● real-time")
+	}
+	return alignStatusLine(left, right, max(1, width))
 }
 
 func markdownArtifacts(data artifactData) []markdownArtifact {
@@ -209,7 +234,19 @@ func markdownArtifacts(data artifactData) []markdownArtifact {
 	return artifacts
 }
 
+// renderLogLine renders one columnar feed row:
+// `HH:MM:SS TAG    icon role#attempt message`. The tag column carries the
+// cross-model color (claude/codex); role and attempt stay in the message
+// prefix so no information from the old bracket prefix is lost.
 func renderLogLine(currentTheme theme, line logEntry, width int) string {
+	timestamp := strings.Repeat(" ", 8)
+	if !line.At.IsZero() {
+		timestamp = line.At.Format("15:04:05")
+	}
+	timeColumn := currentTheme.styles.Muted.Render(timestamp)
+	tagColumn := renderLogTag(currentTheme, line)
+	iconColumn := renderLogIcon(currentTheme, line)
+
 	label := line.Role
 	if label == "" {
 		label = line.Step
@@ -217,55 +254,84 @@ func renderLogLine(currentTheme theme, line logEntry, width int) string {
 	if label == "" {
 		label = "process"
 	}
-	if line.CLI != "" {
-		label += "→" + line.CLI
-	}
 	if line.Attempt > 0 {
 		label += "#" + strconv.Itoa(line.Attempt)
 	}
-	prefixStyle := cliRoleStyle(
-		currentTheme,
-		line.CLI,
-		currentTheme.styles.Muted,
-	)
-	prefix := prefixStyle.Render("[" + label + "]")
+	meta := currentTheme.styles.Label.Render(label)
+
 	text := remapANSI16(line.Text, currentTheme.tokens.ANSI)
 	if line.Stream == runner.StreamStderr {
 		text = currentTheme.styles.Error.Render(text)
 	} else {
 		text = currentTheme.styles.Value.Render(text)
 	}
-	return ansi.TruncateWc(prefix+" "+text, max(1, width), "…")
+	return ansi.TruncateWc(
+		timeColumn+" "+tagColumn+" "+iconColumn+" "+meta+" "+text,
+		max(1, width),
+		"…",
+	)
+}
+
+func renderLogTag(currentTheme theme, line logEntry) string {
+	tag := strings.ToUpper(strings.TrimSpace(line.CLI))
+	style := currentTheme.styles.Muted
+	switch strings.ToLower(strings.TrimSpace(line.CLI)) {
+	case "claude":
+		style = currentTheme.styles.Claude
+	case "codex":
+		style = currentTheme.styles.Codex
+	case "coterix", "":
+		tag = "INFO"
+	}
+	tag = ansi.TruncateWc(tag, logTagCellWidth, "…")
+	if pad := logTagCellWidth - ansi.StringWidth(tag); pad > 0 {
+		tag += strings.Repeat(" ", pad)
+	}
+	return style.Render(tag)
+}
+
+func renderLogIcon(currentTheme theme, line logEntry) string {
+	switch line.Icon {
+	case logIconStart:
+		return currentTheme.styles.PhaseInfo.Render("▸")
+	case logIconDone:
+		return currentTheme.styles.PhaseSuccess.Render("✓")
+	case logIconFail:
+		return currentTheme.styles.PhaseError.Render("×")
+	default:
+		if line.Stream == runner.StreamStderr {
+			return currentTheme.styles.PhaseError.Render("×")
+		}
+		return currentTheme.styles.Muted.Render("·")
+	}
 }
 
 func renderSidebar(current model, width, height int) string {
-	data := deriveSidebar(current)
-	innerWidth := max(1, width-6)
-	var content strings.Builder
-	content.WriteString(renderWordmark(
+	cardWidth := max(8, width-2)
+	innerWidth := max(1, cardWidth-4)
+	pipelineCard := renderSidebarCard(
 		current.theme,
-		height >= expandedWordmarkMinSidebarHeight,
-	))
-	content.WriteString("\n")
-	if current.isWorking() {
-		content.WriteString(current.spinner.View())
-		content.WriteString(gradientText(current.theme, " WORKING"))
-	} else {
-		content.WriteString(current.theme.styles.Muted.Render("● CONTROL PLANE"))
+		"PIPELINE",
+		renderStepper(current.theme, deriveStepper(current), innerWidth),
+		cardWidth,
+	)
+	statusCard := renderSidebarCard(
+		current.theme,
+		"STATUS",
+		renderSidebarBody(
+			current.theme,
+			deriveSidebar(current),
+			innerWidth,
+			true,
+		),
+		cardWidth,
+	)
+	content := pipelineCard + "\n" + statusCard
+	indented := make([]string, 0, strings.Count(content, "\n")+1)
+	for _, line := range strings.Split(content, "\n") {
+		indented = append(indented, " "+line)
 	}
-	content.WriteString("\n\n")
-	content.WriteString(renderSidebarBody(
-		current.theme,
-		data,
-		innerWidth,
-		true,
-	))
-
-	return current.theme.styles.Sidebar.
-		Width(max(1, width-3)).
-		Height(max(1, height-2)).
-		Padding(1).
-		Render(content.String())
+	return strings.Join(indented[:min(len(indented), max(1, height))], "\n")
 }
 
 func renderSidebarBody(
@@ -319,25 +385,16 @@ func renderSidebarBody(
 		innerWidth,
 	))
 	content.WriteString("\n")
+	task := data.TaskID
+	if string(data.TaskStatus) != "" {
+		task += " · " + string(data.TaskStatus)
+	}
+	task += " · #" + strconv.Itoa(data.Attempt)
 	writeSidebarField(
 		&content,
 		currentTheme,
-		"current",
-		data.TaskID,
-		innerWidth,
-	)
-	writeSidebarField(
-		&content,
-		currentTheme,
-		"status",
-		string(data.TaskStatus),
-		innerWidth,
-	)
-	writeSidebarField(
-		&content,
-		currentTheme,
-		"attempt",
-		strconv.Itoa(data.Attempt),
+		"task",
+		task,
 		innerWidth,
 	)
 	writeSidebarStyledField(
@@ -348,29 +405,20 @@ func renderSidebarBody(
 			outcomeIcon(currentTheme, data.Review),
 		innerWidth,
 	)
-	content.WriteString(renderSidebarSectionTitle(
-		currentTheme,
-		"PROGRESS",
-		innerWidth,
-	))
-	content.WriteString("\n")
 	writeSidebarField(
 		&content,
 		currentTheme,
-		"plan_round",
-		strconv.Itoa(data.PlanRound),
-		innerWidth,
-	)
-	writeSidebarField(
-		&content,
-		currentTheme,
-		"confirmed",
-		fmt.Sprintf("%d/%d", data.Confirmed, data.Total),
+		"progress",
+		fmt.Sprintf(
+			"round %d · %d/%d",
+			data.PlanRound,
+			data.Confirmed,
+			data.Total,
+		),
 		innerWidth,
 	)
 
 	if data.AwaitingApproval {
-		content.WriteString("\n")
 		content.WriteString(
 			currentTheme.styles.Warning.Render("! APPROVAL NEEDED"),
 		)
@@ -382,7 +430,6 @@ func renderSidebarBody(
 			content.WriteString("\n")
 		}
 	} else if data.PendingKind != "" {
-		content.WriteString("\n")
 		content.WriteString(
 			currentTheme.styles.Warning.Render(
 				pendingChipText(data.PendingKind),
@@ -397,7 +444,6 @@ func renderSidebarBody(
 		content.WriteString("\n")
 	}
 	if data.LastError != "" {
-		content.WriteString("\n")
 		content.WriteString(
 			currentTheme.styles.Error.Render(
 				"× " + ansi.HardwrapWc(
@@ -735,15 +781,64 @@ func statusSignal(current model) string {
 	)
 }
 
-func renderWordmark(currentTheme theme, expanded bool) string {
-	if !expanded {
-		return gradientText(currentTheme, "COTERIX")
+// renderTopBar draws the brand bar from the north-star mock-up: gradient
+// wordmark on the left, one orchestration-activity signal in the middle, the
+// run identity on the right, and a gradient underline under the wordmark.
+func renderTopBar(current model, width, height int) string {
+	innerWidth := max(1, width-2)
+	contentWidth := max(1, innerWidth-2)
+	wordmark := gradientText(current.theme, wordmarkText)
+
+	activity := current.theme.styles.Muted.Render("● orchestration idle")
+	if current.isWorking() {
+		activity = current.theme.styles.PhaseBusy.Render(
+			"● orchestration active",
+		)
 	}
-	rows := make([]string, 0, len(expandedWordmarkRows))
-	for _, row := range expandedWordmarkRows {
-		rows = append(rows, gradientText(currentTheme, row))
+
+	runID := "starting…"
+	if current.hasStatus && current.status.RunID != "" {
+		runID = current.status.RunID
 	}
-	return strings.Join(rows, "\n")
+	identity := current.theme.styles.Label.Render("run: ") +
+		current.theme.styles.Value.Render(
+			ansi.TruncateWc(runID, max(1, contentWidth/3), "…"),
+		)
+
+	first := alignTriple(wordmark, activity, identity, contentWidth)
+	underline := gradientText(
+		current.theme,
+		strings.Repeat("─", ansi.StringWidth(wordmarkText)),
+	)
+	return current.theme.styles.Header.
+		Width(innerWidth).
+		Height(max(1, height)).
+		Padding(0, 1).
+		Render(first + "\n" + underline)
+}
+
+// alignTriple lays out left, center, and right segments on one line. When the
+// budget is tight the center yields first, then the right.
+func alignTriple(left, center, right string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	leftWidth := ansi.StringWidth(left)
+	rightWidth := ansi.StringWidth(right)
+	centerWidth := ansi.StringWidth(center)
+	if leftWidth+centerWidth+rightWidth+2 > width {
+		return alignStatusLine(left, right, width)
+	}
+	centerStart := max(leftWidth+1, (width-centerWidth)/2)
+	if centerStart+centerWidth+1+rightWidth > width {
+		centerStart = width - rightWidth - 1 - centerWidth
+	}
+	rightStart := width - rightWidth
+	return left +
+		strings.Repeat(" ", centerStart-leftWidth) +
+		center +
+		strings.Repeat(" ", max(1, rightStart-centerStart-centerWidth)) +
+		right
 }
 
 func renderSidebarSectionTitle(

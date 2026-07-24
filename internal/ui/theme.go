@@ -321,6 +321,7 @@ func validateHexColor(value string) error {
 type dashboardStyles struct {
 	Canvas       lipgloss.Style
 	Main         lipgloss.Style
+	MainCard     lipgloss.Style
 	Sidebar      lipgloss.Style
 	Header       lipgloss.Style
 	StatusBar    lipgloss.Style
@@ -344,6 +345,7 @@ type dashboardStyles struct {
 	PhaseWarning lipgloss.Style
 	PhaseSuccess lipgloss.Style
 	PhaseError   lipgloss.Style
+	PhaseBusy    lipgloss.Style
 	Input        lipgloss.Style
 	InputCursor  lipgloss.Style
 	DiffInsert   lipgloss.Style
@@ -365,6 +367,11 @@ func newDashboardStyles(tokens colorTokens) dashboardStyles {
 		Main: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(theme.FGBase)).
 			Background(lipgloss.Color(theme.BGBase)),
+		MainCard: lipgloss.NewStyle().
+			Foreground(lipgloss.Color(theme.FGBase)).
+			Background(lipgloss.Color(theme.BGBase)).
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color(component.BorderBlurred)),
 		Sidebar: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(theme.FGSubtle)).
 			Background(lipgloss.Color(theme.BGLeastVisible)).
@@ -425,6 +432,8 @@ func newDashboardStyles(tokens colorTokens) dashboardStyles {
 			Foreground(lipgloss.Color(status.Success.FG)),
 		PhaseError: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(status.Error.FG)),
+		PhaseBusy: lipgloss.NewStyle().
+			Foreground(lipgloss.Color(status.Busy.FG)),
 		Input: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(component.SelectionFG)).
 			Background(lipgloss.Color(component.SelectionBG)).

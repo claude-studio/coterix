@@ -3,11 +3,13 @@ package ui
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"charm.land/lipgloss/v2"
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/ridenow/coterix/internal/pipeline"
+	"github.com/ridenow/coterix/internal/runner"
 	"github.com/ridenow/coterix/internal/state"
 )
 
@@ -18,8 +20,13 @@ func TestDashboardWideAndCompactLayoutBranches(t *testing.T) {
 	current.height = wideBreakpointHeight
 	wide := ansi.Strip(renderDashboard(current))
 	for _, expected := range []string{
-		"COTERIX",
+		wordmarkText,
+		"orchestration",
+		"coterix run",
 		"PIPELINE FEED",
+		"PIPELINE",
+		"PLAN",
+		"VERIFY",
 		"ROUTING",
 		"plan_writer",
 		"claude",
@@ -121,12 +128,71 @@ func TestMainPaneRendersPlanDiffVerdictAndStreamingLogs(t *testing.T) {
 		"Verdict",
 		"clean",
 		"LIVE OUTPUT",
-		"impl_writer→codex#1",
+		"CODEX",
+		"impl_writer#1",
 		"streamed output",
 	} {
 		if !strings.Contains(plain, expected) {
 			t.Fatalf("main pane lacks %q:\n%s", expected, plain)
 		}
+	}
+}
+
+func TestLogLinesRenderColumnarTimeTagAndIcon(t *testing.T) {
+	current := populatedViewModel(t)
+	at := time.Date(2026, 7, 24, 21, 42, 7, 0, time.UTC)
+
+	line := ansi.Strip(renderLogLine(current.theme, logEntry{
+		Role:    "impl_writer",
+		CLI:     "codex",
+		Attempt: 1,
+		Text:    "writing files",
+		At:      at,
+	}, 80))
+	for _, expected := range []string{
+		"21:42:07",
+		"CODEX",
+		"·",
+		"impl_writer#1",
+		"writing files",
+	} {
+		if !strings.Contains(line, expected) {
+			t.Fatalf("columnar log line lacks %q: %q", expected, line)
+		}
+	}
+
+	iconCases := []struct {
+		entry logEntry
+		glyph string
+	}{
+		{entry: logEntry{Icon: logIconStart}, glyph: "▸"},
+		{entry: logEntry{Icon: logIconDone}, glyph: "✓"},
+		{entry: logEntry{Icon: logIconFail}, glyph: "×"},
+		{entry: logEntry{Stream: runner.StreamStderr}, glyph: "×"},
+	}
+	for _, iconCase := range iconCases {
+		rendered := ansi.Strip(
+			renderLogIcon(current.theme, iconCase.entry),
+		)
+		if rendered != iconCase.glyph {
+			t.Fatalf("icon=%q, want %q", rendered, iconCase.glyph)
+		}
+	}
+
+	// appendLog stamps arrival time from the injected clock.
+	current.now = func() time.Time { return at }
+	current.appendLog(logEntry{CLI: "claude", Text: "hello"})
+	stamped := current.logs[len(current.logs)-1]
+	if !stamped.At.Equal(at) {
+		t.Fatalf("appendLog stamped %v, want %v", stamped.At, at)
+	}
+	if rendered := ansi.Strip(renderLogLine(
+		current.theme,
+		stamped,
+		80,
+	)); !strings.Contains(rendered, "21:42:07") ||
+		!strings.Contains(rendered, "CLAUDE") {
+		t.Fatalf("stamped log line=%q", rendered)
 	}
 }
 
@@ -156,71 +222,62 @@ func TestStatusBarDistinguishesApprovalAndPendingAction(t *testing.T) {
 	}
 }
 
-func TestWordmarkExpandsOnlyWithWideHeightBudget(t *testing.T) {
+func TestTopBarShowsWordmarkActivityAndRun(t *testing.T) {
 	current := populatedViewModel(t)
 	current.width = wideBreakpointWidth
 	current.height = wideBreakpointHeight
 
-	minimum := renderSidebar(
-		current,
-		sidebarWidth,
-		wideBreakpointHeight-2,
-	)
-	if plain := ansi.Strip(minimum); !strings.Contains(plain, "COTERIX") ||
-		strings.Contains(plain, expandedWordmarkRows[0]) {
-		t.Fatalf("120x30 sidebar wordmark expanded:\n%s", plain)
-	}
-
-	current.height = wideBreakpointHeight + 2
-	expanded := renderWordmark(current.theme, true)
-	lines := strings.Split(expanded, "\n")
-	if len(lines) < 2 || len(lines) > 3 {
-		t.Fatalf("expanded wordmark rows=%d, want 2-3", len(lines))
-	}
-	for index, line := range lines {
-		if width := ansi.StringWidth(line); width > 27 {
-			t.Fatalf("expanded wordmark row %d width=%d, want <=27", index, width)
+	working := renderTopBar(current, wideBreakpointWidth, topBarHeight)
+	plain := ansi.Strip(working)
+	for _, expected := range []string{
+		wordmarkText,
+		"● orchestration active",
+		"run: run-9",
+	} {
+		if !strings.Contains(plain, expected) {
+			t.Fatalf("working top bar lacks %q:\n%s", expected, plain)
 		}
 	}
-	if plain := ansi.Strip(
-		renderSidebar(
-			current,
-			sidebarWidth,
-			expandedWordmarkMinSidebarHeight,
-		),
-	); !strings.Contains(plain, expandedWordmarkRows[0]) ||
-		strings.Contains(plain, "\n COTERIX") {
-		t.Fatalf("height-rich sidebar lacks expanded wordmark:\n%s", plain)
+	lines := strings.Split(working, "\n")
+	if len(lines) != topBarHeight {
+		t.Fatalf("top bar rows=%d, want %d", len(lines), topBarHeight)
 	}
-	current.prompt = promptReject
-	if plain := ansi.Strip(renderSidebar(
-		current,
-		sidebarWidth,
-		wideBreakpointHeight-2,
-	)); !strings.Contains(plain, "COTERIX") ||
-		strings.Contains(plain, expandedWordmarkRows[0]) {
-		t.Fatalf("prompt-constrained sidebar wordmark expanded:\n%s", plain)
+	for index, line := range lines {
+		if width := ansi.StringWidth(line); width > wideBreakpointWidth {
+			t.Fatalf("top bar row %d width=%d exceeds %d", index, width, wideBreakpointWidth)
+		}
 	}
-	current.prompt = promptNone
+	underline := ansi.Strip(lines[1])
+	if !strings.Contains(underline, strings.Repeat("─", ansi.StringWidth(wordmarkText))) {
+		t.Fatalf("top bar lacks the wordmark underline:\n%s", underline)
+	}
 
-	first := styledCellAt(t, lines[0], 0, 0)
-	last := styledCellAt(t, lines[0], ansi.StringWidth(lines[0])-1, 0)
+	activeCell := findStyledCell(t, working, "●")
 	assertSameColor(
 		t,
-		first.Style.Fg,
+		activeCell.Style.Fg,
+		lipgloss.Color(current.theme.tokens.Status.Busy.FG),
+	)
+	wordmarkCell := styledCellAt(t, lines[0], 1, 0)
+	assertSameColor(
+		t,
+		wordmarkCell.Style.Fg,
 		lipgloss.Color(current.theme.tokens.Gradient.BrandLeftToRight[0]),
 	)
-	brand := current.theme.tokens.Gradient.BrandLeftToRight
-	assertSameColor(
-		t,
-		last.Style.Fg,
-		lipgloss.Color(brand[len(brand)-1]),
-	)
+
+	current.activeStep = ""
+	current.activeRole = ""
+	current.activeCLI = ""
+	current.operation = ""
+	idle := ansi.Strip(renderTopBar(current, wideBreakpointWidth, topBarHeight))
+	if !strings.Contains(idle, "● orchestration idle") ||
+		strings.Contains(idle, "orchestration active") {
+		t.Fatalf("idle top bar=%q", idle)
+	}
 
 	compact := ansi.Strip(renderCompactHeader(current, 80, 2))
-	if !strings.Contains(compact, "COTERIX") ||
-		strings.Contains(compact, expandedWordmarkRows[0]) {
-		t.Fatalf("compact header wordmark expanded:\n%s", compact)
+	if !strings.Contains(compact, "COTERIX") {
+		t.Fatalf("compact header lost the wordmark:\n%s", compact)
 	}
 }
 
@@ -303,9 +360,10 @@ func TestSidebarSectionAndRoleColorsUseInjectedTokens(t *testing.T) {
 				CLI:  roleCase.cli,
 				Text: "output",
 			}, 60)
+			// Columns: 8-cell time, one space, then the CLI tag.
 			assertSameColor(
 				t,
-				styledCellAt(t, logLine, 0, 0).Style.Fg,
+				styledCellAt(t, logLine, 9, 0).Style.Fg,
 				lipgloss.Color(roleCase.token),
 			)
 		})
@@ -455,6 +513,9 @@ func TestCanonicalHumanSignalsRemainVisibleAtMinimumLayouts(t *testing.T) {
 	current.width = wideBreakpointWidth
 	current.height = wideBreakpointHeight
 
+	// The wide sidebar budget at 120x30 after the top bar and status bar.
+	sidebarBudget := wideBreakpointHeight - topBarHeight - 2
+
 	t.Run("awaiting approval with last error", func(t *testing.T) {
 		candidate := current
 		candidate.status.Phase = state.PhaseAwaitingApproval
@@ -463,11 +524,7 @@ func TestCanonicalHumanSignalsRemainVisibleAtMinimumLayouts(t *testing.T) {
 			"approval-error-marker " + strings.Repeat("failure context ", 3),
 		)
 
-		wide := renderSidebar(
-			candidate,
-			sidebarWidth,
-			wideBreakpointHeight-2,
-		)
+		wide := renderSidebar(candidate, sidebarWidth, sidebarBudget)
 		assertVisibleSignals(
 			t,
 			wide,
@@ -475,7 +532,16 @@ func TestCanonicalHumanSignalsRemainVisibleAtMinimumLayouts(t *testing.T) {
 			"APPROVAL NEEDED",
 			"approval-error-marker",
 		)
-		assertRenderedHeight(t, wide, wideBreakpointHeight-2)
+		assertRenderedHeight(t, wide, sidebarBudget)
+
+		dashboard := renderDashboard(candidate)
+		assertVisibleSignals(
+			t,
+			dashboard,
+			candidate.width,
+			"APPROVAL NEEDED",
+			"approval-error-marker",
+		)
 
 		candidate.width = 80
 		candidate.height = 24
@@ -503,11 +569,7 @@ func TestCanonicalHumanSignalsRemainVisibleAtMinimumLayouts(t *testing.T) {
 			"pending-error-marker " + strings.Repeat("failure context ", 3),
 		)
 
-		wide := renderSidebar(
-			candidate,
-			sidebarWidth,
-			wideBreakpointHeight-2,
-		)
+		wide := renderSidebar(candidate, sidebarWidth, sidebarBudget)
 		assertVisibleSignals(
 			t,
 			wide,
@@ -516,7 +578,17 @@ func TestCanonicalHumanSignalsRemainVisibleAtMinimumLayouts(t *testing.T) {
 			"retry or abort",
 			"pending-error-marker",
 		)
-		assertRenderedHeight(t, wide, wideBreakpointHeight-2)
+		assertRenderedHeight(t, wide, sidebarBudget)
+
+		dashboard := renderDashboard(candidate)
+		assertVisibleSignals(
+			t,
+			dashboard,
+			candidate.width,
+			"task_cap",
+			"retry or abort",
+			"pending-error-marker",
+		)
 
 		candidate.width = 80
 		candidate.height = 24
