@@ -1,0 +1,42 @@
+{
+  "clis": {
+    "claude": {
+      "command": "claude",
+      "args": [
+        "-p",
+        "--dangerously-skip-permissions",
+        "--no-session-persistence"
+      ],
+      "stdin": false,
+      "env": {}
+    },
+    "codex": {
+      "command": "codex",
+      "args": [
+        "exec",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--skip-git-repo-check"
+      ],
+      "stdin": true,
+      "env": {}
+    }
+  },
+  "roles": {
+    "plan_writer": "claude",
+    "plan_reviewer": "codex",
+    "plan_reviser": "claude",
+    "impl_writer": "codex",
+    "impl_reviewer": "claude",
+    "fixer": "codex"
+  },
+  "idle_timeout_secs": 600,
+  "max_retries": 3,
+  "max_plan_rounds": 5,
+  "max_task_attempts": 5,
+  "gate_command": [
+    "go",
+    "test",
+    "./..."
+  ],
+  "gate_cwd": "."
+}
