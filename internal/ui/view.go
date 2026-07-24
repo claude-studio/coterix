@@ -254,94 +254,116 @@ func renderSidebar(current model, width, height int) string {
 		content.WriteString(current.theme.styles.Muted.Render("● CONTROL PLANE"))
 	}
 	content.WriteString("\n\n")
-	content.WriteString(renderSidebarSectionTitle(
+	content.WriteString(renderSidebarBody(
 		current.theme,
+		data,
+		innerWidth,
+		true,
+	))
+
+	return current.theme.styles.Sidebar.
+		Width(max(1, width-3)).
+		Height(max(1, height-2)).
+		Padding(1).
+		Render(content.String())
+}
+
+func renderSidebarBody(
+	currentTheme theme,
+	data sidebarData,
+	innerWidth int,
+	showActionHints bool,
+) string {
+	innerWidth = max(1, innerWidth)
+	var content strings.Builder
+	content.WriteString(renderSidebarSectionTitle(
+		currentTheme,
 		"RUN",
 		innerWidth,
 	))
 	content.WriteString("\n")
 	writeSidebarField(
 		&content,
-		current.theme,
+		currentTheme,
 		"run",
 		ansi.TruncateWc(data.RunID, innerWidth, "…"),
 		innerWidth,
 	)
 	writeSidebarStyledField(
 		&content,
-		current.theme,
+		currentTheme,
 		"",
-		phaseValue(current.theme, data.Phase),
+		phaseValue(currentTheme, data.Phase),
 		innerWidth,
 	)
 	content.WriteString(renderSidebarSectionTitle(
-		current.theme,
+		currentTheme,
 		"ROUTING",
 		innerWidth,
 	))
 	content.WriteString("\n")
 	writeSidebarStyledField(
 		&content,
-		current.theme,
+		currentTheme,
 		"",
 		cliRoleStyle(
-			current.theme,
+			currentTheme,
 			data.CLI,
-			current.theme.styles.Value,
+			currentTheme.styles.Value,
 		).Render(data.Role+" → "+data.CLI),
 		innerWidth,
 	)
 	content.WriteString(renderSidebarSectionTitle(
-		current.theme,
+		currentTheme,
 		"TASK",
 		innerWidth,
 	))
 	content.WriteString("\n")
 	writeSidebarField(
 		&content,
-		current.theme,
+		currentTheme,
 		"current",
 		data.TaskID,
 		innerWidth,
 	)
 	writeSidebarField(
 		&content,
-		current.theme,
+		currentTheme,
 		"status",
 		string(data.TaskStatus),
 		innerWidth,
 	)
 	writeSidebarField(
 		&content,
-		current.theme,
+		currentTheme,
 		"attempt",
 		strconv.Itoa(data.Attempt),
 		innerWidth,
 	)
 	writeSidebarStyledField(
 		&content,
-		current.theme,
+		currentTheme,
 		"gate / review",
-		outcomeIcon(current.theme, data.Gate)+"  "+
-			outcomeIcon(current.theme, data.Review),
+		outcomeIcon(currentTheme, data.Gate)+"  "+
+			outcomeIcon(currentTheme, data.Review),
 		innerWidth,
 	)
 	content.WriteString(renderSidebarSectionTitle(
-		current.theme,
+		currentTheme,
 		"PROGRESS",
 		innerWidth,
 	))
 	content.WriteString("\n")
 	writeSidebarField(
 		&content,
-		current.theme,
+		currentTheme,
 		"plan_round",
 		strconv.Itoa(data.PlanRound),
 		innerWidth,
 	)
 	writeSidebarField(
 		&content,
-		current.theme,
+		currentTheme,
 		"confirmed",
 		fmt.Sprintf("%d/%d", data.Confirmed, data.Total),
 		innerWidth,
@@ -350,23 +372,25 @@ func renderSidebar(current model, width, height int) string {
 	if data.AwaitingApproval {
 		content.WriteString("\n")
 		content.WriteString(
-			current.theme.styles.Warning.Render("! APPROVAL NEEDED"),
+			currentTheme.styles.Warning.Render("! APPROVAL NEEDED"),
 		)
 		content.WriteString("\n")
-		content.WriteString(
-			current.theme.styles.Warning.Render("a approve · r reject"),
-		)
-		content.WriteString("\n")
+		if showActionHints {
+			content.WriteString(
+				currentTheme.styles.Warning.Render("a approve · r reject"),
+			)
+			content.WriteString("\n")
+		}
 	} else if data.PendingKind != "" {
 		content.WriteString("\n")
 		content.WriteString(
-			current.theme.styles.Warning.Render(
+			currentTheme.styles.Warning.Render(
 				pendingChipText(data.PendingKind),
 			),
 		)
 		content.WriteString("\n")
 		content.WriteString(
-			current.theme.styles.Warning.Render(
+			currentTheme.styles.Warning.Render(
 				ansi.HardwrapWc(data.PendingPrompt, innerWidth, false),
 			),
 		)
@@ -375,7 +399,7 @@ func renderSidebar(current model, width, height int) string {
 	if data.LastError != "" {
 		content.WriteString("\n")
 		content.WriteString(
-			current.theme.styles.Error.Render(
+			currentTheme.styles.Error.Render(
 				"× " + ansi.HardwrapWc(
 					data.LastError,
 					max(1, innerWidth-2),
@@ -386,11 +410,7 @@ func renderSidebar(current model, width, height int) string {
 		content.WriteString("\n")
 	}
 
-	return current.theme.styles.Sidebar.
-		Width(max(1, width-3)).
-		Height(max(1, height-2)).
-		Padding(1).
-		Render(content.String())
+	return content.String()
 }
 
 func deriveSidebar(current model) sidebarData {
@@ -416,11 +436,53 @@ func deriveSidebar(current model) sidebarData {
 		return data
 	}
 
-	status := current.status
-	data.RunID = status.RunID
-	data.Phase = status.Phase
-	data.PlanRound = status.PlanRound
-	data.Total = len(status.TaskOrder)
+	statusData := deriveStatusFields(current.status)
+	statusGate := statusData.Gate
+	statusReview := statusData.Review
+	statusData.Gate = current.artifacts.GateOutcome
+	statusData.Review = current.artifacts.ReviewOutcome
+	if statusGate == evidencePass {
+		statusData.Gate = statusGate
+		statusData.Review = statusReview
+	}
+	if current.activeRole != "" || current.activeStep != "" {
+		statusData.Role = current.activeRole
+		if statusData.Role == "" {
+			statusData.Role = current.activeStep
+		}
+		statusData.CLI = current.activeCLI
+	}
+	if current.activeStep == "" {
+		switch {
+		case statusData.AwaitingApproval:
+			statusData.Role = "human_gate"
+			statusData.CLI = "operator"
+		case statusData.PendingKind != "":
+			statusData.Role = "pending_action"
+			statusData.CLI = "operator"
+		case current.status.Phase == state.PhaseDone ||
+			current.status.Phase == state.PhaseFailed:
+			statusData.Role = "—"
+			statusData.CLI = "—"
+		}
+	}
+	return statusData
+}
+
+func deriveStatusFields(status pipeline.RunStatus) sidebarData {
+	data := sidebarData{
+		RunID:       status.RunID,
+		Phase:       status.Phase,
+		Role:        "—",
+		CLI:         "—",
+		TaskID:      "—",
+		TaskStatus:  state.TaskOpen,
+		Gate:        evidenceUnknown,
+		Review:      evidenceUnknown,
+		PlanRound:   status.PlanRound,
+		Total:       len(status.TaskOrder),
+		PendingKind: "",
+	}
 	for _, taskID := range status.TaskOrder {
 		if task, exists := status.Tasks[taskID]; exists &&
 			task.Status == state.TaskConfirmed {
@@ -446,18 +508,13 @@ func deriveSidebar(current model) sidebarData {
 	if status.LastError != nil {
 		data.LastError = *status.LastError
 	}
-	if current.activeStep == "" {
-		switch {
-		case data.AwaitingApproval:
-			data.Role = "human_gate"
-			data.CLI = "operator"
-		case data.PendingKind != "":
-			data.Role = "pending_action"
-			data.CLI = "operator"
-		case status.Phase == state.PhaseDone || status.Phase == state.PhaseFailed:
-			data.Role = "—"
-			data.CLI = "—"
-		}
+	switch {
+	case data.AwaitingApproval:
+		data.Role = "human_gate"
+		data.CLI = "operator"
+	case data.PendingKind != "":
+		data.Role = "pending_action"
+		data.CLI = "operator"
 	}
 	return data
 }

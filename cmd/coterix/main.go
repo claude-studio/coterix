@@ -9,10 +9,13 @@ import (
 	"io"
 	"os"
 
+	"github.com/charmbracelet/x/term"
 	"github.com/ridenow/coterix/internal/pipeline"
 	"github.com/ridenow/coterix/internal/runner"
 	"github.com/ridenow/coterix/internal/ui"
 )
+
+const defaultSnapshotWidth = 120
 
 const usageText = `Usage:
   coterix run <request>
@@ -197,11 +200,79 @@ func execute(
 	if interactive {
 		return 0
 	}
+	statuses, presentation, snapshot := snapshotResult(args, result)
+	if snapshot && len(dashboards) > 0 && dashboards[0].Interactive() {
+		rendered, renderErr := ui.RenderSnapshot(
+			statuses,
+			outputWidth(stdout),
+			presentation,
+		)
+		if renderErr != nil {
+			fmt.Fprintf(
+				stderr,
+				"coterix: render snapshot output: %v\n",
+				renderErr,
+			)
+			return 1
+		}
+		if _, writeErr := io.WriteString(stdout, rendered+"\n"); writeErr != nil {
+			fmt.Fprintf(
+				stderr,
+				"coterix: write snapshot output: %v\n",
+				writeErr,
+			)
+			return 1
+		}
+		return 0
+	}
 	if err := writeJSON(stdout, result); err != nil {
 		fmt.Fprintf(stderr, "coterix: write JSON output: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+func snapshotResult(
+	args []string,
+	result any,
+) ([]pipeline.RunStatus, ui.SnapshotPresentation, bool) {
+	if len(args) == 0 {
+		return nil, 0, false
+	}
+	switch args[0] {
+	case "approve", "reject", "resume":
+		status, ok := result.(pipeline.RunStatus)
+		if !ok {
+			return nil, 0, false
+		}
+		return []pipeline.RunStatus{status},
+			ui.SnapshotPresentationDetail,
+			true
+	case "status":
+		statuses, ok := result.([]pipeline.RunStatus)
+		if !ok {
+			return nil, 0, false
+		}
+		presentation := ui.SnapshotPresentationDetail
+		if len(args) == 1 {
+			presentation = ui.SnapshotPresentationTable
+		}
+		return statuses, presentation, true
+	default:
+		return nil, 0, false
+	}
+}
+
+func outputWidth(output io.Writer) int {
+	file, ok := output.(*os.File)
+	if !ok {
+		return defaultSnapshotWidth
+	}
+	width, _, err := term.GetSize(file.Fd())
+	if err != nil || width <= 0 {
+		return defaultSnapshotWidth
+	}
+	return width
 }
 
 func dispatch(

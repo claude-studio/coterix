@@ -10,7 +10,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/ridenow/coterix/internal/pipeline"
+	"github.com/ridenow/coterix/internal/state"
 )
 
 type controlCall struct {
@@ -30,10 +32,11 @@ type fakeControlPlane struct {
 }
 
 type fakeRunDashboard struct {
-	calls       []controlCall
-	status      pipeline.RunStatus
-	err         error
-	interactive bool
+	calls            []controlCall
+	status           pipeline.RunStatus
+	err              error
+	interactive      bool
+	interactiveCalls int
 }
 
 func (fake *fakeRunDashboard) Run(
@@ -50,6 +53,7 @@ func (fake *fakeRunDashboard) Run(
 }
 
 func (fake *fakeRunDashboard) Interactive() bool {
+	fake.interactiveCalls++
 	return fake.interactive
 }
 
@@ -213,6 +217,12 @@ func TestExecuteExactRunCommandReachesDashboard(t *testing.T) {
 	if status.RunID != "run-from-dashboard" {
 		t.Fatalf("dashboard status run_id=%q", status.RunID)
 	}
+	if dashboard.interactiveCalls != 1 {
+		t.Fatalf(
+			"headless run Interactive() calls=%d, want 1",
+			dashboard.interactiveCalls,
+		)
+	}
 
 	dashboard.interactive = true
 	stdout.Reset()
@@ -230,6 +240,12 @@ func TestExecuteExactRunCommandReachesDashboard(t *testing.T) {
 			"interactive dashboard code=%d stdout=%q",
 			code,
 			stdout.String(),
+		)
+	}
+	if dashboard.interactiveCalls != 2 {
+		t.Fatalf(
+			"interactive run total Interactive() calls=%d, want 2",
+			dashboard.interactiveCalls,
 		)
 	}
 }
@@ -663,6 +679,377 @@ func TestExecuteJSONOutputAndExitCodes(t *testing.T) {
 	}
 }
 
+func TestExecuteControlCommandsPreserveExactHeadlessJSON(t *testing.T) {
+	responsePath := filepath.Join(t.TempDir(), "response.txt")
+	const fileResponse = "response from file\n"
+	if err := os.WriteFile(
+		responsePath,
+		[]byte(fileResponse),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	status := pipeline.RunStatus{
+		RunID: "run-json",
+		Phase: state.PhaseDone,
+	}
+	const statusJSON = "{\"run_id\":\"run-json\",\"phase\":\"done\"," +
+		"\"plan_hash\":null,\"approved_plan_hash\":null,\"plan_round\":0," +
+		"\"pending_action\":null,\"task_order\":null," +
+		"\"current_task_id\":null,\"tasks\":null,\"last_error\":null}\n"
+	const statusesJSON = "[{\"run_id\":\"run-json\",\"phase\":\"done\"," +
+		"\"plan_hash\":null,\"approved_plan_hash\":null,\"plan_round\":0," +
+		"\"pending_action\":null,\"task_order\":null," +
+		"\"current_task_id\":null,\"tasks\":null,\"last_error\":null}]\n"
+
+	tests := []struct {
+		name       string
+		args       []string
+		wantOutput string
+		wantCall   controlCall
+	}{
+		{
+			name:       "approve",
+			args:       []string{"approve", "run-json"},
+			wantOutput: statusJSON,
+			wantCall: controlCall{
+				command:  "approve",
+				repoRoot: "repo-root",
+				runID:    "run-json",
+			},
+		},
+		{
+			name: "reject inline",
+			args: []string{
+				"reject",
+				"run-json",
+				"--response",
+				"revise it",
+			},
+			wantOutput: statusJSON,
+			wantCall: controlCall{
+				command:  "reject",
+				repoRoot: "repo-root",
+				runID:    "run-json",
+				response: stringPointer("revise it"),
+			},
+		},
+		{
+			name: "reject file",
+			args: []string{
+				"reject",
+				"run-json",
+				"--response-file",
+				responsePath,
+			},
+			wantOutput: statusJSON,
+			wantCall: controlCall{
+				command:  "reject",
+				repoRoot: "repo-root",
+				runID:    "run-json",
+				response: stringPointer(fileResponse),
+			},
+		},
+		{
+			name:       "status all",
+			args:       []string{"status"},
+			wantOutput: statusesJSON,
+			wantCall: controlCall{
+				command:  "status",
+				repoRoot: "repo-root",
+			},
+		},
+		{
+			name:       "status one",
+			args:       []string{"status", "run-json"},
+			wantOutput: statusesJSON,
+			wantCall: controlCall{
+				command:  "status",
+				repoRoot: "repo-root",
+				runID:    "run-json",
+			},
+		},
+		{
+			name:       "resume without response",
+			args:       []string{"resume", "run-json"},
+			wantOutput: statusJSON,
+			wantCall: controlCall{
+				command:  "resume",
+				repoRoot: "repo-root",
+				runID:    "run-json",
+			},
+		},
+		{
+			name: "resume inline",
+			args: []string{
+				"resume",
+				"run-json",
+				"--response",
+				"retry",
+			},
+			wantOutput: statusJSON,
+			wantCall: controlCall{
+				command:  "resume",
+				repoRoot: "repo-root",
+				runID:    "run-json",
+				response: stringPointer("retry"),
+			},
+		},
+		{
+			name: "resume file",
+			args: []string{
+				"resume",
+				"run-json",
+				"--response-file",
+				responsePath,
+			},
+			wantOutput: statusJSON,
+			wantCall: controlCall{
+				command:  "resume",
+				repoRoot: "repo-root",
+				runID:    "run-json",
+				response: stringPointer(fileResponse),
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fake := &fakeControlPlane{
+				status:       status,
+				statuses:     []pipeline.RunStatus{status},
+				resumeResult: status,
+			}
+			dashboard := &fakeRunDashboard{interactive: false}
+			code, stdout, stderr := executeWithDashboardForTest(
+				t,
+				fake,
+				dashboard,
+				"repo-root",
+				test.args...,
+			)
+			if code != 0 ||
+				stdout != test.wantOutput ||
+				stderr != "" {
+				t.Fatalf(
+					"execute() code=%d stdout=%q stderr=%q",
+					code,
+					stdout,
+					stderr,
+				)
+			}
+			assertSingleCall(t, fake, test.wantCall)
+			if len(dashboard.calls) != 0 {
+				t.Fatalf("control command reached dashboard.Run: %#v", dashboard.calls)
+			}
+		})
+	}
+}
+
+func TestExecuteControlCommandsRenderInteractiveSnapshots(t *testing.T) {
+	status := pipeline.RunStatus{
+		RunID: "run-tty",
+		Phase: state.PhaseDone,
+	}
+	tests := []struct {
+		name        string
+		args        []string
+		wantCall    controlCall
+		wantTable   bool
+		wantDetails bool
+	}{
+		{
+			name: "approve detail",
+			args: []string{"approve", "run-tty"},
+			wantCall: controlCall{
+				command:  "approve",
+				repoRoot: "repo-root",
+				runID:    "run-tty",
+			},
+			wantDetails: true,
+		},
+		{
+			name: "reject detail",
+			args: []string{
+				"reject",
+				"run-tty",
+				"--response",
+				"revise",
+			},
+			wantCall: controlCall{
+				command:  "reject",
+				repoRoot: "repo-root",
+				runID:    "run-tty",
+				response: stringPointer("revise"),
+			},
+			wantDetails: true,
+		},
+		{
+			name: "bare status table with one run",
+			args: []string{"status"},
+			wantCall: controlCall{
+				command:  "status",
+				repoRoot: "repo-root",
+			},
+			wantTable: true,
+		},
+		{
+			name: "status id detail",
+			args: []string{"status", "run-tty"},
+			wantCall: controlCall{
+				command:  "status",
+				repoRoot: "repo-root",
+				runID:    "run-tty",
+			},
+			wantDetails: true,
+		},
+		{
+			name: "resume detail",
+			args: []string{"resume", "run-tty"},
+			wantCall: controlCall{
+				command:  "resume",
+				repoRoot: "repo-root",
+				runID:    "run-tty",
+			},
+			wantDetails: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fake := &fakeControlPlane{
+				status:       status,
+				statuses:     []pipeline.RunStatus{status},
+				resumeResult: status,
+			}
+			dashboard := &fakeRunDashboard{interactive: true}
+			code, stdout, stderr := executeWithDashboardForTest(
+				t,
+				fake,
+				dashboard,
+				"repo-root",
+				test.args...,
+			)
+			if code != 0 || stderr != "" || stdout == "" {
+				t.Fatalf(
+					"execute() code=%d stdout=%q stderr=%q",
+					code,
+					stdout,
+					stderr,
+				)
+			}
+			if json.Valid([]byte(stdout)) {
+				t.Fatalf("interactive output remained JSON: %q", stdout)
+			}
+			plain := ansi.Strip(stdout)
+			if !strings.Contains(plain, "██████") {
+				t.Fatalf("snapshot lacks block banner:\n%s", plain)
+			}
+			if test.wantTable && (!strings.Contains(plain, "run_id") ||
+				strings.Contains(plain, "╱╱╱ RUN")) {
+				t.Fatalf("bare status did not render a table:\n%s", plain)
+			}
+			if test.wantDetails && !strings.Contains(plain, "╱╱╱ RUN") {
+				t.Fatalf("control result did not render details:\n%s", plain)
+			}
+			assertSingleCall(t, fake, test.wantCall)
+			if len(dashboard.calls) != 0 {
+				t.Fatalf("control command reached dashboard.Run: %#v", dashboard.calls)
+			}
+		})
+	}
+}
+
+func TestExecuteInteractiveControlErrorsAreNotIntercepted(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantStderr string
+	}{
+		{
+			name: "reject response missing",
+			args: []string{"reject", "run-tty"},
+			wantStderr: "coterix: reject: exactly one of --response or " +
+				"--response-file is required\n" + usageText,
+		},
+		{
+			name:       "reject unknown flag",
+			args:       []string{"reject", "run-tty", "--unknown"},
+			wantStderr: "coterix: reject: flag provided but not defined: -unknown\n" + usageText,
+		},
+		{
+			name:       "unknown command",
+			args:       []string{"unknown"},
+			wantStderr: "coterix: unknown command \"unknown\"\n" + usageText,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fake := &fakeControlPlane{}
+			dashboard := &fakeRunDashboard{interactive: true}
+			code, stdout, stderr := executeWithDashboardForTest(
+				t,
+				fake,
+				dashboard,
+				"repo-root",
+				test.args...,
+			)
+			if code != 2 ||
+				stdout != "" ||
+				stderr != test.wantStderr {
+				t.Fatalf(
+					"execute() code=%d stdout=%q stderr=%q",
+					code,
+					stdout,
+					stderr,
+				)
+			}
+			if len(fake.calls) != 0 || len(dashboard.calls) != 0 {
+				t.Fatalf(
+					"invalid argv reached a control path: control=%#v dashboard=%#v",
+					fake.calls,
+					dashboard.calls,
+				)
+			}
+		})
+	}
+
+	t.Run("core failure", func(t *testing.T) {
+		coreErr := errors.New("core rejected the interactive operation")
+		fake := &fakeControlPlane{err: coreErr}
+		dashboard := &fakeRunDashboard{interactive: true}
+		code, stdout, stderr := executeWithDashboardForTest(
+			t,
+			fake,
+			dashboard,
+			"repo-root",
+			"approve",
+			"run-tty",
+		)
+		if code != 1 ||
+			stdout != "" ||
+			stderr != "coterix: "+coreErr.Error()+"\n" {
+			t.Fatalf(
+				"execute() code=%d stdout=%q stderr=%q",
+				code,
+				stdout,
+				stderr,
+			)
+		}
+		assertSingleCall(t, fake, controlCall{
+			command:  "approve",
+			repoRoot: "repo-root",
+			runID:    "run-tty",
+		})
+		if dashboard.interactiveCalls != 0 || len(dashboard.calls) != 0 {
+			t.Fatalf(
+				"core failure reached snapshot/dashboard: interactive=%d calls=%#v",
+				dashboard.interactiveCalls,
+				dashboard.calls,
+			)
+		}
+	})
+}
+
 func executeForTest(
 	t *testing.T,
 	controller controlPlane,
@@ -679,6 +1066,28 @@ func executeForTest(
 		args,
 		&stdout,
 		&stderr,
+	)
+	return code, stdout.String(), stderr.String()
+}
+
+func executeWithDashboardForTest(
+	t *testing.T,
+	controller controlPlane,
+	dashboard runDashboard,
+	repoRoot string,
+	args ...string,
+) (int, string, string) {
+	t.Helper()
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := execute(
+		context.Background(),
+		controller,
+		repoRoot,
+		args,
+		&stdout,
+		&stderr,
+		dashboard,
 	)
 	return code, stdout.String(), stderr.String()
 }
