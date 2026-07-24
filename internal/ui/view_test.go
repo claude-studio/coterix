@@ -229,6 +229,70 @@ func TestPromptRendersWideRuneResponse(t *testing.T) {
 	}
 }
 
+// The prompt shares one row with its label, the Input border and the cursor, and
+// the whole thing lives in a 4-row region. If any of that chrome is left out of
+// the width budget the Input box wraps and the `enter confirm` footer is pushed
+// out of the region (review T13a-1-followup f1).
+func TestPromptStaysWithinItsRegionAtWidthBoundaries(t *testing.T) {
+	const (
+		width  = 120
+		height = 4
+	)
+	innerWidth := width - 2
+	label := "Response · plan_question"
+	// StatusBar padding 2 + ": " 2 + Input border 2 + cursor 1.
+	budget := innerWidth - ansi.StringWidth(label) - 7
+
+	base := populatedViewModel(t)
+	base.prompt = promptResume
+	base.status.PendingAction = &state.PendingAction{
+		Kind:   state.PendingPlanQuestion,
+		Prompt: "질문",
+	}
+
+	for _, promptCase := range []struct {
+		name  string
+		value string
+	}{
+		{"exactly at budget", strings.Repeat("a", budget)},
+		{"one cell over budget", strings.Repeat("a", budget+1)},
+		{"wide runes over budget", strings.Repeat("가", budget/2+1)},
+	} {
+		t.Run(promptCase.name, func(t *testing.T) {
+			candidate := base
+			candidate.promptValue = promptCase.value
+			plain := ansi.Strip(renderStatusBar(candidate, width, height))
+
+			if !strings.Contains(plain, "▌") {
+				t.Fatalf("cursor is missing:\n%s", plain)
+			}
+			if !strings.Contains(plain, "enter confirm") {
+				t.Fatalf("footer was pushed out of the region:\n%s", plain)
+			}
+			lines := strings.Split(plain, "\n")
+			if len(lines) > height {
+				t.Fatalf(
+					"prompt used %d rows, region is %d:\n%s",
+					len(lines),
+					height,
+					plain,
+				)
+			}
+			for index, line := range lines {
+				if cells := ansi.StringWidth(line); cells > innerWidth {
+					t.Fatalf(
+						"row %d is %d cells wide, region is %d:\n%s",
+						index,
+						cells,
+						innerWidth,
+						plain,
+					)
+				}
+			}
+		})
+	}
+}
+
 func TestLogLinesRenderColumnarTimeTagAndIcon(t *testing.T) {
 	current := populatedViewModel(t)
 	at := time.Date(2026, 7, 24, 21, 42, 7, 0, time.UTC)

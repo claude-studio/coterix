@@ -18,6 +18,9 @@ const (
 	topBarHeight    = 2
 	wordmarkText    = "C O T E R I X"
 	logTagCellWidth = 6
+	// promptEllipsis marks a left-trimmed response; its width counts against the
+	// input budget (review T13a-1-followup f1).
+	promptEllipsis = "…"
 )
 
 // THESIS: Make a synchronous multi-agent pipeline readable as one live
@@ -413,9 +416,16 @@ func renderMainHeader(current model, width int) string {
 				current.theme.styles.PhaseBusy.Render("working")
 		}
 	}
-	// The request has to yield whatever the live signal needs, not a fixed 24.
-	requestWidth := max(1, width-ansi.StringWidth(right)-3)
-	left := current.theme.styles.Secondary.Bold(true).Render("coterix run ") +
+	// The request has to yield whatever the live signal needs, not a fixed 24 —
+	// and the `coterix run ` prefix is part of the left side's width, so it comes
+	// out of the request budget too. Omitting it truncated the descriptor's CLI
+	// and elapsed time on long requests (review T13a-1-followup f2).
+	const headerPrefix = "coterix run "
+	requestWidth := max(
+		1,
+		width-ansi.StringWidth(right)-ansi.StringWidth(headerPrefix)-2,
+	)
+	left := current.theme.styles.Secondary.Bold(true).Render(headerPrefix) +
 		current.theme.styles.Value.Render(
 			ansi.TruncateWc(
 				strings.Join(strings.Fields(current.request), " "),
@@ -920,10 +930,22 @@ func renderStatusBar(current model, width, height int) string {
 		// response, so the input always rendered empty (live-smoke finding,
 		// 2026-07-25). Only trim when the value actually overflows, and measure
 		// the label in cells: len() counts bytes and the label contains `·`.
-		budget := max(1, innerWidth-ansi.StringWidth(label)-6)
+		//
+		// The chrome that shares the row must all come out of the budget, or the
+		// Input box wraps and pushes the footer out of the 4-row prompt region
+		// (review T13a-1-followup f1): StatusBar padding, the `label: ` suffix,
+		// the Input border, and the cursor cell.
+		const promptChrome = 2 + // StatusBar Padding(0, 1)
+			2 + // ": " after the label
+			2 + // Input border, both sides
+			1 // the cursor cell appended below
+		budget := max(1, innerWidth-ansi.StringWidth(label)-promptChrome)
 		value := current.promptValue
-		if overflow := ansi.StringWidth(value) - budget; overflow > 0 {
-			value = ansi.TruncateLeftWc(value, overflow, "…")
+		if ansi.StringWidth(value) > budget {
+			// The marker is prepended by TruncateLeftWc, so its own width has to
+			// be part of the cut — otherwise the result stays a cell over budget.
+			cut := ansi.StringWidth(value) - budget + ansi.StringWidth(promptEllipsis)
+			value = ansi.TruncateLeftWc(value, cut, promptEllipsis)
 		}
 		input := current.theme.styles.Input.Render(
 			value + current.theme.styles.InputCursor.Render("▌"),

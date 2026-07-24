@@ -11,6 +11,7 @@ import (
 
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/ridenow/coterix/internal/pipeline"
 	"github.com/ridenow/coterix/internal/runner"
@@ -357,6 +358,156 @@ func TestActivityTailRendersNewestLinesAndHeightBudget(t *testing.T) {
 // feedActivityLines emits numbered lines so tests can assert *which* lines
 // survive the buffer and the render limit — identical text would let a
 // newest/oldest mix-up pass unnoticed (review T13a-1 f1).
+// f3/f4 of the follow-up review: the earlier tests checked endpoints and
+// ANSI-stripped glyphs, so a renderer that emitted only the newest compact line,
+// dropped the middle of a widened failure tail, or painted muted stderr red would
+// still have passed. These assert the exact sets, the styling, and the real
+// lifecycle path.
+func TestActivityTailExactSetsStylingAndHeightBudgets(t *testing.T) {
+	const produced = 22
+	wide := feedActivityLines(t, populatedViewModel(t), produced)
+
+	compact := wide
+	compact.width = wideBreakpointWidth - 1
+	compact.height = wideBreakpointHeight - 1
+	assertActivityLines(
+		t,
+		renderActivityTail(compact, 80, activityTailLimit(compact)),
+		produced,
+		activityTailCompact,
+	)
+	assertActivityLines(
+		t,
+		renderActivityTail(wide, 120, activityTailLimit(wide)),
+		produced,
+		activityTailWide,
+	)
+
+	// A failed attempt widens the window to the entire buffer — every one of the
+	// retained lines, in order, not just the two endpoints.
+	result := runner.RunResult{Exit: 1}
+	updated, _ := wide.Update(pipelineEventMsg{Event: pipeline.Event{
+		Kind:    pipeline.EventAttemptFinished,
+		Step:    pipeline.StepPlan,
+		Role:    "plan_writer",
+		Attempt: 1,
+		Result:  &result,
+	}})
+	failed := updated.(model)
+	assertActivityLines(
+		t,
+		renderActivityTail(failed, 120, activityTailLimit(failed)),
+		produced,
+		maxActivityLines,
+	)
+
+	// The lifecycle feed must carry the failure with an explicit error-styled
+	// icon — the tail's muting must not reach it.
+	feed := renderFeed(failed, 120)
+	if !strings.Contains(ansi.Strip(feed), "×") {
+		t.Fatalf("lifecycle feed lost the failure marker:\n%s", ansi.Strip(feed))
+	}
+	assertSameColor(
+		t,
+		findStyledCell(t, feed, "×").Style.Fg,
+		lipgloss.Color(failed.theme.tokens.Status.Error.FG),
+	)
+
+	// Muted stderr progress in the tail keeps the neutral value color and the
+	// `·` icon (not a red `×`).
+	stderrModel := populatedViewModel(t)
+	line := runner.Line{Attempt: 1, Stream: runner.StreamStderr, Text: "boom"}
+	updated, _ = stderrModel.Update(pipelineEventMsg{Event: pipeline.Event{
+		Kind:  pipeline.EventStepLog,
+		RunID: "run-1",
+		Step:  pipeline.StepPlan,
+		Role:  "plan_writer",
+		CLI:   "codex",
+		Line:  &line,
+	}})
+	stderrModel = updated.(model)
+	tail := renderActivityTail(stderrModel, 120, activityTailWide)
+	assertSameColor(
+		t,
+		findStyledCell(t, tail, "b").Style.Fg,
+		lipgloss.Color(stderrModel.theme.tokens.Theme.FGBase),
+	)
+	assertSameColor(
+		t,
+		findStyledCell(t, tail, "·").Style.Fg,
+		lipgloss.Color(stderrModel.theme.tokens.Theme.FGMostSubtle),
+	)
+
+	// Height budgets: neither layout may overflow, and the lifecycle signal must
+	// survive alongside a widened tail.
+	for _, layout := range []struct {
+		name    string
+		current model
+		width   int
+		height  int
+	}{
+		{"wide healthy", wide, 140, 40},
+		{"wide failed", failed, 140, 40},
+		{"compact healthy", compact, 80, 22},
+	} {
+		t.Run(layout.name, func(t *testing.T) {
+			candidate := layout.current
+			candidate.logs = []logEntry{{
+				Role: "plan_writer",
+				CLI:  "claude",
+				Icon: logIconStart,
+				Text: "plan_writer · claude started",
+			}}
+			frame := ansi.Strip(
+				renderMain(candidate, layout.width, layout.height),
+			)
+			if rows := strings.Count(frame, "\n") + 1; rows > layout.height {
+				t.Fatalf(
+					"main pane used %d rows, budget is %d:\n%s",
+					rows,
+					layout.height,
+					frame,
+				)
+			}
+			if !strings.Contains(frame, "plan_writer · claude started") {
+				t.Fatalf("lifecycle signal was dropped:\n%s", frame)
+			}
+		})
+	}
+}
+
+// assertActivityLines checks that exactly the newest `limit` lines are rendered,
+// in order, out of `produced` emitted lines.
+func assertActivityLines(
+	t *testing.T,
+	rendered string,
+	produced, limit int,
+) {
+	t.Helper()
+	lines := make([]string, 0, limit)
+	for _, line := range strings.Split(ansi.Strip(rendered), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.Contains(trimmed, "ACTIVITY") {
+			continue
+		}
+		lines = append(lines, trimmed)
+	}
+	if len(lines) != limit {
+		t.Fatalf("rendered %d activity lines, want %d:\n%s", len(lines), limit, rendered)
+	}
+	for index, line := range lines {
+		want := fmt.Sprintf("line-%02d", produced-limit+index)
+		if !strings.Contains(line, want) {
+			t.Fatalf(
+				"activity row %d is %q, want it to contain %q (order must be preserved)",
+				index,
+				line,
+				want,
+			)
+		}
+	}
+}
+
 func feedActivityLines(t *testing.T, current model, count int) model {
 	t.Helper()
 	return feedActivityAttempt(t, current, 1, count)
