@@ -9,7 +9,9 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
+	"charm.land/bubbles/v2/spinner"
 	"charm.land/lipgloss/v2"
 	"github.com/ridenow/coterix/design"
 )
@@ -43,6 +45,31 @@ type quickStyleOpts struct {
 	Success           string `json:"success"`
 	SuccessMoreSubtle string `json:"successMoreSubtle"`
 	SuccessMostSubtle string `json:"successMostSubtle"`
+}
+
+type paletteRampTokens struct {
+	Shade50  string `json:"50"`
+	Shade100 string `json:"100"`
+	Shade200 string `json:"200"`
+	Shade300 string `json:"300"`
+	Shade400 string `json:"400"`
+	Shade500 string `json:"500"`
+	Shade600 string `json:"600"`
+	Shade700 string `json:"700"`
+	Shade800 string `json:"800"`
+	Shade900 string `json:"900"`
+	Shade950 string `json:"950"`
+}
+
+type paletteTokens struct {
+	Ink     paletteRampTokens `json:"ink"`
+	Codex   paletteRampTokens `json:"codex"`
+	Claude  paletteRampTokens `json:"claude"`
+	Violet  paletteRampTokens `json:"violet"`
+	Success paletteRampTokens `json:"success"`
+	Warning paletteRampTokens `json:"warning"`
+	Danger  paletteRampTokens `json:"danger"`
+	Cyan    paletteRampTokens `json:"cyan"`
 }
 
 type gradientTokens struct {
@@ -163,7 +190,7 @@ func (tokens ansiTokens) colors() [16]string {
 
 type colorTokens struct {
 	Meta      json.RawMessage `json:"meta"`
-	Palette   json.RawMessage `json:"palette"`
+	Palette   paletteTokens   `json:"palette"`
 	Gradient  gradientTokens  `json:"gradient"`
 	Theme     quickStyleOpts  `json:"theme"`
 	Component componentTokens `json:"component"`
@@ -225,6 +252,7 @@ func validateColorTokens(tokens colorTokens) error {
 		name  string
 		value any
 	}{
+		{name: "palette", value: tokens.Palette},
 		{name: "gradient", value: tokens.Gradient},
 		{name: "theme", value: tokens.Theme},
 		{name: "component", value: tokens.Component},
@@ -298,16 +326,24 @@ type dashboardStyles struct {
 	StatusBar    lipgloss.Style
 	Logo         lipgloss.Style
 	SectionTitle lipgloss.Style
+	Separator    lipgloss.Style
 	Label        lipgloss.Style
 	Value        lipgloss.Style
 	Muted        lipgloss.Style
 	Primary      lipgloss.Style
 	Secondary    lipgloss.Style
+	Claude       lipgloss.Style
+	Codex        lipgloss.Style
 	Success      lipgloss.Style
 	Warning      lipgloss.Style
 	Error        lipgloss.Style
+	Info         lipgloss.Style
 	Busy         lipgloss.Style
-	Pending      lipgloss.Style
+	Hint         lipgloss.Style
+	PhaseInfo    lipgloss.Style
+	PhaseWarning lipgloss.Style
+	PhaseSuccess lipgloss.Style
+	PhaseError   lipgloss.Style
 	Input        lipgloss.Style
 	InputCursor  lipgloss.Style
 	DiffInsert   lipgloss.Style
@@ -317,6 +353,7 @@ type dashboardStyles struct {
 
 func newDashboardStyles(tokens colorTokens) dashboardStyles {
 	theme := tokens.Theme
+	palette := tokens.Palette
 	component := tokens.Component
 	status := tokens.Status
 	diff := tokens.Diff
@@ -347,6 +384,8 @@ func newDashboardStyles(tokens colorTokens) dashboardStyles {
 		SectionTitle: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(theme.Accent)).
 			Bold(true),
+		Separator: lipgloss.NewStyle().
+			Foreground(lipgloss.Color(theme.Separator)),
 		Label: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(theme.FGMoreSubtle)),
 		Value: lipgloss.NewStyle().
@@ -357,6 +396,10 @@ func newDashboardStyles(tokens colorTokens) dashboardStyles {
 			Foreground(lipgloss.Color(theme.Primary)),
 		Secondary: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(theme.Secondary)),
+		Claude: lipgloss.NewStyle().
+			Foreground(lipgloss.Color(palette.Claude.Shade400)),
+		Codex: lipgloss.NewStyle().
+			Foreground(lipgloss.Color(palette.Codex.Shade400)),
 		Success: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(status.Success.FG)).
 			Background(lipgloss.Color(status.Success.BG)),
@@ -366,13 +409,22 @@ func newDashboardStyles(tokens colorTokens) dashboardStyles {
 		Error: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(status.Error.FG)).
 			Background(lipgloss.Color(status.Error.BG)),
+		Info: lipgloss.NewStyle().
+			Foreground(lipgloss.Color(status.Info.FG)).
+			Background(lipgloss.Color(status.Info.BG)),
 		Busy: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(status.Busy.FG)).
 			Background(lipgloss.Color(status.Busy.BG)),
-		Pending: lipgloss.NewStyle().
-			Foreground(lipgloss.Color(status.Warning.FG)).
-			Background(lipgloss.Color(status.Warning.EmphasisBG)).
-			Bold(true),
+		Hint: lipgloss.NewStyle().
+			Foreground(lipgloss.Color(theme.FGSubtle)),
+		PhaseInfo: lipgloss.NewStyle().
+			Foreground(lipgloss.Color(status.Info.FG)),
+		PhaseWarning: lipgloss.NewStyle().
+			Foreground(lipgloss.Color(status.Warning.FG)),
+		PhaseSuccess: lipgloss.NewStyle().
+			Foreground(lipgloss.Color(status.Success.FG)),
+		PhaseError: lipgloss.NewStyle().
+			Foreground(lipgloss.Color(status.Error.FG)),
 		Input: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(component.SelectionFG)).
 			Background(lipgloss.Color(component.SelectionBG)).
@@ -389,6 +441,25 @@ func newDashboardStyles(tokens colorTokens) dashboardStyles {
 		DiffDivider: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(diff.DividerFG)).
 			Background(lipgloss.Color(diff.DividerBG)),
+	}
+}
+
+func workingSpinner(tokens colorTokens) spinner.Spinner {
+	colors := lipgloss.Blend1D(
+		len(spinner.Points.Frames),
+		lipgloss.Color(tokens.Component.WorkingGradientFrom),
+		lipgloss.Color(tokens.Component.WorkingGradientTo),
+	)
+	frames := make([]string, len(spinner.Points.Frames))
+	for index, frame := range spinner.Points.Frames {
+		frames[index] = lipgloss.NewStyle().
+			Foreground(colors[index]).
+			Background(lipgloss.Color(tokens.Status.Busy.BG)).
+			Render(frame)
+	}
+	return spinner.Spinner{
+		Frames: frames,
+		FPS:    225 * time.Millisecond,
 	}
 }
 

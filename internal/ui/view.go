@@ -13,7 +13,16 @@ import (
 	"github.com/ridenow/coterix/internal/state"
 )
 
-const sidebarWidth = 32
+const (
+	sidebarWidth                     = 32
+	expandedWordmarkMinSidebarHeight = wideBreakpointHeight
+)
+
+var expandedWordmarkRows = []string{
+	"███ ███ ███ ███ ██  █ █ █",
+	"█   █ █  █  ██  ██  █  █",
+	"███ ███  █  ███ █ █ █ █ █",
+}
 
 // THESIS: Make a synchronous multi-agent pipeline readable as one live
 // instrument panel, without turning it into chat or session chrome.
@@ -214,7 +223,12 @@ func renderLogLine(currentTheme theme, line logEntry, width int) string {
 	if line.Attempt > 0 {
 		label += "#" + strconv.Itoa(line.Attempt)
 	}
-	prefix := currentTheme.styles.Muted.Render("[" + label + "]")
+	prefixStyle := cliRoleStyle(
+		currentTheme,
+		line.CLI,
+		currentTheme.styles.Muted,
+	)
+	prefix := prefixStyle.Render("[" + label + "]")
 	text := remapANSI16(line.Text, currentTheme.tokens.ANSI)
 	if line.Stream == runner.StreamStderr {
 		text = currentTheme.styles.Error.Render(text)
@@ -226,89 +240,117 @@ func renderLogLine(currentTheme theme, line logEntry, width int) string {
 
 func renderSidebar(current model, width, height int) string {
 	data := deriveSidebar(current)
-	innerWidth := max(1, width-5)
+	innerWidth := max(1, width-6)
 	var content strings.Builder
-	content.WriteString(gradientText(current.theme, "COTERIX"))
+	content.WriteString(renderWordmark(
+		current.theme,
+		height >= expandedWordmarkMinSidebarHeight,
+	))
 	content.WriteString("\n")
-	if current.operation != "" || current.activeStep != "" {
+	if current.isWorking() {
 		content.WriteString(current.spinner.View())
 		content.WriteString(gradientText(current.theme, " WORKING"))
 	} else {
 		content.WriteString(current.theme.styles.Muted.Render("● CONTROL PLANE"))
 	}
 	content.WriteString("\n\n")
-	content.WriteString(current.theme.styles.SectionTitle.Render("RUN"))
+	content.WriteString(renderSidebarSectionTitle(
+		current.theme,
+		"RUN",
+		innerWidth,
+	))
 	content.WriteString("\n")
 	writeSidebarField(
 		&content,
 		current.theme,
 		"run",
 		ansi.TruncateWc(data.RunID, innerWidth, "…"),
+		innerWidth,
 	)
-	writeSidebarField(
+	writeSidebarStyledField(
 		&content,
 		current.theme,
-		"phase",
+		"",
 		phaseValue(current.theme, data.Phase),
+		innerWidth,
 	)
+	content.WriteString(renderSidebarSectionTitle(
+		current.theme,
+		"ROUTING",
+		innerWidth,
+	))
 	content.WriteString("\n")
-	content.WriteString(current.theme.styles.SectionTitle.Render("ROUTING"))
+	writeSidebarStyledField(
+		&content,
+		current.theme,
+		"",
+		cliRoleStyle(
+			current.theme,
+			data.CLI,
+			current.theme.styles.Value,
+		).Render(data.Role+" → "+data.CLI),
+		innerWidth,
+	)
+	content.WriteString(renderSidebarSectionTitle(
+		current.theme,
+		"TASK",
+		innerWidth,
+	))
 	content.WriteString("\n")
 	writeSidebarField(
 		&content,
 		current.theme,
-		"role",
-		ansi.TruncateWc(data.Role, innerWidth, "…"),
+		"current",
+		data.TaskID,
+		innerWidth,
 	)
-	writeSidebarField(
-		&content,
-		current.theme,
-		"cli",
-		ansi.TruncateWc(data.CLI, innerWidth, "…"),
-	)
-	content.WriteString("\n")
-	content.WriteString(current.theme.styles.SectionTitle.Render("TASK"))
-	content.WriteString("\n")
-	writeSidebarField(&content, current.theme, "current", data.TaskID)
 	writeSidebarField(
 		&content,
 		current.theme,
 		"status",
 		string(data.TaskStatus),
+		innerWidth,
 	)
 	writeSidebarField(
 		&content,
 		current.theme,
 		"attempt",
 		strconv.Itoa(data.Attempt),
+		innerWidth,
 	)
-	writeSidebarField(
+	writeSidebarStyledField(
 		&content,
 		current.theme,
 		"gate / review",
 		outcomeIcon(current.theme, data.Gate)+"  "+
 			outcomeIcon(current.theme, data.Review),
+		innerWidth,
 	)
-	content.WriteString("\n")
-	content.WriteString(current.theme.styles.SectionTitle.Render("PROGRESS"))
+	content.WriteString(renderSidebarSectionTitle(
+		current.theme,
+		"PROGRESS",
+		innerWidth,
+	))
 	content.WriteString("\n")
 	writeSidebarField(
 		&content,
 		current.theme,
 		"plan_round",
 		strconv.Itoa(data.PlanRound),
+		innerWidth,
 	)
 	writeSidebarField(
 		&content,
 		current.theme,
 		"confirmed",
 		fmt.Sprintf("%d/%d", data.Confirmed, data.Total),
+		innerWidth,
 	)
 
 	if data.AwaitingApproval {
 		content.WriteString("\n")
 		content.WriteString(
-			current.theme.styles.Pending.Render("! APPROVAL GATE"),
+			current.theme.styles.Warning.Render("! APPROVAL NEEDED"),
 		)
 		content.WriteString("\n")
 		content.WriteString(
@@ -318,8 +360,8 @@ func renderSidebar(current model, width, height int) string {
 	} else if data.PendingKind != "" {
 		content.WriteString("\n")
 		content.WriteString(
-			current.theme.styles.Pending.Render(
-				"! PENDING · " + string(data.PendingKind),
+			current.theme.styles.Warning.Render(
+				pendingChipText(data.PendingKind),
 			),
 		)
 		content.WriteString("\n")
@@ -334,7 +376,11 @@ func renderSidebar(current model, width, height int) string {
 		content.WriteString("\n")
 		content.WriteString(
 			current.theme.styles.Error.Render(
-				"× " + ansi.HardwrapWc(data.LastError, innerWidth, false),
+				"× " + ansi.HardwrapWc(
+					data.LastError,
+					max(1, innerWidth-2),
+					false,
+				),
 			),
 		)
 		content.WriteString("\n")
@@ -421,25 +467,52 @@ func writeSidebarField(
 	currentTheme theme,
 	label string,
 	value string,
+	width int,
 ) {
 	if value == "" {
 		value = "—"
 	}
-	builder.WriteString(currentTheme.styles.Label.Render(label + ": "))
-	builder.WriteString(currentTheme.styles.Value.Render(value))
+	writeSidebarStyledField(
+		builder,
+		currentTheme,
+		label,
+		currentTheme.styles.Value.Render(value),
+		width,
+	)
+}
+
+func writeSidebarStyledField(
+	builder *strings.Builder,
+	currentTheme theme,
+	label string,
+	value string,
+	width int,
+) {
+	prefix := currentTheme.styles.SectionTitle.Render("▌") + " "
+	if label != "" {
+		prefix += currentTheme.styles.Label.Render(label + ": ")
+	}
+	builder.WriteString(prefix)
+	available := max(1, width-ansi.StringWidth(prefix))
+	builder.WriteString(ansi.TruncateWc(value, available, "…"))
 	builder.WriteString("\n")
 }
 
 func phaseValue(currentTheme theme, phase state.Phase) string {
+	return phaseDot(currentTheme, phase) + " " +
+		currentTheme.styles.Value.Render(string(phase))
+}
+
+func phaseDot(currentTheme theme, phase state.Phase) string {
 	switch phase {
 	case state.PhaseDone:
-		return currentTheme.styles.Success.Render("✓ " + string(phase))
+		return currentTheme.styles.PhaseSuccess.Render("●")
 	case state.PhaseFailed:
-		return currentTheme.styles.Error.Render("× " + string(phase))
+		return currentTheme.styles.PhaseError.Render("●")
 	case state.PhaseAwaitingApproval, state.PhasePausedForInput:
-		return currentTheme.styles.Warning.Render("! " + string(phase))
+		return currentTheme.styles.PhaseWarning.Render("●")
 	default:
-		return currentTheme.styles.Busy.Render("● " + string(phase))
+		return currentTheme.styles.PhaseInfo.Render("●")
 	}
 }
 
@@ -450,7 +523,7 @@ func outcomeIcon(currentTheme theme, outcome evidenceOutcome) string {
 	case evidenceFail:
 		return currentTheme.styles.Error.Render("×")
 	default:
-		return currentTheme.styles.Busy.Render("⋯")
+		return currentTheme.styles.PhaseInfo.Render("⋯")
 	}
 }
 
@@ -504,7 +577,7 @@ func renderStatusBar(current model, width, height int) string {
 				"…",
 			) + current.theme.styles.InputCursor.Render("▌"),
 		)
-		footer := current.theme.styles.Muted.Render(
+		footer := current.theme.styles.Hint.Render(
 			"enter confirm · esc cancel",
 		)
 		if current.promptError != "" {
@@ -523,6 +596,7 @@ func renderStatusBar(current model, width, height int) string {
 	}
 
 	primary := statusSignal(current)
+	contentWidth := max(1, innerWidth-2)
 	hints := "j/k scroll · home/end · q quit"
 	if current.hasStatus {
 		switch current.status.Phase {
@@ -537,10 +611,14 @@ func renderStatusBar(current model, width, height int) string {
 			}
 		}
 	}
-	content := ansi.TruncateWc(primary, innerWidth, "…") + "\n" +
-		current.theme.styles.Muted.Render(
-			ansi.TruncateWc(hints, innerWidth, "…"),
-		)
+	content := alignStatusLine(
+		primary,
+		current.theme.styles.Hint.Render(hints),
+		contentWidth,
+	)
+	if detail := statusDetail(current, contentWidth); detail != "" {
+		content += "\n" + detail
+	}
 	return current.theme.styles.StatusBar.
 		Width(innerWidth).
 		Height(max(1, height)).
@@ -550,40 +628,196 @@ func renderStatusBar(current model, width, height int) string {
 
 func statusSignal(current model) string {
 	if current.stopping {
-		return current.spinner.View() +
-			current.theme.styles.Warning.Render(" Stopping safely")
+		return statusChip(
+			current.theme.styles.Warning,
+			"⟳ STOPPING SAFELY",
+		)
 	}
-	if current.operation != "" || current.activeStep != "" {
+	if current.isWorking() {
 		step := current.activeRole
 		if step == "" {
 			step = current.activeStep
 		}
-		return current.spinner.View() + gradientText(
+		return workingStatusChip(
 			current.theme,
-			" "+strings.ToUpper(step)+" WORKING",
+			current.spinner.View()+workingGradientText(
+				current.theme,
+				" "+strings.ToUpper(step)+" WORKING",
+			),
 		)
 	}
 	if !current.hasStatus {
-		return current.theme.styles.Busy.Render("⋯ Starting pipeline")
+		return statusChip(
+			current.theme.styles.Info,
+			"◇ STARTING PIPELINE",
+		)
 	}
 	if current.status.Phase == state.PhaseAwaitingApproval {
-		return current.theme.styles.Pending.Render(
-			"! Approval required — this is the normal plan gate",
+		return statusChip(
+			current.theme.styles.Warning,
+			"! APPROVAL NEEDED",
 		)
 	}
 	if current.status.PendingAction != nil {
-		return current.theme.styles.Pending.Render(
-			"! Pending action — " +
-				string(current.status.PendingAction.Kind) +
-				": " + current.status.PendingAction.Prompt,
+		return statusChip(
+			current.theme.styles.Warning,
+			pendingChipText(current.status.PendingAction.Kind),
 		)
 	}
 	if current.operationErr != nil {
-		return current.theme.styles.Error.Render(
-			"× " + current.operationErr.Error(),
+		return statusChip(
+			current.theme.styles.Error,
+			"× OPERATION FAILED",
 		)
 	}
-	return phaseValue(current.theme, current.status.Phase)
+	return statusChip(
+		phaseChipStyle(current.theme, current.status.Phase),
+		"● "+strings.ToUpper(
+			strings.ReplaceAll(string(current.status.Phase), "_", " "),
+		),
+	)
+}
+
+func renderWordmark(currentTheme theme, expanded bool) string {
+	if !expanded {
+		return gradientText(currentTheme, "COTERIX")
+	}
+	rows := make([]string, 0, len(expandedWordmarkRows))
+	for _, row := range expandedWordmarkRows {
+		rows = append(rows, gradientText(currentTheme, row))
+	}
+	return strings.Join(rows, "\n")
+}
+
+func renderSidebarSectionTitle(
+	currentTheme theme,
+	label string,
+	width int,
+) string {
+	title := brandEndpointGradient(currentTheme, "╱╱╱") + " " +
+		currentTheme.styles.SectionTitle.Render(label)
+	remaining := width - ansi.StringWidth(title) - 1
+	if remaining <= 0 {
+		return ansi.TruncateWc(title, max(1, width), "…")
+	}
+	return title + " " + currentTheme.styles.Separator.Render(
+		strings.Repeat("─", remaining),
+	)
+}
+
+func cliRoleStyle(
+	currentTheme theme,
+	cliName string,
+	fallback lipgloss.Style,
+) lipgloss.Style {
+	switch strings.ToLower(strings.TrimSpace(cliName)) {
+	case "claude":
+		return currentTheme.styles.Claude
+	case "codex":
+		return currentTheme.styles.Codex
+	default:
+		return fallback
+	}
+}
+
+func statusDetail(current model, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	parts := make([]string, 0, 2)
+	if current.hasStatus && current.status.PendingAction != nil {
+		if prompt := strings.TrimSpace(current.status.PendingAction.Prompt); prompt != "" {
+			parts = append(
+				parts,
+				current.theme.styles.Warning.Render(prompt),
+			)
+		}
+	}
+	if current.hasStatus && current.status.LastError != nil {
+		if message := strings.TrimSpace(*current.status.LastError); message != "" {
+			parts = append(
+				parts,
+				current.theme.styles.Error.Render("× "+message),
+			)
+		}
+	} else if current.operationErr != nil {
+		parts = append(
+			parts,
+			current.theme.styles.Error.Render(
+				"× "+current.operationErr.Error(),
+			),
+		)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	if len(parts) == 1 {
+		return ansi.TruncateWc(parts[0], width, "…")
+	}
+	separator := " · "
+	available := width - ansi.StringWidth(separator)
+	if available < 2 {
+		return ansi.TruncateWc(strings.Join(parts, separator), width, "…")
+	}
+	leftWidth := available / 2
+	rightWidth := available - leftWidth
+	return ansi.TruncateWc(parts[0], leftWidth, "…") +
+		separator +
+		ansi.TruncateWc(parts[1], rightWidth, "…")
+}
+
+func alignStatusLine(left, right string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	leftWidth := ansi.StringWidth(left)
+	if leftWidth >= width {
+		return ansi.TruncateWc(left, width, "…")
+	}
+	available := width - leftWidth - 1
+	if available <= 0 {
+		return left
+	}
+	right = ansi.TruncateWc(right, available, "…")
+	padding := max(1, width-leftWidth-ansi.StringWidth(right))
+	return left + strings.Repeat(" ", padding) + right
+}
+
+func statusChip(style lipgloss.Style, content string) string {
+	return style.Bold(true).Padding(0, 1).Render(content)
+}
+
+func workingStatusChip(currentTheme theme, content string) string {
+	padding := currentTheme.styles.Busy.Render(" ")
+	return padding + content + padding
+}
+
+func phaseChipStyle(currentTheme theme, phase state.Phase) lipgloss.Style {
+	switch phase {
+	case state.PhaseAwaitingApproval, state.PhasePausedForInput:
+		return currentTheme.styles.Warning
+	case state.PhaseDone:
+		return currentTheme.styles.Success
+	case state.PhaseFailed:
+		return currentTheme.styles.Error
+	default:
+		return currentTheme.styles.Info
+	}
+}
+
+func pendingChipText(kind state.PendingKind) string {
+	switch kind {
+	case state.PendingPlanQuestion:
+		return "? PENDING · plan_question"
+	case state.PendingPlanCap:
+		return "⟳ PENDING · plan_cap"
+	case state.PendingTaskCap:
+		return "▶ PENDING · task_cap"
+	case state.PendingAuth:
+		return "◇ PENDING · auth"
+	default:
+		return "! PENDING"
+	}
 }
 
 func gradientText(currentTheme theme, text string) string {
@@ -598,6 +832,63 @@ func gradientText(currentTheme theme, text string) string {
 	colors := lipgloss.Blend1D(len(runes), stops...)
 	if len(colors) != len(runes) {
 		return currentTheme.styles.Logo.Render(text)
+	}
+	var output strings.Builder
+	for index, character := range runes {
+		output.WriteString(
+			lipgloss.NewStyle().
+				Foreground(colors[index]).
+				Bold(true).
+				Render(string(character)),
+		)
+	}
+	return output.String()
+}
+
+func workingGradientText(currentTheme theme, text string) string {
+	runes := []rune(text)
+	if len(runes) == 0 {
+		return ""
+	}
+	stops := make(
+		[]color.Color,
+		0,
+		len(currentTheme.tokens.Gradient.BrandLeftToRight),
+	)
+	for _, token := range currentTheme.tokens.Gradient.BrandLeftToRight {
+		stops = append(stops, lipgloss.Color(token))
+	}
+	colors := lipgloss.Blend1D(len(runes), stops...)
+	if len(colors) != len(runes) {
+		return currentTheme.styles.Busy.Render(text)
+	}
+	background := lipgloss.Color(currentTheme.tokens.Status.Busy.BG)
+	var output strings.Builder
+	for index, character := range runes {
+		output.WriteString(
+			lipgloss.NewStyle().
+				Foreground(colors[index]).
+				Background(background).
+				Bold(true).
+				Render(string(character)),
+		)
+	}
+	return output.String()
+}
+
+func brandEndpointGradient(currentTheme theme, text string) string {
+	runes := []rune(text)
+	stops := currentTheme.tokens.Gradient.BrandLeftToRight
+	if len(runes) == 0 || len(stops) == 0 {
+		return ""
+	}
+	colors := lipgloss.Blend1D(
+		len(runes),
+		lipgloss.Color(stops[0]),
+		lipgloss.Color(stops[len(stops)-1]),
+	)
+	if len(colors) != len(runes) {
+		return currentTheme.styles.SectionTitle.Render(text)
 	}
 	var output strings.Builder
 	for index, character := range runes {

@@ -45,6 +45,95 @@ func TestMarkdownRendererRendersPlanVerdictAndDiff(t *testing.T) {
 	}
 	assertRenderedColorPresent(t, diff, tokens.Diff.InsertFG)
 	assertRenderedColorPresent(t, diff, tokens.Diff.DeleteFG)
+	assertRenderedBackgroundPresent(t, diff, tokens.Diff.InsertLineBG)
+	assertRenderedBackgroundPresent(t, diff, tokens.Diff.DeleteLineBG)
+}
+
+func TestGlamourStyleKeepsSyntaxAndDiffTokenMappings(t *testing.T) {
+	tokens, err := loadColorTokens()
+	if err != nil {
+		t.Fatal(err)
+	}
+	chroma := glamourStyle(tokens).CodeBlock.Chroma
+	if chroma == nil {
+		t.Fatal("Glamour Chroma style is nil")
+	}
+
+	syntaxCases := []struct {
+		name string
+		got  *string
+		want string
+	}{
+		{name: "text", got: chroma.Text.Color, want: tokens.Syntax.Text},
+		{name: "error", got: chroma.Error.Color, want: tokens.Syntax.Error},
+		{name: "comment", got: chroma.Comment.Color, want: tokens.Syntax.Comment},
+		{name: "preprocessor", got: chroma.CommentPreproc.Color, want: tokens.Syntax.Preprocessor},
+		{name: "keyword", got: chroma.Keyword.Color, want: tokens.Syntax.Keyword},
+		{name: "keyword_reserved", got: chroma.KeywordReserved.Color, want: tokens.Syntax.KeywordReserved},
+		{name: "keyword_namespace", got: chroma.KeywordNamespace.Color, want: tokens.Syntax.KeywordNamespace},
+		{name: "type", got: chroma.KeywordType.Color, want: tokens.Syntax.Type},
+		{name: "operator", got: chroma.Operator.Color, want: tokens.Syntax.Operator},
+		{name: "punctuation", got: chroma.Punctuation.Color, want: tokens.Syntax.Punctuation},
+		{name: "name", got: chroma.Name.Color, want: tokens.Syntax.Name},
+		{name: "builtin", got: chroma.NameBuiltin.Color, want: tokens.Syntax.Builtin},
+		{name: "tag", got: chroma.NameTag.Color, want: tokens.Syntax.Tag},
+		{name: "attribute", got: chroma.NameAttribute.Color, want: tokens.Syntax.Attribute},
+		{name: "class", got: chroma.NameClass.Color, want: tokens.Syntax.Class},
+		{name: "decorator", got: chroma.NameDecorator.Color, want: tokens.Syntax.Decorator},
+		{name: "function", got: chroma.NameFunction.Color, want: tokens.Syntax.Function},
+		{name: "number", got: chroma.LiteralNumber.Color, want: tokens.Syntax.Number},
+		{name: "string", got: chroma.LiteralString.Color, want: tokens.Syntax.String},
+		{name: "string_escape", got: chroma.LiteralStringEscape.Color, want: tokens.Syntax.StringEscape},
+	}
+	for _, syntaxCase := range syntaxCases {
+		t.Run(syntaxCase.name, func(t *testing.T) {
+			if syntaxCase.got == nil || *syntaxCase.got != syntaxCase.want {
+				t.Fatalf(
+					"syntax mapping=%v, want %q",
+					syntaxCase.got,
+					syntaxCase.want,
+				)
+			}
+		})
+	}
+
+	diffCases := []struct {
+		name string
+		got  *string
+		want string
+	}{
+		{
+			name: "insert_foreground",
+			got:  chroma.GenericInserted.Color,
+			want: tokens.Diff.InsertFG,
+		},
+		{
+			name: "insert_line_background",
+			got:  chroma.GenericInserted.BackgroundColor,
+			want: tokens.Diff.InsertLineBG,
+		},
+		{
+			name: "delete_foreground",
+			got:  chroma.GenericDeleted.Color,
+			want: tokens.Diff.DeleteFG,
+		},
+		{
+			name: "delete_line_background",
+			got:  chroma.GenericDeleted.BackgroundColor,
+			want: tokens.Diff.DeleteLineBG,
+		},
+	}
+	for _, diffCase := range diffCases {
+		t.Run(diffCase.name, func(t *testing.T) {
+			if diffCase.got == nil || *diffCase.got != diffCase.want {
+				t.Fatalf(
+					"diff mapping=%v, want %q",
+					diffCase.got,
+					diffCase.want,
+				)
+			}
+		})
+	}
 }
 
 func TestRenderMarkdownCombinesArtifacts(t *testing.T) {
@@ -136,6 +225,22 @@ func assertRenderedColorPresent(t *testing.T, rendered string, token string) {
 		}
 	}
 	t.Fatalf("rendered output did not use injected token %q", token)
+}
+
+func assertRenderedBackgroundPresent(t *testing.T, rendered string, token string) {
+	t.Helper()
+	screen := uv.NewScreenBuffer(max(1, ansi.StringWidth(rendered)), max(1, strings.Count(rendered, "\n")+1))
+	uv.NewStyledString(rendered).Draw(screen, screen.Bounds())
+	want := colorFromToken(token)
+	for y := screen.Bounds().Min.Y; y < screen.Bounds().Max.Y; y++ {
+		for x := screen.Bounds().Min.X; x < screen.Bounds().Max.X; x++ {
+			cell := screen.CellAt(x, y)
+			if cell != nil && sameColor(cell.Style.Bg, want) {
+				return
+			}
+		}
+	}
+	t.Fatalf("rendered output did not use injected background token %q", token)
 }
 
 func colorFromToken(token string) color.Color {

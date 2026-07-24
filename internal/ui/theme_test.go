@@ -9,7 +9,9 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
+	"charm.land/bubbles/v2/spinner"
 	"charm.land/lipgloss/v2"
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
@@ -43,6 +45,7 @@ func TestEmbeddedColorTokensAreSoleSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, section := range []string{
+		"palette",
 		"gradient",
 		"theme",
 		"component",
@@ -68,6 +71,59 @@ func TestColorTokensRejectMissingRequiredColor(t *testing.T) {
 	}
 }
 
+func TestColorTokensRejectMissingPaletteColorAtLoad(t *testing.T) {
+	for _, rampName := range []string{
+		"ink",
+		"codex",
+		"claude",
+		"violet",
+		"success",
+		"warning",
+		"danger",
+		"cyan",
+	} {
+		t.Run(rampName, func(t *testing.T) {
+			source := mutatePaletteRamp(t, rampName, func(ramp map[string]any) {
+				delete(ramp, "400")
+			})
+			_, err := parseColorTokens(source)
+			if err == nil {
+				t.Fatal("missing palette color was accepted")
+			}
+			if !strings.Contains(err.Error(), "palette."+rampName+".400") {
+				t.Fatalf("missing palette color error lacks token path: %v", err)
+			}
+		})
+	}
+}
+
+func TestColorTokensRejectPaletteColorTypoAtLoad(t *testing.T) {
+	for _, rampName := range []string{
+		"ink",
+		"codex",
+		"claude",
+		"violet",
+		"success",
+		"warning",
+		"danger",
+		"cyan",
+	} {
+		t.Run(rampName, func(t *testing.T) {
+			source := mutatePaletteRamp(t, rampName, func(ramp map[string]any) {
+				ramp["fourHundred"] = ramp["400"]
+				delete(ramp, "400")
+			})
+			_, err := parseColorTokens(source)
+			if err == nil {
+				t.Fatal("misspelled palette color was accepted")
+			}
+			if !strings.Contains(err.Error(), "fourHundred") {
+				t.Fatalf("misspelled palette color error lacks unknown key: %v", err)
+			}
+		})
+	}
+}
+
 func TestDashboardStylesUseInjectedTokens(t *testing.T) {
 	tokens, err := loadColorTokens()
 	if err != nil {
@@ -81,6 +137,98 @@ func TestDashboardStylesUseInjectedTokens(t *testing.T) {
 	cell = firstStyledCell(t, styles.DiffInsert.Render("I"))
 	assertSameColor(t, cell.Style.Fg, lipgloss.Color(tokens.Diff.InsertFG))
 	assertSameColor(t, cell.Style.Bg, lipgloss.Color(tokens.Diff.InsertLineBG))
+
+	cell = firstStyledCell(t, styles.Claude.Render("C"))
+	assertSameColor(t, cell.Style.Fg, lipgloss.Color(tokens.Palette.Claude.Shade400))
+
+	cell = firstStyledCell(t, styles.Codex.Render("C"))
+	assertSameColor(t, cell.Style.Fg, lipgloss.Color(tokens.Palette.Codex.Shade400))
+
+	cell = firstStyledCell(t, styles.Info.Render("I"))
+	assertSameColor(t, cell.Style.Fg, lipgloss.Color(tokens.Status.Info.FG))
+	assertSameColor(t, cell.Style.Bg, lipgloss.Color(tokens.Status.Info.BG))
+
+	cell = firstStyledCell(t, styles.Hint.Render("H"))
+	assertSameColor(t, cell.Style.Fg, lipgloss.Color(tokens.Theme.FGSubtle))
+
+	cell = firstStyledCell(t, styles.Separator.Render("─"))
+	assertSameColor(t, cell.Style.Fg, lipgloss.Color(tokens.Theme.Separator))
+
+	phaseStyles := []struct {
+		name  string
+		style lipgloss.Style
+		color string
+	}{
+		{name: "info", style: styles.PhaseInfo, color: tokens.Status.Info.FG},
+		{name: "warning", style: styles.PhaseWarning, color: tokens.Status.Warning.FG},
+		{name: "success", style: styles.PhaseSuccess, color: tokens.Status.Success.FG},
+		{name: "error", style: styles.PhaseError, color: tokens.Status.Error.FG},
+	}
+	for _, phase := range phaseStyles {
+		t.Run("phase_"+phase.name, func(t *testing.T) {
+			cell := firstStyledCell(t, phase.style.Render("●"))
+			assertSameColor(t, cell.Style.Fg, lipgloss.Color(phase.color))
+			if _, ok := phase.style.GetBackground().(lipgloss.NoColor); !ok {
+				t.Fatalf("%s phase dot has a background", phase.name)
+			}
+		})
+	}
+}
+
+func TestWorkingSpinnerUsesInjectedGradientFrames(t *testing.T) {
+	tokens, err := loadColorTokens()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	working := workingSpinner(tokens)
+	if working.FPS < 200*time.Millisecond || working.FPS > 250*time.Millisecond {
+		t.Fatalf("working spinner FPS=%s, want 200-250ms", working.FPS)
+	}
+	if len(working.Frames) != len(spinner.Points.Frames) {
+		t.Fatalf(
+			"working spinner has %d frames, want %d",
+			len(working.Frames),
+			len(spinner.Points.Frames),
+		)
+	}
+
+	renderedColors := make([]color.Color, 0, len(working.Frames))
+	for index, frame := range working.Frames {
+		if plain := ansi.Strip(frame); plain != spinner.Points.Frames[index] {
+			t.Fatalf(
+				"working frame %d text=%q, want %q",
+				index,
+				plain,
+				spinner.Points.Frames[index],
+			)
+		}
+		cell := firstStyledCell(t, frame)
+		assertSameColor(
+			t,
+			cell.Style.Bg,
+			lipgloss.Color(tokens.Status.Busy.BG),
+		)
+		renderedColors = append(renderedColors, cell.Style.Fg)
+	}
+	assertSameColor(
+		t,
+		renderedColors[0],
+		lipgloss.Color(tokens.Component.WorkingGradientFrom),
+	)
+	assertSameColor(
+		t,
+		renderedColors[len(renderedColors)-1],
+		lipgloss.Color(tokens.Component.WorkingGradientTo),
+	)
+	for index := 1; index < len(renderedColors); index++ {
+		if reflect.DeepEqual(
+			rgba(renderedColors[index-1]),
+			rgba(renderedColors[index]),
+		) {
+			t.Fatalf("working frames %d and %d have the same color", index-1, index)
+		}
+	}
 }
 
 func TestANSI16RemapPreservesOtherSGR(t *testing.T) {
@@ -166,6 +314,35 @@ func assertSameColor(t *testing.T, got color.Color, want color.Color) {
 func rgba(value color.Color) [4]uint32 {
 	red, green, blue, alpha := value.RGBA()
 	return [4]uint32{red, green, blue, alpha}
+}
+
+func mutatePaletteRamp(
+	t *testing.T,
+	name string,
+	mutate func(map[string]any),
+) []byte {
+	t.Helper()
+	var document map[string]any
+	if err := json.Unmarshal(
+		[]byte(design.CoterixColorTokensJSON()),
+		&document,
+	); err != nil {
+		t.Fatal(err)
+	}
+	palette, ok := document["palette"].(map[string]any)
+	if !ok {
+		t.Fatal("color-token palette is not an object")
+	}
+	ramp, ok := palette[name].(map[string]any)
+	if !ok {
+		t.Fatalf("color-token palette ramp %q is not an object", name)
+	}
+	mutate(ramp)
+	source, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return source
 }
 
 func TestANSI16RemapLeavesPlainTextAndOtherCSI(t *testing.T) {

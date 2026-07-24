@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 	"github.com/ridenow/coterix/internal/cli"
 	"github.com/ridenow/coterix/internal/pipeline"
@@ -241,9 +242,28 @@ func integrationModel(
 func runIntegrationCommand(command tea.Cmd) <-chan tea.Msg {
 	done := make(chan tea.Msg, 1)
 	go func() {
-		done <- command()
+		runIntegrationMessage(command(), done)
 	}()
 	return done
+}
+
+func runIntegrationMessage(message tea.Msg, done chan<- tea.Msg) {
+	switch message := message.(type) {
+	case operationDoneMsg:
+		done <- message
+	case tea.BatchMsg:
+		for _, command := range message {
+			if command == nil {
+				continue
+			}
+			child := command()
+			if _, ok := child.(spinner.TickMsg); ok {
+				continue
+			}
+			runIntegrationMessage(child, done)
+			return
+		}
+	}
 }
 
 func waitForIntegrationExecutor(

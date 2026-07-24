@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
 	"github.com/ridenow/coterix/internal/pipeline"
 	"github.com/ridenow/coterix/internal/runner"
@@ -121,6 +122,95 @@ func TestModelStreamsBoundedLogsAndAttemptCompletion(t *testing.T) {
 	if last.Stream != runner.StreamStderr ||
 		!containsAll(last.Text, "attempt 2", "timed out", "idle timeout") {
 		t.Fatalf("attempt completion log=%#v", last)
+	}
+}
+
+func TestWorkingAnimationTicksOnlyWhileActive(t *testing.T) {
+	current := testModel(t, &fakeUIControl{})
+	current.operation = operationRun
+	current.artifactRender = "cached-artifact"
+
+	previousFrame := current.spinner.View()
+	previousColor := firstStyledCell(t, previousFrame).Style.Fg
+	for tick := 0; tick < 2; tick++ {
+		updated, command := current.Update(current.spinner.Tick())
+		current = updated.(model)
+		if command == nil {
+			t.Fatalf("active tick %d did not schedule the next frame", tick)
+		}
+		frame := current.spinner.View()
+		if frame == previousFrame {
+			t.Fatalf("active tick %d did not change the frame", tick)
+		}
+		color := firstStyledCell(t, frame).Style.Fg
+		if rgba(color) == rgba(previousColor) {
+			t.Fatalf("active tick %d did not change the frame color", tick)
+		}
+		if current.artifactRender != "cached-artifact" {
+			t.Fatalf(
+				"active tick %d rerendered cached artifacts: %q",
+				tick,
+				current.artifactRender,
+			)
+		}
+		previousFrame = frame
+		previousColor = color
+	}
+
+	current.activeStep = pipeline.StepImplementation
+	current.activeRole = "impl_writer"
+	current.activeCLI = "codex"
+	updated, command := current.Update(operationDoneMsg{})
+	current = updated.(model)
+	if command != nil || current.isWorking() ||
+		current.activeRole != "" || current.activeCLI != "" {
+		t.Fatalf(
+			"idle transition command=%v working=%t role=%q cli=%q",
+			command,
+			current.isWorking(),
+			current.activeRole,
+			current.activeCLI,
+		)
+	}
+	idleFrame := current.spinner.View()
+	updated, command = current.Update(current.spinner.Tick())
+	current = updated.(model)
+	if command != nil {
+		t.Fatal("idle spinner tick scheduled another tick")
+	}
+	if current.spinner.View() != idleFrame {
+		t.Fatal("idle spinner tick changed the frame")
+	}
+	if current.artifactRender != "cached-artifact" {
+		t.Fatal("idle spinner tick changed the artifact render cache")
+	}
+}
+
+func TestInitStartsOperationAndWorkingTick(t *testing.T) {
+	current := testModel(t, &fakeUIControl{})
+	current.operation = operationRun
+
+	message := current.Init()()
+	batch, ok := message.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Init command returned %T, want tea.BatchMsg", message)
+	}
+	var operationStarted bool
+	var tickStarted bool
+	for _, command := range batch {
+		switch command().(type) {
+		case operationDoneMsg:
+			operationStarted = true
+		case spinner.TickMsg:
+			tickStarted = true
+		}
+	}
+	if !operationStarted || !tickStarted {
+		t.Fatalf(
+			"Init batch operation=%t tick=%t",
+			operationStarted,
+			tickStarted,
+		)
 	}
 }
 
@@ -258,7 +348,7 @@ func TestModelApprovalRejectAndPendingActionsUseControlPlane(t *testing.T) {
 		if command == nil || current.operation != operationApprove {
 			t.Fatal("approve key did not start a control operation")
 		}
-		done := command().(operationDoneMsg)
+		done := operationDoneFromCommand(t, command)
 		if done.status.Phase != state.PhaseImplementing {
 			t.Fatalf("approve result phase=%s", done.status.Phase)
 		}
@@ -294,7 +384,7 @@ func TestModelApprovalRejectAndPendingActionsUseControlPlane(t *testing.T) {
 		if command == nil || current.prompt != promptNone {
 			t.Fatal("reject confirmation did not start the core operation")
 		}
-		_ = command()
+		_ = operationDoneFromCommand(t, command)
 		response := "revise the gate"
 		assertUICall(t, fake, operationReject, "run-2", &response)
 	})
@@ -322,7 +412,7 @@ func TestModelApprovalRejectAndPendingActionsUseControlPlane(t *testing.T) {
 		if command == nil {
 			t.Fatal("pending response did not start resume")
 		}
-		_ = command()
+		_ = operationDoneFromCommand(t, command)
 		response := "target A"
 		assertUICall(t, fake, operationResume, "run-3", &response)
 
@@ -338,7 +428,7 @@ func TestModelApprovalRejectAndPendingActionsUseControlPlane(t *testing.T) {
 			t.Fatal("auth enter did not resume")
 		}
 		_ = updated
-		_ = command()
+		_ = operationDoneFromCommand(t, command)
 		assertUICall(t, fake, operationResume, "run-3", nil)
 	})
 }
@@ -422,4 +512,36 @@ func containsAll(value string, parts ...string) bool {
 		}
 	}
 	return true
+}
+
+func operationDoneFromCommand(t *testing.T, command tea.Cmd) operationDoneMsg {
+	t.Helper()
+	if command == nil {
+		t.Fatal("nil command")
+	}
+	return operationDoneFromMessage(t, command())
+}
+
+func operationDoneFromMessage(t *testing.T, message tea.Msg) operationDoneMsg {
+	t.Helper()
+	switch message := message.(type) {
+	case operationDoneMsg:
+		return message
+	case tea.BatchMsg:
+		for _, command := range message {
+			if command == nil {
+				continue
+			}
+			switch child := command().(type) {
+			case operationDoneMsg:
+				return child
+			case tea.BatchMsg:
+				return operationDoneFromMessage(t, child)
+			}
+		}
+		t.Fatal("batch command did not contain an operation result")
+	default:
+		t.Fatalf("command returned %T, want operation result", message)
+	}
+	return operationDoneMsg{}
 }

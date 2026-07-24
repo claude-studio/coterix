@@ -91,10 +91,7 @@ func newModel(
 	trackers ...*operationTracker,
 ) model {
 	activity := spinner.New()
-	activity.Spinner = spinner.Spinner{
-		Frames: []string{"⋯"},
-	}
-	activity.Style = theme.styles.Busy
+	activity.Spinner = workingSpinner(theme.tokens)
 	tracker := &operationTracker{}
 	if len(trackers) > 0 && trackers[0] != nil {
 		tracker = trackers[0]
@@ -117,7 +114,7 @@ func newModel(
 }
 
 func (current model) Init() tea.Cmd {
-	return runOperation(
+	operation := runOperation(
 		current.ctx,
 		current.control,
 		current.tracker,
@@ -127,6 +124,7 @@ func (current model) Init() tea.Cmd {
 		"",
 		nil,
 	)
+	return tea.Batch(operation, current.spinnerTickCommand())
 }
 
 func (current model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
@@ -160,6 +158,13 @@ func (current model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return current, nil
+	case spinner.TickMsg:
+		if !current.isWorking() {
+			return current, nil
+		}
+		var command tea.Cmd
+		current.spinner, command = current.spinner.Update(message)
+		return current, command
 	case tea.PasteMsg:
 		if current.prompt != promptNone {
 			current.promptValue += message.Content
@@ -182,6 +187,7 @@ func (current model) View() tea.View {
 func (current model) updatePipelineEvent(
 	event pipeline.Event,
 ) (tea.Model, tea.Cmd) {
+	wasWorking := current.isWorking()
 	switch event.Kind {
 	case pipeline.EventStateSnapshot:
 		if event.Status == nil {
@@ -234,6 +240,9 @@ func (current model) updatePipelineEvent(
 			current.activeCLI = ""
 		}
 	}
+	if !wasWorking && current.isWorking() {
+		return current, current.spinnerTickCommand()
+	}
 	return current, nil
 }
 
@@ -241,6 +250,9 @@ func (current model) finishOperation(
 	result operationDoneMsg,
 ) (tea.Model, tea.Cmd) {
 	current.operation = ""
+	current.activeStep = ""
+	current.activeRole = ""
+	current.activeCLI = ""
 	if result.status.RunID != "" {
 		current.status = result.status
 		current.hasStatus = true
@@ -364,9 +376,10 @@ func (current model) beginOperation(
 	kind operationKind,
 	response *string,
 ) (tea.Model, tea.Cmd) {
+	wasWorking := current.isWorking()
 	current.operation = kind
 	current.operationErr = nil
-	return current, runOperation(
+	operation := runOperation(
 		current.ctx,
 		current.control,
 		current.tracker,
@@ -376,6 +389,20 @@ func (current model) beginOperation(
 		current.status.RunID,
 		response,
 	)
+	if wasWorking {
+		return current, operation
+	}
+	return current, tea.Batch(operation, current.spinnerTickCommand())
+}
+
+func (current model) isWorking() bool {
+	return current.operation != "" || current.activeStep != ""
+}
+
+func (current model) spinnerTickCommand() tea.Cmd {
+	return func() tea.Msg {
+		return current.spinner.Tick()
+	}
 }
 
 func (current model) requestStop() (tea.Model, tea.Cmd) {
