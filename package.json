@@ -1,0 +1,24 @@
+{
+  "name": "coterix",
+  "version": "0.0.1",
+  "description": "Coterix — an orchestration layer for multi-agent systems.",
+  "keywords": [
+    "agents",
+    "orchestration",
+    "multi-agent",
+    "ai",
+    "coterix"
+  ],
+  "license": "MIT",
+  "author": "FRONT-JB <jeonbg@kakao.com>",
+  "files": [
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/claude-studio/coterix.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
