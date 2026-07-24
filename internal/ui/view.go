@@ -849,12 +849,19 @@ func renderStatusBar(current model, width, height int) string {
 			}
 			label = "Response · " + kind
 		}
+		// TruncateLeftWc removes the given number of cells from the left; it is
+		// not a "keep this many" budget. Passing the budget straight in erased
+		// every response shorter than the budget — which is every realistic
+		// response, so the input always rendered empty (live-smoke finding,
+		// 2026-07-25). Only trim when the value actually overflows, and measure
+		// the label in cells: len() counts bytes and the label contains `·`.
+		budget := max(1, innerWidth-ansi.StringWidth(label)-6)
+		value := current.promptValue
+		if overflow := ansi.StringWidth(value) - budget; overflow > 0 {
+			value = ansi.TruncateLeftWc(value, overflow, "…")
+		}
 		input := current.theme.styles.Input.Render(
-			ansi.TruncateLeftWc(
-				current.promptValue,
-				max(1, innerWidth-len(label)-6),
-				"…",
-			) + current.theme.styles.InputCursor.Render("▌"),
+			value + current.theme.styles.InputCursor.Render("▌"),
 		)
 		footer := current.theme.styles.Hint.Render(
 			"enter confirm · esc cancel",

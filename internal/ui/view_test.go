@@ -192,6 +192,43 @@ func TestMainHeaderNamesActiveStepAndIdleState(t *testing.T) {
 	)
 }
 
+// The response the user types must render as text. `len(label)` counts bytes
+// while the truncation budget is measured in cells, so a label containing `·`
+// (3 bytes, 1 cell) plus a wide-rune response over-truncated the input to
+// nothing (live-smoke finding, 2026-07-25).
+func TestPromptRendersWideRuneResponse(t *testing.T) {
+	current := populatedViewModel(t)
+	current.prompt = promptResume
+	current.status.PendingAction = &state.PendingAction{
+		Kind:   state.PendingPlanQuestion,
+		Prompt: "질문",
+	}
+	current.promptValue = "한국어 답변입니다"
+
+	rendered := ansi.Strip(renderStatusBar(current, 120, 4))
+	if !strings.Contains(rendered, "한국어 답변입니다") {
+		t.Fatalf("prompt dropped the typed response:\n%s", rendered)
+	}
+
+	// An ASCII response is equally affected — the defect was never about runes.
+	current.promptValue = "retry please"
+	if rendered = ansi.Strip(
+		renderStatusBar(current, 120, 4),
+	); !strings.Contains(rendered, "retry please") {
+		t.Fatalf("prompt dropped an ASCII response:\n%s", rendered)
+	}
+
+	// Overflow keeps the tail (what is being typed) and marks the cut.
+	current.promptValue = strings.Repeat("a", 40) + "TAIL"
+	rendered = ansi.Strip(renderStatusBar(current, 40, 4))
+	if !strings.Contains(rendered, "TAIL") {
+		t.Fatalf("overflowing prompt lost its tail:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "…") {
+		t.Fatalf("overflowing prompt did not mark the cut:\n%s", rendered)
+	}
+}
+
 func TestLogLinesRenderColumnarTimeTagAndIcon(t *testing.T) {
 	current := populatedViewModel(t)
 	at := time.Date(2026, 7, 24, 21, 42, 7, 0, time.UTC)
