@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/ridenow/coterix/internal/pipeline"
 	"github.com/ridenow/coterix/internal/state"
@@ -49,6 +50,9 @@ func TestRenderSnapshotTableKeepsArgvSelectedShape(t *testing.T) {
 	if strings.Contains(plain, "╱╱╱ RUN") {
 		t.Fatalf("table presentation changed to detail by cardinality:\n%s", plain)
 	}
+	// Inline signals in the one-shot table are foreground-only: no cell —
+	// including the awaiting-approval signal cell — may carry a background.
+	assertNoBackgroundCells(t, rendered)
 
 	oneRun, err := RenderSnapshot(
 		statuses[:1],
@@ -330,5 +334,33 @@ func snapshotTestStatus(
 				Attempt: 2,
 			},
 		},
+	}
+}
+
+// assertNoBackgroundCells fails when any rendered cell paints a background —
+// snapshot output has no chips, so every signal must be foreground-only.
+func assertNoBackgroundCells(t *testing.T, rendered string) {
+	t.Helper()
+	width := 1
+	for _, line := range strings.Split(rendered, "\n") {
+		width = max(width, ansi.StringWidth(line))
+	}
+	height := max(1, strings.Count(rendered, "\n")+1)
+	screen := uv.NewScreenBuffer(width, height)
+	uv.NewStyledString(rendered).Draw(screen, screen.Bounds())
+	for y := screen.Bounds().Min.Y; y < screen.Bounds().Max.Y; y++ {
+		for x := screen.Bounds().Min.X; x < screen.Bounds().Max.X; x++ {
+			cell := screen.CellAt(x, y)
+			if cell == nil || cell.Style.Bg == nil {
+				continue
+			}
+			t.Fatalf(
+				"cell %d,%d (%q) has background %v",
+				x,
+				y,
+				cell.Content,
+				cell.Style.Bg,
+			)
+		}
 	}
 }

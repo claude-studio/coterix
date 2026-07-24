@@ -182,7 +182,8 @@ func renderSnapshotTable(
 			case 9:
 				if rowData[row].AwaitingApproval ||
 					rowData[row].PendingKind != "" {
-					return currentTheme.styles.Warning
+					// Inline signal, not a chip: foreground only.
+					return currentTheme.styles.PhaseWarning
 				}
 				return currentTheme.styles.Muted
 			default:
