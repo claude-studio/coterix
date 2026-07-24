@@ -2,6 +2,17 @@
 
 Coterix 프로젝트에서 작업하는 에이전트를 위한 지침입니다.
 
+## 설계·빌드 문서 (로컬 전용)
+
+구현 작업 전 로컬 `docs/`의 설계 문서를 먼저 읽는다. 이 문서들은 공개 저장소에 포함되지 않는다(git 미추적):
+
+- `docs/coterix-guide.md` — 작업 규칙·경계·확정된 결정
+- `docs/PLAN.md` — 정식 build contract
+- `docs/BUILD.md` — 구현 마일스톤(M0~)
+- `docs/spec/` — cli-config·state·ui 스펙
+- `docs/prompts/` — 에이전트 CLI 프롬프트
+- `docs/agent/`, `docs/human/` — 설계 근거·판단 변화 스냅샷
+
 ## Git Commit 규칙
 
 Git 커밋 메시지를 작성할 때 다음 규칙을 **반드시** 따르세요.
