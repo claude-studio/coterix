@@ -150,67 +150,294 @@ func dashboardMainInnerWidth(width, height int) int {
 // renderMain wraps the feed in the bordered command card on wide layouts. The
 // compact branch keeps the pre-card feed exactly (design-plan.md v1
 // acceptance: compact runs header+feed+status without the card).
+// renderMain lays the wide pane out as independently scrollable boxes (T14 W1):
+// PENDING (only while blocked) · PIPELINE FEED · LIVE OUTPUT · ACTIVITY. Each
+// box owns its scroll offset so reading the artifacts never displaces the live
+// activity, and `tab` moves focus between them (T14 W2).
 func renderMain(current model, width, height int) string {
-	innerWidth := max(1, width-4)
-	// The activity tail is pinned under the scrolling feed, so it claims its
-	// rows first and the feed scrolls within what is left (plan T13 W2).
-	tail := renderActivityTail(current, innerWidth, activityTailLimit(current))
-	tailHeight := 0
-	if tail != "" {
-		tailHeight = strings.Count(tail, "\n") + 1
-	}
 	if !isWide(current.width, current.height) {
-		innerHeight := max(1, height-2)
-		// compact gets a tighter pending budget but must never drop the question
-		// — it is the one thing blocking the run (T14 W1).
-		pending := renderPendingBox(current, innerWidth, max(3, innerHeight/3))
-		pendingHeight := 0
-		if pending != "" {
-			pendingHeight = strings.Count(pending, "\n") + 1
-		}
-		visible := visibleLines(
-			renderFeed(current, innerWidth),
-			max(1, innerHeight-tailHeight-pendingHeight),
-			current.scroll,
-		)
-		if pending != "" {
-			visible = pending + "\n" + visible
-		}
-		if tail != "" {
-			visible += "\n" + tail
-		}
-		return current.theme.styles.Main.
-			Width(innerWidth).
-			Height(innerHeight).
-			Padding(1, 2).
-			Render(visible)
+		return renderMainCompact(current, width, height)
 	}
+	// lipgloss Width() is the *final* width including the border (measured in
+	// T12), so MainCard spends 2 cells on its border and 2 on padding before the
+	// boxes get any room; each box then spends 4 more on its own border and
+	// padding. Overshooting here wraps every box line and doubles the row count.
+	boxWidth := max(8, width-4)
+	innerWidth := max(1, boxWidth-4)
+	order := mainBoxOrder(current)
+	// MainCard's own border costs 2 rows and the header claims 1; the boxes share
+	// what is left.
+	total := max(1, height-3)
 
-	innerHeight := max(1, height-3)
-	// The pending question claims rows ahead of the artifacts: it is the one
-	// thing the run is blocked on (T14 W1).
-	pending := renderPendingBox(current, innerWidth, max(3, innerHeight/2))
-	pendingHeight := 0
-	if pending != "" {
-		pendingHeight = strings.Count(pending, "\n") + 1
+	bodies := make([]string, len(order))
+	for index, box := range order {
+		bodies[index] = mainBoxBody(current, box, innerWidth, max(1, total/2-2))
 	}
-	visible := visibleLines(
-		renderFeed(current, innerWidth),
-		max(1, innerHeight-tailHeight-pendingHeight),
-		current.scroll,
-	)
-	if pending != "" {
-		visible = pending + "\n" + visible
+	heights := distributeMainBoxHeights(order, bodies, total, 2)
+
+	parts := make([]string, 0, len(order)+1)
+	parts = append(parts, renderMainHeader(current, boxWidth))
+	for index, box := range order {
+		if heights[index] < 3 {
+			continue
+		}
+		body := visibleLines(
+			bodies[index],
+			heights[index]-2,
+			current.boxScroll[box],
+		)
+		if box == boxFeed {
+			// The artifacts box absorbs the leftover rows, so pad it to its
+			// allocation — otherwise the pane ends in a ragged gap below the last
+			// box. Pad as a line slice: appending "\n" instead would leave a
+			// trailing newline that renderBoxCard's TrimSuffix then eats, making
+			// the row count drift.
+			lines := strings.Split(body, "\n")
+			for len(lines) < heights[index]-2 {
+				lines = append(lines, "")
+			}
+			body = strings.Join(lines, "\n")
+		}
+		parts = append(parts, renderBoxCard(
+			current.theme,
+			mainBoxTitle(current, box),
+			body,
+			boxWidth,
+			current.focus == box,
+		))
 	}
-	if tail != "" {
-		visible += "\n" + tail
-	}
-	body := renderMainHeader(current, innerWidth) + "\n" + visible
 	return current.theme.styles.MainCard.
 		Width(max(1, width)).
 		Height(max(1, height)).
 		Padding(0, 1).
-		Render(body)
+		Render(strings.Join(parts, "\n"))
+}
+
+// renderMainCompact keeps the single-column stack: at 80x24 there is no room for
+// per-box chrome or a focus concept, so section titles separate the parts and one
+// scroll drives the whole column (T14 W1/W2 — compact is explicitly excluded).
+func renderMainCompact(current model, width, height int) string {
+	innerWidth := max(1, width-4)
+	// Main has no border, but its Padding(1, 2) costs 2 rows and 4 cells. Wrapping
+	// bodies to innerWidth would overflow that by 4 cells, and lipgloss then wraps
+	// again — silently inflating the row count past the budget.
+	bodyWidth := max(1, innerWidth-4)
+	innerHeight := max(1, height-2)
+	order := mainBoxOrder(current)
+	bodies := make([]string, len(order))
+	for index, box := range order {
+		bodies[index] = mainBoxBody(
+			current,
+			box,
+			bodyWidth,
+			max(1, innerHeight/2-1),
+		)
+	}
+	// One row of chrome per section (its title). Sharing one budget is what keeps
+	// the bottom section from being clipped without a marker at 80x24, where a
+	// widened failure tail and a PENDING question compete for 18 rows
+	// (review round-3 f1).
+	heights := distributeMainBoxHeights(order, bodies, innerHeight, 1)
+
+	parts := make([]string, 0, len(order)*2)
+	for index, box := range order {
+		if heights[index] < 2 {
+			continue
+		}
+		parts = append(
+			parts,
+			current.theme.styles.SectionTitle.Render(
+				"╱╱╱ "+mainBoxTitle(current, box),
+			),
+			visibleLines(
+				bodies[index],
+				heights[index]-1,
+				current.boxScroll[box],
+			),
+		)
+	}
+	return current.theme.styles.Main.
+		Width(innerWidth).
+		Height(innerHeight).
+		Padding(1, 2).
+		Render(strings.Join(parts, "\n"))
+}
+
+// The four box bodies below are the *content* of the main pane's boxes, without
+// section chrome, so the wide layout can put each one in its own scrollable box
+// (T14 W1) while the compact layout still stacks them into one column.
+
+func artifactBody(current model) string {
+	if current.artifactRenderErr != nil {
+		return current.theme.styles.PhaseError.Render(
+			"× " + current.artifactRenderErr.Error(),
+		)
+	}
+	if current.artifactRender != "" {
+		return current.artifactRender
+	}
+	return current.theme.styles.Muted.Render("⋯ No artifacts yet")
+}
+
+func lifecycleBody(current model, innerWidth int) string {
+	if len(current.logs) == 0 {
+		return current.theme.styles.Muted.Render(
+			"⋯ Waiting for the first pipeline step",
+		)
+	}
+	lines := make([]string, 0, len(current.logs))
+	for _, line := range current.logs {
+		lines = append(
+			lines,
+			renderLogLine(current.theme, line, innerWidth, false),
+		)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func activityBody(current model, innerWidth, limit int) string {
+	if len(current.activity) == 0 {
+		return activityWaitingBody(current, innerWidth)
+	}
+	lines := current.activity
+	if limit > 0 && len(lines) > limit {
+		lines = lines[len(lines)-limit:]
+	}
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		// muteStream: tail lines are progress, not diagnostics (codex writes
+		// progress to stderr).
+		out = append(out, renderLogLine(current.theme, line, innerWidth, true))
+	}
+	return strings.Join(out, "\n")
+}
+
+func pendingBody(current model, innerWidth, maxRows int) string {
+	if !hasPendingPrompt(current) {
+		return ""
+	}
+	lines := strings.Split(
+		ansi.HardwrapWc(
+			strings.TrimSpace(current.status.PendingAction.Prompt),
+			max(1, innerWidth),
+			false,
+		),
+		"\n",
+	)
+	if maxRows > 0 && len(lines) > maxRows {
+		lines = lines[:maxRows]
+		lines[maxRows-1] = ansi.TruncateWc(
+			lines[maxRows-1],
+			max(1, innerWidth-2),
+			"",
+		) + " …"
+	}
+	return strings.Join(lines, "\n")
+}
+
+func mainBoxTitle(current model, box mainBox) string {
+	switch box {
+	case boxPending:
+		kind := ""
+		if current.status.PendingAction != nil {
+			kind = string(current.status.PendingAction.Kind)
+		}
+		return "PENDING · " + kind
+	case boxFeed:
+		return "PIPELINE FEED"
+	case boxLiveOutput:
+		return "LIVE OUTPUT"
+	case boxActivity:
+		return "ACTIVITY"
+	}
+	return ""
+}
+
+func mainBoxBody(current model, box mainBox, innerWidth, maxRows int) string {
+	switch box {
+	case boxPending:
+		return pendingBody(current, innerWidth, maxRows)
+	case boxFeed:
+		return artifactBody(current)
+	case boxLiveOutput:
+		return lifecycleBody(current, innerWidth)
+	case boxActivity:
+		return activityBody(current, innerWidth, activityTailLimit(current))
+	}
+	return ""
+}
+
+func countRows(body string) int {
+	if body == "" {
+		return 0
+	}
+	return strings.Count(body, "\n") + 1
+}
+
+func indexOfBox(order []mainBox, box mainBox) int {
+	for index, candidate := range order {
+		if candidate == box {
+			return index
+		}
+	}
+	return -1
+}
+
+// distributeMainBoxHeights hands out rows by priority: the pending question
+// first (the run is blocked on it), then the live edge, then history, and the
+// artifacts absorb whatever is left. Every visible box gets its border plus at
+// least one content row; the lowest-priority boxes are dropped when even that
+// does not fit.
+// chrome is the per-section overhead: 2 for the wide layout's box border, 1 for
+// the compact layout's section title. Both layouts must budget from the same real
+// row count or the bottom section is silently clipped (review round-3 f1).
+func distributeMainBoxHeights(
+	order []mainBox,
+	bodies []string,
+	total, chrome int,
+) []int {
+	minRows := chrome + 1 // chrome + one content row
+	heights := make([]int, len(order))
+	if len(order) == 0 || total < minRows {
+		return heights
+	}
+
+	visible := len(order)
+	for visible > 1 && visible*minRows > total {
+		visible--
+	}
+	remaining := total
+	for index := 0; index < visible; index++ {
+		heights[index] = minRows
+		remaining -= minRows
+	}
+	remaining = max(0, remaining)
+
+	for _, box := range []mainBox{
+		boxPending,
+		boxActivity,
+		boxLiveOutput,
+		boxFeed,
+	} {
+		index := indexOfBox(order[:visible], box)
+		if index < 0 {
+			continue
+		}
+		want := countRows(bodies[index]) + chrome
+		switch box {
+		case boxPending:
+			want = min(want, max(minRows, total/2))
+		case boxLiveOutput:
+			want = min(want, max(minRows, total/3))
+		}
+		grow := min(remaining, max(0, want-heights[index]))
+		heights[index] += grow
+		remaining -= grow
+	}
+	if index := indexOfBox(order[:visible], boxFeed); index >= 0 {
+		heights[index] += remaining
+	}
+	return heights
 }
 
 func renderFeed(current model, innerWidth int) string {
@@ -261,34 +488,13 @@ func renderFeed(current model, innerWidth int) string {
 // no longer accumulates in the lifecycle feed, so this is where "what is it
 // doing right now" shows up. Returns "" when there is nothing to show.
 func renderActivityTail(current model, innerWidth, limit int) string {
-	if len(current.activity) == 0 {
-		return renderActivityWaiting(current, innerWidth)
-	}
-	if limit <= 0 {
+	body := activityBody(current, innerWidth, limit)
+	if body == "" {
 		return ""
 	}
-	lines := current.activity
-	if len(lines) > limit {
-		lines = lines[len(lines)-limit:]
-	}
-
-	var content strings.Builder
-	content.WriteString("\n")
-	content.WriteString(
-		current.theme.styles.SectionTitle.Render("╱╱╱ ACTIVITY"),
-	)
-	content.WriteString("\n")
-	for index, line := range lines {
-		// muteStream: tail lines are progress, not diagnostics (codex writes
-		// progress to stderr).
-		content.WriteString(
-			renderLogLine(current.theme, line, innerWidth, true),
-		)
-		if index < len(lines)-1 {
-			content.WriteString("\n")
-		}
-	}
-	return content.String()
+	return "\n" +
+		current.theme.styles.SectionTitle.Render("╱╱╱ ACTIVITY") + "\n" +
+		body
 }
 
 // renderActivityWaiting fills the content pane while a step is running but has
@@ -297,7 +503,7 @@ func renderActivityTail(current model, innerWidth, limit int) string {
 // at the screen edges. This puts the spinner, the role/CLI actually running, its
 // elapsed time, and where the full log lives into the content area itself
 // (live-smoke finding, 2026-07-25).
-func renderActivityWaiting(current model, innerWidth int) string {
+func activityWaitingBody(current model, innerWidth int) string {
 	descriptor := activeDescriptor(current)
 	if descriptor == "" {
 		return ""
@@ -305,23 +511,15 @@ func renderActivityWaiting(current model, innerWidth int) string {
 	headline := current.spinner.View() + " " +
 		current.theme.styles.Value.Render(descriptor) +
 		current.theme.styles.Muted.Render(" — waiting for the first line")
-
-	var content strings.Builder
-	content.WriteString("\n")
-	content.WriteString(
-		current.theme.styles.SectionTitle.Render("╱╱╱ ACTIVITY"),
-	)
-	content.WriteString("\n")
-	content.WriteString(ansi.TruncateWc(headline, max(1, innerWidth), "…"))
+	lines := []string{ansi.TruncateWc(headline, max(1, innerWidth), "…")}
 	if current.hasStatus && current.status.RunID != "" {
-		content.WriteString("\n")
-		content.WriteString(current.theme.styles.Muted.Render(ansi.TruncateWc(
+		lines = append(lines, current.theme.styles.Muted.Render(ansi.TruncateWc(
 			"  full log: .coterix/runs/"+current.status.RunID+"/logs/",
 			max(1, innerWidth),
 			"…",
 		)))
 	}
-	return content.String()
+	return strings.Join(lines, "\n")
 }
 
 // renderPendingBox renders the pending question in the *main* pane (T14 W1).
@@ -329,31 +527,15 @@ func renderActivityWaiting(current model, innerWidth int) string {
 // question into an unreadable vertical ribbon — the sidebar now keeps only the
 // `? PENDING · kind` signal. Returns "" when nothing is pending.
 func renderPendingBox(current model, innerWidth, maxRows int) string {
-	if !current.hasStatus || current.status.PendingAction == nil {
-		return ""
-	}
-	action := current.status.PendingAction
-	prompt := strings.TrimSpace(action.Prompt)
-	if prompt == "" {
-		return ""
-	}
 	// Box chrome costs 2 rows and 4 cells; wrap to what is left.
-	lines := strings.Split(
-		ansi.HardwrapWc(prompt, max(1, innerWidth-4), false),
-		"\n",
-	)
-	if budget := max(1, maxRows-2); len(lines) > budget {
-		lines = lines[:budget]
-		lines[budget-1] = ansi.TruncateWc(
-			lines[budget-1],
-			max(1, innerWidth-6),
-			"",
-		) + " …"
+	body := pendingBody(current, max(1, innerWidth-4), max(1, maxRows-2))
+	if body == "" {
+		return ""
 	}
 	return renderSidebarCard(
 		current.theme,
-		"PENDING · "+string(action.Kind),
-		strings.Join(lines, "\n"),
+		mainBoxTitle(current, boxPending),
+		body,
 		innerWidth,
 	)
 }
@@ -924,6 +1106,9 @@ func renderStatusBar(current model, width, height int) string {
 			}
 			label = "Response · " + kind
 		}
+		// At very narrow widths the label alone can exceed the row, which wraps
+		// and pushes the footer out of the region (review round-3 f2).
+		label = ansi.TruncateWc(label, max(1, innerWidth-8), "…")
 		// TruncateLeftWc removes the given number of cells from the left; it is
 		// not a "keep this many" budget. Passing the budget straight in erased
 		// every response shorter than the budget — which is every realistic
@@ -950,14 +1135,18 @@ func renderStatusBar(current model, width, height int) string {
 		input := current.theme.styles.Input.Render(
 			value + current.theme.styles.InputCursor.Render("▌"),
 		)
-		footer := current.theme.styles.Hint.Render(
-			"enter confirm · esc cancel",
-		)
+		footerText := "enter confirm · esc cancel"
+		footerStyle := current.theme.styles.Hint
 		if current.promptError != "" {
-			footer = current.theme.styles.PhaseError.Render(
-				"× " + current.promptError,
-			)
+			footerText = "× " + current.promptError
+			footerStyle = current.theme.styles.PhaseError
 		}
+		// A long validation error (e.g. the task_cap message) wrapped to a second
+		// row and pushed the last line out of the 4-row prompt region, so the
+		// footer is clamped to one row (review round-3 f2).
+		footer := footerStyle.Render(
+			ansi.TruncateWc(footerText, max(1, innerWidth-2), "…"),
+		)
 		return current.theme.styles.StatusBar.
 			Width(innerWidth).
 			Height(max(1, height)).

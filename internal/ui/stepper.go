@@ -295,9 +295,24 @@ func renderSidebarCard(
 	body string,
 	width int,
 ) string {
+	return renderBoxCard(currentTheme, title, body, width, false)
+}
+
+// renderBoxCard is renderSidebarCard generalized over focus so the main pane can
+// draw the same chrome and mark which box `j/k` currently drives (T14 W1/W2).
+func renderBoxCard(
+	currentTheme theme,
+	title string,
+	body string,
+	width int,
+	focused bool,
+) string {
 	width = max(8, width)
 	inner := width - 2
 	border := currentTheme.styles.Separator
+	if focused {
+		border = currentTheme.styles.BorderFocus
+	}
 
 	// Top border cells: "╭─ " + title + " " + fill + "╮" == width.
 	titleWidth := ansi.StringWidth(title)

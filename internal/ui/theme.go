@@ -328,6 +328,9 @@ type dashboardStyles struct {
 	Logo         lipgloss.Style
 	SectionTitle lipgloss.Style
 	Separator    lipgloss.Style
+	// BorderFocus draws the border of a focused box (T14 W2). The token was
+	// previously consumed only by the Input frame.
+	BorderFocus  lipgloss.Style
 	Label        lipgloss.Style
 	Value        lipgloss.Style
 	Muted        lipgloss.Style
@@ -390,6 +393,8 @@ func newDashboardStyles(tokens colorTokens) dashboardStyles {
 			Bold(true),
 		Separator: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(theme.Separator)),
+		BorderFocus: lipgloss.NewStyle().
+			Foreground(lipgloss.Color(component.BorderFocused)),
 		Label: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(theme.FGMoreSubtle)),
 		Value: lipgloss.NewStyle().

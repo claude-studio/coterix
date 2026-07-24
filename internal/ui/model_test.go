@@ -476,6 +476,192 @@ func TestActivityTailExactSetsStylingAndHeightBudgets(t *testing.T) {
 	}
 }
 
+// Each box owns its scroll offset and `tab` cycles focus through the boxes that
+// are actually on screen. Before T14 a single offset drove the whole pane, so
+// scrolling to read the artifacts displaced the live activity and vice versa
+// (T14 W1/W2).
+func TestMainBoxesScrollIndependentlyAndTabCyclesFocus(t *testing.T) {
+	current := feedActivityLines(t, populatedViewModel(t), 20)
+	current.status.PendingAction = nil
+
+	if current.focus != boxFeed {
+		t.Fatalf("default focus=%d want boxFeed", current.focus)
+	}
+
+	// k scrolls only the focused box.
+	updated, _ := current.Update(printableKey('k'))
+	current = updated.(model)
+	if current.boxScroll[boxFeed] != 1 {
+		t.Fatalf("focused box offset=%d want 1", current.boxScroll[boxFeed])
+	}
+	for _, box := range []mainBox{boxLiveOutput, boxActivity} {
+		if current.boxScroll[box] != 0 {
+			t.Fatalf("box %d moved with an unrelated scroll", box)
+		}
+	}
+
+	// tab hands scrolling to the next box; the previous offset survives.
+	updated, _ = current.Update(specialKey(tea.KeyTab))
+	current = updated.(model)
+	if current.focus != boxLiveOutput {
+		t.Fatalf("focus after tab=%d want boxLiveOutput", current.focus)
+	}
+	updated, _ = current.Update(printableKey('k'))
+	current = updated.(model)
+	if current.boxScroll[boxLiveOutput] != 1 || current.boxScroll[boxFeed] != 1 {
+		t.Fatalf(
+			"offsets=%v — each box must keep its own",
+			current.boxScroll,
+		)
+	}
+
+	// end parks the focused box at the live edge without touching the others.
+	updated, _ = current.Update(printableKey('e'))
+	_ = updated
+	updated, _ = current.Update(specialKey(tea.KeyTab))
+	current = updated.(model)
+	if current.focus != boxActivity {
+		t.Fatalf("focus=%d want boxActivity", current.focus)
+	}
+	updated, _ = current.Update(specialKey(tea.KeyTab))
+	current = updated.(model)
+	if current.focus != boxFeed {
+		t.Fatalf("focus wrapped to %d want boxFeed", current.focus)
+	}
+
+	// PENDING joins the cycle only while the run is blocked on a question.
+	blocked := current
+	blocked.status.PendingAction = &state.PendingAction{
+		Kind:   state.PendingTaskCap,
+		Prompt: "retry or abort",
+	}
+	if order := mainBoxOrder(blocked); order[0] != boxPending {
+		t.Fatalf("pending run must lead with boxPending, got %v", order)
+	}
+	if order := mainBoxOrder(current); indexOfBox(order, boxPending) >= 0 {
+		t.Fatalf("unblocked run must not include boxPending: %v", order)
+	}
+}
+
+// The wide pane draws one box per section and marks the focused one; the compact
+// pane keeps the single-column stack with no box chrome.
+func TestMainPaneRendersOneBoxPerSection(t *testing.T) {
+	current := feedActivityLines(t, populatedViewModel(t), 6)
+	current.logs = []logEntry{{
+		Role: "plan_writer",
+		CLI:  "claude",
+		Icon: logIconStart,
+		Text: "plan_writer · claude started",
+	}}
+	current.status.PendingAction = &state.PendingAction{
+		Kind:   state.PendingTaskCap,
+		Prompt: "retry or abort after reviewing the evidence",
+	}
+
+	wide := ansi.Strip(renderMain(current, 140, 40))
+	for _, want := range []string{
+		"PENDING · task_cap",
+		"retry or abort",
+		"PIPELINE FEED",
+		"LIVE OUTPUT",
+		"plan_writer · claude started",
+		"ACTIVITY",
+		"line-05",
+	} {
+		if !strings.Contains(wide, want) {
+			t.Fatalf("wide pane lacks %q:\n%s", want, wide)
+		}
+	}
+	// Four boxes → four top borders.
+	if boxes := strings.Count(wide, "╭"); boxes < 4 {
+		t.Fatalf("expected one box per section, found %d:\n%s", boxes, wide)
+	}
+
+	compact := current
+	compact.width = 80
+	compact.height = 24
+	plain := ansi.Strip(renderMain(compact, 80, 22))
+	if !strings.Contains(plain, "LIVE OUTPUT") {
+		t.Fatalf("compact pane lost its sections:\n%s", plain)
+	}
+	if !strings.Contains(plain, "retry or abort") {
+		t.Fatalf("compact pane dropped the pending question:\n%s", plain)
+	}
+}
+
+// A widened failure tail, a long PENDING question and a last_error all compete
+// for the same rows. Before the shared budget the compact path forced each part
+// to its own minimum and overflowed, so composeUV silently cut the newest failure
+// lines off the bottom (review round-3 f1).
+func TestMainPaneSharesOneRowBudgetUnderPressure(t *testing.T) {
+	base := feedActivityLines(t, populatedViewModel(t), maxActivityLines+5)
+	result := runner.RunResult{Exit: 1}
+	updated, _ := base.Update(pipelineEventMsg{Event: pipeline.Event{
+		Kind:    pipeline.EventAttemptFinished,
+		Step:    pipeline.StepPlan,
+		Role:    "plan_writer",
+		Attempt: 1,
+		Result:  &result,
+	}})
+	base = updated.(model)
+	if !base.activityFailed {
+		t.Fatal("fixture must carry a widened tail")
+	}
+	base.status.Phase = state.PhasePausedForInput
+	base.status.PendingAction = &state.PendingAction{
+		Kind:   state.PendingTaskCap,
+		Prompt: strings.Repeat("retry or abort after reviewing the evidence. ", 8),
+	}
+	base.status.LastError = pointerTo("pending-error-marker")
+	base.logs = []logEntry{{
+		Role: "plan_writer",
+		CLI:  "claude",
+		Icon: logIconFail,
+		Text: "attempt 1 exited 1",
+	}}
+	newest := fmt.Sprintf("line-%02d", maxActivityLines+4)
+
+	for _, layout := range []struct {
+		name   string
+		modelW int
+		modelH int
+		width  int
+		height int
+	}{
+		{"compact 80x24", 80, 24, 80, 20},
+		{
+			"minimum wide",
+			wideBreakpointWidth,
+			wideBreakpointHeight,
+			wideBreakpointWidth - sidebarWidth,
+			wideBreakpointHeight - topBarHeight - 2,
+		},
+	} {
+		t.Run(layout.name, func(t *testing.T) {
+			candidate := base
+			candidate.width = layout.modelW
+			candidate.height = layout.modelH
+			frame := ansi.Strip(
+				renderMain(candidate, layout.width, layout.height),
+			)
+			if rows := strings.Count(frame, "\n") + 1; rows > layout.height {
+				t.Fatalf(
+					"used %d rows, budget is %d:\n%s",
+					rows,
+					layout.height,
+					frame,
+				)
+			}
+			// The question blocking the run and the newest failure line both live.
+			for _, want := range []string{"PENDING", "retry or abort", newest} {
+				if !strings.Contains(frame, want) {
+					t.Fatalf("lost %q under pressure:\n%s", want, frame)
+				}
+			}
+		})
+	}
+}
+
 // assertActivityLines checks that exactly the newest `limit` lines are rendered,
 // in order, out of `produced` emitted lines.
 func assertActivityLines(

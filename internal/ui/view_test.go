@@ -293,6 +293,74 @@ func TestPromptStaysWithinItsRegionAtWidthBoundaries(t *testing.T) {
 	}
 }
 
+// A long validation error and a very narrow width must not push the prompt past
+// its 4-row region (review round-3 f2).
+func TestPromptFooterStaysOnOneRow(t *testing.T) {
+	current := populatedViewModel(t)
+	current.prompt = promptResume
+	current.status.PendingAction = &state.PendingAction{
+		Kind:   state.PendingTaskCap,
+		Prompt: "retry or abort",
+	}
+	current.promptValue = "maybe"
+	current.promptError = "Task cap response must be retry or abort."
+
+	for _, width := range []int{40, 24, 12} {
+		plain := ansi.Strip(renderStatusBar(current, width, 4))
+		lines := strings.Split(plain, "\n")
+		if len(lines) > 4 {
+			t.Fatalf(
+				"width=%d used %d rows, region is 4:\n%s",
+				width,
+				len(lines),
+				plain,
+			)
+		}
+		for index, line := range lines {
+			if cells := ansi.StringWidth(line); cells > width-2 {
+				t.Fatalf(
+					"width=%d row %d is %d cells:\n%s",
+					width,
+					index,
+					cells,
+					plain,
+				)
+			}
+		}
+		if !strings.Contains(plain, "×") {
+			t.Fatalf("width=%d lost the error marker:\n%s", width, plain)
+		}
+	}
+}
+
+// The header must keep `role · cli · elapsed` intact at the minimum wide width
+// even when the request is long — reverting the prefix-width fix has to fail here
+// (review round-3 f3).
+func TestMainHeaderKeepsDescriptorAtMinimumWideWidth(t *testing.T) {
+	current := populatedViewModel(t)
+	current.request = strings.Repeat("update the readme thoroughly ", 6)
+	current.activeRole = "plan_reviewer"
+	current.activeCLI = "codex"
+	// Put the active stage on the clock so the descriptor carries an elapsed time.
+	// observePhase only drives the approval window, so the step has to start it.
+	current.status.Phase = state.PhasePlanning
+	start := current.now()
+	current.stages.stepStarted(pipeline.StepPlan, start)
+	current.now = func() time.Time { return start.Add(95 * time.Second) }
+
+	// The main pane at the minimum wide layout.
+	headerWidth := wideBreakpointWidth - sidebarWidth - 4
+	plain := ansi.Strip(renderMainHeader(current, headerWidth))
+	if cells := ansi.StringWidth(plain); cells > headerWidth {
+		t.Fatalf("header is %d cells, budget is %d:\n%s", cells, headerWidth, plain)
+	}
+	for _, want := range []string{"plan_reviewer", "codex", "1m35s"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("header dropped %q:\n%s", want, plain)
+		}
+	}
+}
+
 func TestLogLinesRenderColumnarTimeTagAndIcon(t *testing.T) {
 	current := populatedViewModel(t)
 	at := time.Date(2026, 7, 24, 21, 42, 7, 0, time.UTC)

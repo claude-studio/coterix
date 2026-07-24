@@ -32,6 +32,24 @@ const (
 	activityTailCompact = 3
 )
 
+// mainBox identifies a scrollable box in the main pane. Each box keeps its own
+// scroll offset and `tab` moves focus between them, so scrolling the artifacts
+// no longer displaces the live activity and vice versa (T14 W1/W2).
+// boxFeed is deliberately the zero value: it is the default focus and PENDING
+// only exists while the run is blocked.
+type mainBox uint8
+
+const (
+	boxFeed mainBox = iota
+	boxLiveOutput
+	boxActivity
+	boxPending
+	mainBoxCount
+)
+
+// maxScrollSentinel parks a box at its oldest line; visibleLines clamps it.
+const maxScrollSentinel = 1 << 20
+
 type promptMode uint8
 
 const (
@@ -99,7 +117,8 @@ type model struct {
 	artifactRender      string
 	artifactRenderErr   error
 	artifactRenderWidth int
-	scroll              int
+	focus               mainBox
+	boxScroll           [mainBoxCount]int
 	spinner             spinner.Model
 
 	prompt       promptMode
@@ -335,15 +354,20 @@ func (current model) updateKey(
 	case "ctrl+c", "q":
 		return current.requestStop()
 	case "up", "k":
-		current.scroll++
+		// Scrolling drives the focused box only (T14 W2).
+		current.boxScroll[current.focus]++
 	case "down", "j":
-		if current.scroll > 0 {
-			current.scroll--
+		if current.boxScroll[current.focus] > 0 {
+			current.boxScroll[current.focus]--
 		}
 	case "home":
-		current.scroll = len(current.logs) + 100000
+		current.boxScroll[current.focus] = maxScrollSentinel
 	case "end":
-		current.scroll = 0
+		current.boxScroll[current.focus] = 0
+	case "tab":
+		current.focus = shiftMainFocus(current, 1)
+	case "shift+tab":
+		current.focus = shiftMainFocus(current, -1)
 	}
 
 	if !current.hasStatus || current.operation != "" {
@@ -527,6 +551,34 @@ func (current *model) appendActivity(entry logEntry) {
 func (current *model) resetActivity() {
 	current.activity = current.activity[:0]
 	current.activityFailed = false
+}
+
+// hasPendingPrompt reports whether the run is blocked on a question that has
+// text worth showing.
+func hasPendingPrompt(current model) bool {
+	return current.hasStatus && current.status.PendingAction != nil &&
+		strings.TrimSpace(current.status.PendingAction.Prompt) != ""
+}
+
+// mainBoxOrder is the top-to-bottom render order. PENDING leads because the run
+// is blocked on it; ACTIVITY trails because it is the live edge.
+func mainBoxOrder(current model) []mainBox {
+	order := make([]mainBox, 0, mainBoxCount)
+	if hasPendingPrompt(current) {
+		order = append(order, boxPending)
+	}
+	return append(order, boxFeed, boxLiveOutput, boxActivity)
+}
+
+// shiftMainFocus cycles focus through the boxes that are actually on screen.
+func shiftMainFocus(current model, delta int) mainBox {
+	order := mainBoxOrder(current)
+	for index, box := range order {
+		if box == current.focus {
+			return order[(index+delta+len(order))%len(order)]
+		}
+	}
+	return order[0]
 }
 
 // eventFailed reports whether a step/attempt event carries a failure, which is
