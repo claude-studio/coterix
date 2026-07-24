@@ -153,17 +153,25 @@ func TestMainPaneRendersPlanDiffVerdictAndSplitFeed(t *testing.T) {
 	}
 }
 
-func TestMainHeaderKeepsRealTimeChipTextAcrossStates(t *testing.T) {
+// The header's right slot names what is running rather than showing a fixed
+// chip. The old `● real-time` text never changed during a multi-minute step, so
+// nothing in the content pane answered "what is it doing right now" — the only
+// motion was the sidebar clock and the status bar (live-smoke finding).
+func TestMainHeaderNamesActiveStepAndIdleState(t *testing.T) {
 	current := populatedViewModel(t)
 
 	working := renderMainHeader(current, 96)
-	if !strings.Contains(ansi.Strip(working), "● real-time") {
-		t.Fatalf("working header=%q", ansi.Strip(working))
+	plain := ansi.Strip(working)
+	if !strings.Contains(plain, "plan_writer · claude") {
+		t.Fatalf("working header must name the active role and CLI: %q", plain)
 	}
-	workingChip := findStyledCell(t, working, "●")
+	if strings.Contains(plain, "real-time") {
+		t.Fatalf("fixed chip text survived: %q", plain)
+	}
+	workingCell := findStyledCell(t, working, "p")
 	assertSameColor(
 		t,
-		workingChip.Style.Fg,
+		workingCell.Style.Fg,
 		lipgloss.Color(current.theme.tokens.Status.Busy.FG),
 	)
 
@@ -172,9 +180,8 @@ func TestMainHeaderKeepsRealTimeChipTextAcrossStates(t *testing.T) {
 	current.activeCLI = ""
 	current.operation = ""
 	idle := renderMainHeader(current, 96)
-	plain := ansi.Strip(idle)
-	if !strings.Contains(plain, "● real-time") ||
-		strings.Contains(plain, "idle") {
+	plain = ansi.Strip(idle)
+	if !strings.Contains(plain, "● idle") {
 		t.Fatalf("idle header=%q", plain)
 	}
 	idleChip := findStyledCell(t, idle, "●")
@@ -195,7 +202,7 @@ func TestLogLinesRenderColumnarTimeTagAndIcon(t *testing.T) {
 		Attempt: 1,
 		Text:    "writing files",
 		At:      at,
-	}, 80))
+	}, 80, false))
 	for _, expected := range []string{
 		"21:42:07",
 		"CODEX",
@@ -219,7 +226,7 @@ func TestLogLinesRenderColumnarTimeTagAndIcon(t *testing.T) {
 	}
 	for _, iconCase := range iconCases {
 		rendered := ansi.Strip(
-			renderLogIcon(current.theme, iconCase.entry),
+			renderLogIcon(current.theme, iconCase.entry, false),
 		)
 		if rendered != iconCase.glyph {
 			t.Fatalf("icon=%q, want %q", rendered, iconCase.glyph)
@@ -237,6 +244,7 @@ func TestLogLinesRenderColumnarTimeTagAndIcon(t *testing.T) {
 		current.theme,
 		stamped,
 		80,
+		false,
 	)); !strings.Contains(rendered, "21:42:07") ||
 		!strings.Contains(rendered, "CLAUDE") {
 		t.Fatalf("stamped log line=%q", rendered)
@@ -415,7 +423,7 @@ func TestSidebarSectionAndRoleColorsUseInjectedTokens(t *testing.T) {
 				Role: "role",
 				CLI:  roleCase.cli,
 				Text: "output",
-			}, 60)
+			}, 60, false)
 			// Columns: 8-cell time, one space, then the CLI tag.
 			assertSameColor(
 				t,

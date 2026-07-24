@@ -208,6 +208,9 @@ func renderFeed(current model, innerWidth int) string {
 		content.WriteString(current.artifactRender)
 	}
 
+	// A blank line before each section title: the artifact body runs right up
+	// against the next heading otherwise (live-smoke finding, 2026-07-25).
+	content.WriteString("\n")
 	content.WriteString(
 		current.theme.styles.SectionTitle.Render("╱╱╱ LIVE OUTPUT"),
 	)
@@ -221,7 +224,9 @@ func renderFeed(current model, innerWidth int) string {
 		content.WriteString("\n")
 	} else {
 		for _, line := range current.logs {
-			content.WriteString(renderLogLine(current.theme, line, innerWidth))
+			content.WriteString(
+				renderLogLine(current.theme, line, innerWidth, false),
+			)
 			content.WriteString("\n")
 		}
 	}
@@ -233,7 +238,10 @@ func renderFeed(current model, innerWidth int) string {
 // no longer accumulates in the lifecycle feed, so this is where "what is it
 // doing right now" shows up. Returns "" when there is nothing to show.
 func renderActivityTail(current model, innerWidth, limit int) string {
-	if len(current.activity) == 0 || limit <= 0 {
+	if len(current.activity) == 0 {
+		return renderActivityWaiting(current, innerWidth)
+	}
+	if limit <= 0 {
 		return ""
 	}
 	lines := current.activity
@@ -242,15 +250,53 @@ func renderActivityTail(current model, innerWidth, limit int) string {
 	}
 
 	var content strings.Builder
+	content.WriteString("\n")
 	content.WriteString(
 		current.theme.styles.SectionTitle.Render("╱╱╱ ACTIVITY"),
 	)
 	content.WriteString("\n")
 	for index, line := range lines {
-		content.WriteString(renderLogLine(current.theme, line, innerWidth))
+		// muteStream: tail lines are progress, not diagnostics (codex writes
+		// progress to stderr).
+		content.WriteString(
+			renderLogLine(current.theme, line, innerWidth, true),
+		)
 		if index < len(lines)-1 {
 			content.WriteString("\n")
 		}
+	}
+	return content.String()
+}
+
+// renderActivityWaiting fills the content pane while a step is running but has
+// produced no output yet. Leaving the largest pane blank made a healthy run look
+// stuck: the only motion was the sidebar clock and the status-bar spinner, both
+// at the screen edges. This puts the spinner, the role/CLI actually running, its
+// elapsed time, and where the full log lives into the content area itself
+// (live-smoke finding, 2026-07-25).
+func renderActivityWaiting(current model, innerWidth int) string {
+	descriptor := activeDescriptor(current)
+	if descriptor == "" {
+		return ""
+	}
+	headline := current.spinner.View() + " " +
+		current.theme.styles.Value.Render(descriptor) +
+		current.theme.styles.Muted.Render(" — waiting for the first line")
+
+	var content strings.Builder
+	content.WriteString("\n")
+	content.WriteString(
+		current.theme.styles.SectionTitle.Render("╱╱╱ ACTIVITY"),
+	)
+	content.WriteString("\n")
+	content.WriteString(ansi.TruncateWc(headline, max(1, innerWidth), "…"))
+	if current.hasStatus && current.status.RunID != "" {
+		content.WriteString("\n")
+		content.WriteString(current.theme.styles.Muted.Render(ansi.TruncateWc(
+			"  full log: .coterix/runs/"+current.status.RunID+"/logs/",
+			max(1, innerWidth),
+			"…",
+		)))
 	}
 	return content.String()
 }
@@ -268,23 +314,61 @@ func activityTailLimit(current model) int {
 	return activityTailWide
 }
 
+// activeDescriptor names what is running right now — `role · cli · elapsed`.
+// Empty when nothing is active. Shared by the card header and the activity
+// waiting state so both answer "what is it doing" the same way.
+func activeDescriptor(current model) string {
+	label := current.activeRole
+	if label == "" {
+		label = current.activeStep
+	}
+	if label == "" {
+		return ""
+	}
+	if current.activeCLI != "" {
+		label += " · " + current.activeCLI
+	}
+	for _, row := range deriveStepper(current) {
+		if row.State != stepperActive {
+			continue
+		}
+		if elapsed := formatStageDuration(row.Duration); elapsed != "" {
+			label += " · " + elapsed
+		}
+		break
+	}
+	return label
+}
+
 // renderMainHeader is the feed card's command line: what this dashboard is
-// running on the left, one live signal on the right.
+// running on the left, what is running *right now* on the right.
+//
+// The right slot used to be a fixed `● real-time` chip whose text never changed
+// — only its color did. During a multi-minute step that told the user nothing,
+// and the artifact body pushed every live signal off to the screen edges. Naming
+// the active role/CLI and its elapsed time here keeps it visible regardless of
+// scroll position or how large the artifacts grow (live-smoke finding, 2026-07-25).
 func renderMainHeader(current model, width int) string {
+	right := current.theme.styles.Muted.Render("● idle")
+	if current.isWorking() {
+		if descriptor := activeDescriptor(current); descriptor != "" {
+			right = current.spinner.View() + " " +
+				current.theme.styles.PhaseBusy.Render(descriptor)
+		} else {
+			right = current.spinner.View() + " " +
+				current.theme.styles.PhaseBusy.Render("working")
+		}
+	}
+	// The request has to yield whatever the live signal needs, not a fixed 24.
+	requestWidth := max(1, width-ansi.StringWidth(right)-3)
 	left := current.theme.styles.Secondary.Bold(true).Render("coterix run ") +
 		current.theme.styles.Value.Render(
 			ansi.TruncateWc(
 				strings.Join(strings.Fields(current.request), " "),
-				max(1, width-24),
+				requestWidth,
 				"…",
 			),
 		)
-	// The chip text is fixed; only its color answers "is anything running?".
-	chipStyle := current.theme.styles.Muted
-	if current.isWorking() {
-		chipStyle = current.theme.styles.PhaseBusy
-	}
-	right := chipStyle.Render("● real-time")
 	return alignStatusLine(left, right, max(1, width))
 }
 
@@ -317,14 +401,25 @@ func markdownArtifacts(data artifactData) []markdownArtifact {
 // `HH:MM:SS TAG    icon role#attempt message`. The tag column carries the
 // cross-model color (claude/codex); role and attempt stay in the message
 // prefix so no information from the old bracket prefix is lost.
-func renderLogLine(currentTheme theme, line logEntry, width int) string {
+// muteStream suppresses stream-based error styling. Activity-tail lines are
+// progress output, not diagnostics: codex writes its progress to stderr, so
+// treating stderr as failure paints a perfectly healthy step entirely red. This
+// is what R5 anticipated — the earlier "stderr is empty" measurement only
+// covered claude (live-smoke finding, 2026-07-25). Real failures still surface
+// as the lifecycle feed's `× … exited N` entries, which carry an explicit icon.
+func renderLogLine(
+	currentTheme theme,
+	line logEntry,
+	width int,
+	muteStream bool,
+) string {
 	timestamp := strings.Repeat(" ", 8)
 	if !line.At.IsZero() {
 		timestamp = line.At.Format("15:04:05")
 	}
 	timeColumn := currentTheme.styles.Muted.Render(timestamp)
 	tagColumn := renderLogTag(currentTheme, line)
-	iconColumn := renderLogIcon(currentTheme, line)
+	iconColumn := renderLogIcon(currentTheme, line, muteStream)
 
 	label := line.Role
 	if label == "" {
@@ -341,7 +436,7 @@ func renderLogLine(currentTheme theme, line logEntry, width int) string {
 	meta := currentTheme.styles.Label.Render(label + " ·")
 
 	text := remapANSI16(line.Text, currentTheme.tokens.ANSI)
-	if line.Stream == runner.StreamStderr {
+	if line.Stream == runner.StreamStderr && !muteStream {
 		text = currentTheme.styles.PhaseError.Render(text)
 	} else {
 		text = currentTheme.styles.Value.Render(text)
@@ -371,7 +466,7 @@ func renderLogTag(currentTheme theme, line logEntry) string {
 	return style.Render(tag)
 }
 
-func renderLogIcon(currentTheme theme, line logEntry) string {
+func renderLogIcon(currentTheme theme, line logEntry, muteStream bool) string {
 	switch line.Icon {
 	case logIconStart:
 		return currentTheme.styles.PhaseInfo.Render("▸")
@@ -380,7 +475,7 @@ func renderLogIcon(currentTheme theme, line logEntry) string {
 	case logIconFail:
 		return currentTheme.styles.PhaseError.Render("×")
 	default:
-		if line.Stream == runner.StreamStderr {
+		if line.Stream == runner.StreamStderr && !muteStream {
 			return currentTheme.styles.PhaseError.Render("×")
 		}
 		return currentTheme.styles.Muted.Render("·")

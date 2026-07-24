@@ -186,9 +186,12 @@ func TestActivityTailStepBoundariesAndFailureWidening(t *testing.T) {
 	}
 }
 
-// stderr lines keep the failure icon in the tail (plan T13 W2 — the icon rule
-// itself is unchanged; v4 measurement retired the R5 downgrade).
-func TestActivityTailKeepsStderrFailureIcon(t *testing.T) {
+// codex writes its progress to stderr, so the tail must NOT paint healthy output
+// as failure — every line would turn red. This is exactly what R5 anticipated;
+// the v4 "stderr is empty" measurement only covered claude (live-smoke finding,
+// 2026-07-25). Real failures still surface in the lifecycle feed, which keeps
+// stream-based marking.
+func TestActivityTailDoesNotPaintStderrProgressAsFailure(t *testing.T) {
 	current := testModel(t, &fakeUIControl{})
 	line := runner.Line{Attempt: 1, Stream: runner.StreamStderr, Text: "boom"}
 	updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
@@ -210,8 +213,19 @@ func TestActivityTailKeepsStderrFailureIcon(t *testing.T) {
 	rendered := ansi.Strip(
 		renderActivityTail(current, 120, activityTailLimit(current)),
 	)
-	if !containsAll(rendered, "ACTIVITY", "×", "boom") {
+	if !containsAll(rendered, "ACTIVITY", "boom") {
 		t.Fatalf("activity tail render=%q", rendered)
+	}
+	if strings.Contains(rendered, "×") {
+		t.Fatalf("stderr progress was marked as a failure: %q", rendered)
+	}
+
+	// The lifecycle feed still marks stderr, so genuine failures stay visible.
+	feed := ansi.Strip(
+		renderLogLine(current.theme, current.activity[0], 120, false),
+	)
+	if !strings.Contains(feed, "×") {
+		t.Fatalf("lifecycle feed lost its stderr marker: %q", feed)
 	}
 }
 
@@ -414,6 +428,45 @@ func TestActivityTailResetsAcrossAttemptBoundary(t *testing.T) {
 	}
 	if limit := activityTailLimit(current); limit != activityTailWide {
 		t.Fatalf("limit=%d want=%d after the boundary reset", limit, activityTailWide)
+	}
+}
+
+// A running step with no output yet must still say so in the content pane —
+// leaving it blank made a healthy run look stuck (live-smoke finding).
+func TestActivityWaitingStateFillsContentPane(t *testing.T) {
+	current := populatedViewModel(t)
+	current.activity = nil
+
+	frame := ansi.Strip(renderMain(current, 140, 40))
+	for _, want := range []string{
+		"ACTIVITY",
+		"plan_writer · claude",
+		"waiting for the first line",
+		".coterix/runs/run-9/logs/",
+	} {
+		if !strings.Contains(frame, want) {
+			t.Fatalf("waiting state lacks %q:\n%s", want, frame)
+		}
+	}
+
+	// Once real output arrives the placeholder gives way to the lines.
+	current = feedActivityLines(t, current, 2)
+	frame = ansi.Strip(renderMain(current, 140, 40))
+	if strings.Contains(frame, "waiting for the first line") {
+		t.Fatalf("placeholder survived real output:\n%s", frame)
+	}
+	if !strings.Contains(frame, "line-01") {
+		t.Fatalf("activity lines missing:\n%s", frame)
+	}
+
+	// No step running → no placeholder (a finished run must not look busy).
+	idle := populatedViewModel(t)
+	idle.activity = nil
+	idle.activeStep = ""
+	idle.activeRole = ""
+	idle.activeCLI = ""
+	if got := renderActivityTail(idle, 120, activityTailWide); got != "" {
+		t.Fatalf("idle model rendered a waiting state: %q", got)
 	}
 }
 
