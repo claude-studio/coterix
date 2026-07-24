@@ -131,6 +131,36 @@ func (executor *controlPlanExecutor) Run(
 			return runner.RunResult{}, err
 		}
 
+	case runner.EffectMutating:
+		if request.MaxRetries != 0 {
+			return runner.RunResult{}, fmt.Errorf(
+				"control fake: mutating max retries = %d, want 0",
+				request.MaxRetries,
+			)
+		}
+		if err := os.WriteFile(
+			filepath.Join(request.Dir, "tracked.txt"),
+			[]byte("implemented\n"),
+			0o600,
+		); err != nil {
+			return runner.RunResult{}, err
+		}
+		if err := controlFakeGit(request.Dir, "add", "tracked.txt"); err != nil {
+			return runner.RunResult{}, err
+		}
+		if err := controlFakeGit(
+			request.Dir,
+			"-c",
+			"user.name=Coterix Control Test",
+			"-c",
+			"user.email=control@example.invalid",
+			"commit",
+			"-qm",
+			"implement control task",
+		); err != nil {
+			return runner.RunResult{}, err
+		}
+
 	default:
 		return runner.RunResult{}, fmt.Errorf(
 			"control fake: unsupported effect %d",
@@ -162,6 +192,12 @@ func (executor *controlPlanExecutor) containsPrompt(fragment string) bool {
 		}
 	}
 	return false
+}
+
+func (executor *controlPlanExecutor) promptCount() int {
+	executor.mu.Lock()
+	defer executor.mu.Unlock()
+	return len(executor.prompts)
 }
 
 func TestControllerRunPreconditions(t *testing.T) {
@@ -312,9 +348,16 @@ func TestControllerApproveRehashesAndFreezes(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Approve() error = %v", err)
 		}
+		task := status.Tasks["T1"]
 		if status.Phase != state.PhaseImplementing ||
 			status.ApprovedPlanHash == nil ||
-			*status.ApprovedPlanHash != wantHash {
+			*status.ApprovedPlanHash != wantHash ||
+			status.CurrentTaskID == nil ||
+			*status.CurrentTaskID != "T1" ||
+			task.Status != state.TaskCandidate ||
+			task.BaseSHA == nil ||
+			task.CandidateSHA == nil ||
+			*task.BaseSHA == *task.CandidateSHA {
 			t.Fatalf("approved status = %#v", status)
 		}
 		info, err := os.Stat(planPath)
@@ -478,6 +521,116 @@ func TestControllerResumeAuthResponseRules(t *testing.T) {
 		t.Fatalf("response-free auth status = %#v", status)
 	}
 	controlAssertExecutorCounts(t, executor, 0, 1)
+}
+
+func TestControllerResumeImplementingAuthRunsCurrentTask(t *testing.T) {
+	root, run, base := controlSeedOpenAuthPause(t)
+	executor := &controlPlanExecutor{}
+
+	status, err := NewController(executor).Resume(
+		context.Background(),
+		root,
+		run.ID,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Resume() implementing auth error = %v", err)
+	}
+	task := status.Tasks["T1"]
+	if status.Phase != state.PhaseImplementing ||
+		status.PendingAction != nil ||
+		status.CurrentTaskID == nil ||
+		*status.CurrentTaskID != "T1" ||
+		task.Status != state.TaskCandidate ||
+		task.Attempt != 2 ||
+		task.BaseSHA == nil ||
+		*task.BaseSHA != base ||
+		task.CandidateSHA == nil ||
+		*task.CandidateSHA == base {
+		t.Fatalf("implementing auth resume status = %#v", status)
+	}
+	if !executor.containsPrompt("## T1: Control task") {
+		t.Fatal("implementing auth resume did not dispatch the current task")
+	}
+}
+
+func TestControllerResumeImplementingAuthEscalatesReachedTaskCap(t *testing.T) {
+	root, run, base := controlSeedOpenAuthPauseAtAttempt(t, 5)
+	executor := &controlPlanExecutor{}
+
+	status, err := NewController(executor).Resume(
+		context.Background(),
+		root,
+		run.ID,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("Resume() at task cap error = %v", err)
+	}
+	action := status.PendingAction
+	task := status.Tasks["T1"]
+	if status.Phase != state.PhasePausedForInput ||
+		action == nil ||
+		action.Kind != state.PendingTaskCap ||
+		action.ResumePhase != state.PhaseImplementing ||
+		action.TaskID == nil ||
+		*action.TaskID != "T1" ||
+		action.Response != nil ||
+		task.Status != state.TaskOpen ||
+		task.Attempt != 5 ||
+		task.BaseSHA == nil ||
+		*task.BaseSHA != base ||
+		task.CandidateSHA != nil {
+		t.Fatalf("task-cap escalation status = %#v", status)
+	}
+	if executor.promptCount() != 0 {
+		t.Fatal("task-cap escalation dispatched another mutating attempt")
+	}
+	if got := strings.TrimSpace(
+		controlGit(t, root, "rev-parse", "--verify", "HEAD"),
+	); got != base {
+		t.Fatalf("task-cap escalation changed HEAD from %s to %s", base, got)
+	}
+}
+
+func TestControllerResumeImplementingAuthRejectsBaseDrift(t *testing.T) {
+	root, run, _ := controlSeedOpenAuthPause(t)
+	if err := os.WriteFile(
+		filepath.Join(root, "tracked.txt"),
+		[]byte("drifted\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	controlGit(t, root, "add", "tracked.txt")
+	controlCommit(t, root, "drift after auth pause")
+	driftedHead := strings.TrimSpace(
+		controlGit(t, root, "rev-parse", "--verify", "HEAD"),
+	)
+	executor := &controlPlanExecutor{}
+
+	if _, err := NewController(executor).Resume(
+		context.Background(),
+		root,
+		run.ID,
+		nil,
+	); err == nil {
+		t.Fatal("Resume() accepted clean HEAD drift from open-task base_sha")
+	}
+	reloaded := controlOpenRun(t, root, run.ID)
+	if reloaded.State.Phase != state.PhaseFailed ||
+		reloaded.State.PendingAction != nil ||
+		reloaded.State.LastError == nil {
+		t.Fatalf("base drift fail-safe state = %#v", reloaded.State)
+	}
+	if got := strings.TrimSpace(
+		controlGit(t, root, "rev-parse", "--verify", "HEAD"),
+	); got != driftedHead {
+		t.Fatalf("resume fail-safe changed drifted HEAD from %s to %s", driftedHead, got)
+	}
+	if executor.promptCount() != 0 {
+		t.Fatal("resume fail-safe dispatched an executor after base drift")
+	}
 }
 
 func TestControllerResumeTaskCapResponseRules(t *testing.T) {
@@ -943,6 +1096,40 @@ func controlSeedCandidateAuthPause(t *testing.T) (string, *Run, string) {
 	return root, run, candidate
 }
 
+func controlSeedOpenAuthPause(t *testing.T) (string, *Run, string) {
+	return controlSeedOpenAuthPauseAtAttempt(t, 1)
+}
+
+func controlSeedOpenAuthPauseAtAttempt(
+	t *testing.T,
+	attempt int,
+) (string, *Run, string) {
+	t.Helper()
+	root, run := controlSeedAwaitingRun(t, 1, 5)
+	planHash := *run.State.PlanHash
+	run.State.ApprovedPlanHash = &planHash
+	taskID := "T1"
+	run.State.CurrentTaskID = &taskID
+	base := strings.TrimSpace(
+		controlGit(t, root, "rev-parse", "--verify", "HEAD"),
+	)
+	run.State.Tasks[taskID].Attempt = attempt
+	run.State.Tasks[taskID].BaseSHA = &base
+	if _, err := freezePlan(filepath.Join(run.Dir, planFileName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.State.TransitionPhase(state.PhaseImplementing); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.State.PauseForAuth(&taskID, "Authenticate externally"); err != nil {
+		t.Fatal(err)
+	}
+	if err := run.SaveState(); err != nil {
+		t.Fatal(err)
+	}
+	return root, run, base
+}
+
 func controlOpenRun(t *testing.T, root, runID string) *Run {
 	t.Helper()
 	run, err := OpenRun(root, runID)
@@ -1018,4 +1205,19 @@ func controlCommit(t *testing.T, root, message string) {
 		"-qm",
 		message,
 	)
+}
+
+func controlFakeGit(root string, args ...string) error {
+	command := exec.Command("git", args...)
+	command.Dir = root
+	output, err := command.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf(
+			"git %s: %w\n%s",
+			strings.Join(args, " "),
+			err,
+			output,
+		)
+	}
+	return nil
 }

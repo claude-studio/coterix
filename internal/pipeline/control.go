@@ -40,7 +40,7 @@ type RunStatus struct {
 }
 
 // NewController constructs the shared control plane around the subprocess
-// executor used by planning and, in later milestones, implementation cycles.
+// executor used by planning and implementation cycles.
 func NewController(executor PlanExecutor) *Controller {
 	return &Controller{
 		Executor: executor,
@@ -79,13 +79,18 @@ func (controller *Controller) Run(
 	return statusFromRun(currentRun), err
 }
 
-// Approve binds approval to the current plan bytes, freezes plan.md, verifies
-// the bytes again at the apply boundary, and enters implementing.
+// Approve binds approval to the current plan bytes, freezes plan.md, enters
+// implementing, and advances the first task to its candidate boundary.
 func (controller *Controller) Approve(
 	ctx context.Context,
 	repoRoot string,
 	runID string,
 ) (RunStatus, error) {
+	if controller == nil || controller.Executor == nil {
+		return RunStatus{}, fmt.Errorf(
+			"pipeline: a control-plane executor is required to approve and implement",
+		)
+	}
 	ctx = nonNilContext(ctx)
 	root, err := repositoryRoot(ctx, repoRoot)
 	if err != nil {
@@ -160,7 +165,8 @@ func (controller *Controller) Approve(
 	}
 
 	rollbackMode = false
-	return statusFromRun(currentRun), nil
+	err = NewTaskCycle(controller.Executor).Run(ctx, currentRun)
+	return statusFromRun(currentRun), err
 }
 
 // Reject returns an awaiting plan to planning and immediately spends the
@@ -277,10 +283,13 @@ func (controller *Controller) Resume(
 		)
 	}
 	action := *currentRun.State.PendingAction
-	if action.ResumePhase == state.PhasePlanning &&
+	if (action.ResumePhase == state.PhasePlanning ||
+		(action.ResumePhase == state.PhaseImplementing &&
+			action.Kind == state.PendingAuth)) &&
 		(controller == nil || controller.Executor == nil) {
 		return statusFromRun(currentRun), fmt.Errorf(
-			"pipeline: a control-plane executor is required to resume planning",
+			"pipeline: a control-plane executor is required to resume %s",
+			action.ResumePhase,
 		)
 	}
 
@@ -304,12 +313,17 @@ func (controller *Controller) Resume(
 		return statusFromRun(currentRun), err
 	}
 	if resumed.Aborted || currentRun.State.Phase != state.PhasePlanning {
-		// T7/T8 attach the implementation cycle at this same boundary. T6
-		// already validates and persists auth/task-cap transitions.
 		if err := currentRun.SaveState(); err != nil {
 			persisted, reloadErr := reloadStatus(currentRun)
 			return persisted, errors.Join(err, reloadErr)
 		}
+		if !resumed.Aborted &&
+			currentRun.State.Phase == state.PhaseImplementing &&
+			resumed.Action.Kind == state.PendingAuth {
+			err = NewTaskCycle(controller.Executor).Run(ctx, currentRun)
+			return statusFromRun(currentRun), err
+		}
+		// Task-cap retry is attached to the gate/repair cycle in T8.
 		return statusFromRun(currentRun), nil
 	}
 
@@ -430,15 +444,25 @@ func verifyResumeGitFacts(ctx context.Context, currentRun *Run) error {
 	}
 	taskID := *currentRun.State.CurrentTaskID
 	task := currentRun.State.Tasks[taskID]
-	if task == nil || task.CandidateSHA == nil {
+	if task == nil {
 		return nil
 	}
-	if snapshot.Head != *task.CandidateSHA {
+	expected := task.CandidateSHA
+	evidenceName := "candidate_sha"
+	if expected == nil {
+		expected = task.BaseSHA
+		evidenceName = "base_sha"
+	}
+	if expected == nil {
+		return nil
+	}
+	if snapshot.Head != *expected {
 		return fmt.Errorf(
-			"HEAD %s does not match current task %s candidate_sha %s",
+			"HEAD %s does not match current task %s %s %s",
 			snapshot.Head,
 			taskID,
-			*task.CandidateSHA,
+			evidenceName,
+			*expected,
 		)
 	}
 	return nil
