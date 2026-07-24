@@ -158,11 +158,21 @@ func renderMain(current model, width, height int) string {
 	}
 	if !isWide(current.width, current.height) {
 		innerHeight := max(1, height-2)
+		// compact gets a tighter pending budget but must never drop the question
+		// — it is the one thing blocking the run (T14 W1).
+		pending := renderPendingBox(current, innerWidth, max(3, innerHeight/3))
+		pendingHeight := 0
+		if pending != "" {
+			pendingHeight = strings.Count(pending, "\n") + 1
+		}
 		visible := visibleLines(
 			renderFeed(current, innerWidth),
-			max(1, innerHeight-tailHeight),
+			max(1, innerHeight-tailHeight-pendingHeight),
 			current.scroll,
 		)
+		if pending != "" {
+			visible = pending + "\n" + visible
+		}
 		if tail != "" {
 			visible += "\n" + tail
 		}
@@ -174,11 +184,21 @@ func renderMain(current model, width, height int) string {
 	}
 
 	innerHeight := max(1, height-3)
+	// The pending question claims rows ahead of the artifacts: it is the one
+	// thing the run is blocked on (T14 W1).
+	pending := renderPendingBox(current, innerWidth, max(3, innerHeight/2))
+	pendingHeight := 0
+	if pending != "" {
+		pendingHeight = strings.Count(pending, "\n") + 1
+	}
 	visible := visibleLines(
 		renderFeed(current, innerWidth),
-		max(1, innerHeight-tailHeight),
+		max(1, innerHeight-tailHeight-pendingHeight),
 		current.scroll,
 	)
+	if pending != "" {
+		visible = pending + "\n" + visible
+	}
 	if tail != "" {
 		visible += "\n" + tail
 	}
@@ -299,6 +319,40 @@ func renderActivityWaiting(current model, innerWidth int) string {
 		)))
 	}
 	return content.String()
+}
+
+// renderPendingBox renders the pending question in the *main* pane (T14 W1).
+// It used to live in the sidebar, where a ~30-cell width turned a paragraph-long
+// question into an unreadable vertical ribbon — the sidebar now keeps only the
+// `? PENDING · kind` signal. Returns "" when nothing is pending.
+func renderPendingBox(current model, innerWidth, maxRows int) string {
+	if !current.hasStatus || current.status.PendingAction == nil {
+		return ""
+	}
+	action := current.status.PendingAction
+	prompt := strings.TrimSpace(action.Prompt)
+	if prompt == "" {
+		return ""
+	}
+	// Box chrome costs 2 rows and 4 cells; wrap to what is left.
+	lines := strings.Split(
+		ansi.HardwrapWc(prompt, max(1, innerWidth-4), false),
+		"\n",
+	)
+	if budget := max(1, maxRows-2); len(lines) > budget {
+		lines = lines[:budget]
+		lines[budget-1] = ansi.TruncateWc(
+			lines[budget-1],
+			max(1, innerWidth-6),
+			"",
+		) + " …"
+	}
+	return renderSidebarCard(
+		current.theme,
+		"PENDING · "+string(action.Kind),
+		strings.Join(lines, "\n"),
+		innerWidth,
+	)
 }
 
 // activityTailLimit is the render-time truncation width: the compact layout
@@ -499,6 +553,7 @@ func renderSidebar(current model, width, height int) string {
 			deriveSidebar(current),
 			innerWidth,
 			true,
+			false, // the main pane's PENDING box owns the question body
 		),
 		cardWidth,
 	)
@@ -510,11 +565,16 @@ func renderSidebar(current model, width, height int) string {
 	return strings.Join(indented[:min(len(indented), max(1, height))], "\n")
 }
 
+// showPendingPrompt controls whether the question *body* is rendered here. The
+// live dashboard passes false because its main pane owns the PENDING box (T14
+// W1); the one-shot snapshot passes true because it has no main pane and would
+// otherwise lose the prompt entirely.
 func renderSidebarBody(
 	currentTheme theme,
 	data sidebarData,
 	innerWidth int,
 	showActionHints bool,
+	showPendingPrompt bool,
 ) string {
 	innerWidth = max(1, innerWidth)
 	var content strings.Builder
@@ -612,12 +672,17 @@ func renderSidebarBody(
 			),
 		)
 		content.WriteString("\n")
-		content.WriteString(
-			currentTheme.styles.PhaseWarning.Render(
-				ansi.HardwrapWc(data.PendingPrompt, innerWidth, false),
-			),
-		)
-		content.WriteString("\n")
+		// On the live dashboard this is a signal only — at ~30 cells the body
+		// wrapped into an unreadable vertical ribbon and ate the 26-row budget,
+		// so the main pane's PENDING box renders it instead (T14 W1).
+		if showPendingPrompt {
+			content.WriteString(
+				currentTheme.styles.PhaseWarning.Render(
+					ansi.HardwrapWc(data.PendingPrompt, innerWidth, false),
+				),
+			)
+			content.WriteString("\n")
+		}
 	}
 	if data.LastError != "" {
 		content.WriteString(

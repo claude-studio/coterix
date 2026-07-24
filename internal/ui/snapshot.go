@@ -111,6 +111,7 @@ func renderSnapshotDetail(
 		data,
 		innerWidth,
 		false,
+		true, // one-shot snapshot has no main pane, so it must carry the prompt
 	)
 	return currentTheme.styles.Sidebar.
 		Width(max(1, width-3)).

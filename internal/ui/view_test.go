@@ -670,15 +670,20 @@ func TestCanonicalHumanSignalsRemainVisibleAtMinimumLayouts(t *testing.T) {
 			"pending-error-marker " + strings.Repeat("failure context ", 3),
 		)
 
+		// The sidebar keeps the *signal*; the question body moved to the main
+		// pane's PENDING box (T14 W1) because ~30 cells turned a paragraph into
+		// an unreadable vertical ribbon that also consumed the 26-row budget.
 		wide := renderSidebar(candidate, sidebarWidth, sidebarBudget)
 		assertVisibleSignals(
 			t,
 			wide,
 			sidebarWidth,
 			"task_cap",
-			"retry or abort",
 			"pending-error-marker",
 		)
+		if strings.Contains(ansi.Strip(wide), "retry or abort") {
+			t.Fatalf("sidebar still renders the question body:\n%s", wide)
+		}
 		assertRenderedHeight(t, wide, sidebarBudget)
 
 		dashboard := renderDashboard(candidate)
