@@ -175,6 +175,33 @@ func TestDashboardStylesUseInjectedTokens(t *testing.T) {
 	}
 }
 
+// Surface styles must not paint partial background patches: the dashboard
+// inherits the terminal background uniformly, and only intentional chips
+// (status/working/input) keep one.
+func TestSurfaceStylesCarryNoBackground(t *testing.T) {
+	tokens, err := loadColorTokens()
+	if err != nil {
+		t.Fatal(err)
+	}
+	styles := newDashboardStyles(tokens)
+	surfaces := []struct {
+		name  string
+		style lipgloss.Style
+	}{
+		{name: "canvas", style: styles.Canvas},
+		{name: "main", style: styles.Main},
+		{name: "main_card", style: styles.MainCard},
+		{name: "sidebar", style: styles.Sidebar},
+		{name: "header", style: styles.Header},
+		{name: "status_bar", style: styles.StatusBar},
+	}
+	for _, surface := range surfaces {
+		if _, ok := surface.style.GetBackground().(lipgloss.NoColor); !ok {
+			t.Fatalf("%s surface style has a background", surface.name)
+		}
+	}
+}
+
 func TestWorkingSpinnerUsesInjectedGradientFrames(t *testing.T) {
 	tokens, err := loadColorTokens()
 	if err != nil {

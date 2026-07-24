@@ -360,31 +360,28 @@ func newDashboardStyles(tokens colorTokens) dashboardStyles {
 	status := tokens.Status
 	diff := tokens.Diff
 
+	// Surface styles carry no background on purpose: the dashboard inherits
+	// the terminal background uniformly instead of painting partial patches.
+	// Backgrounds remain only on intentional chips (status/working/input).
 	return dashboardStyles{
 		Canvas: lipgloss.NewStyle().
-			Foreground(lipgloss.Color(theme.FGBase)).
-			Background(lipgloss.Color(theme.BGBase)),
+			Foreground(lipgloss.Color(theme.FGBase)),
 		Main: lipgloss.NewStyle().
-			Foreground(lipgloss.Color(theme.FGBase)).
-			Background(lipgloss.Color(theme.BGBase)),
+			Foreground(lipgloss.Color(theme.FGBase)),
 		MainCard: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(theme.FGBase)).
-			Background(lipgloss.Color(theme.BGBase)).
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color(component.BorderBlurred)),
 		Sidebar: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(theme.FGSubtle)).
-			Background(lipgloss.Color(theme.BGLeastVisible)).
 			BorderLeft(true).
 			BorderStyle(lipgloss.NormalBorder()).
 			BorderLeftForeground(lipgloss.Color(theme.Separator)),
 		Header: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(theme.FGBase)).
-			Background(lipgloss.Color(theme.BGLeastVisible)).
 			Bold(true),
 		StatusBar: lipgloss.NewStyle().
-			Foreground(lipgloss.Color(theme.FGSubtle)).
-			Background(lipgloss.Color(theme.BGLessVisible)),
+			Foreground(lipgloss.Color(theme.FGSubtle)),
 		Logo: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(theme.Primary)).
 			Bold(true),

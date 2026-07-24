@@ -176,7 +176,7 @@ func renderSnapshotTable(
 					outcome = rowData[row].Review
 				}
 				if outcome == evidencePass {
-					return currentTheme.styles.Success
+					return currentTheme.styles.PhaseSuccess
 				}
 				return currentTheme.styles.PhaseInfo
 			case 9:

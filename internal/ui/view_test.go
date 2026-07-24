@@ -52,6 +52,11 @@ func TestDashboardWideAndCompactLayoutBranches(t *testing.T) {
 	if strings.Contains(compact, "ROUTING") {
 		t.Fatalf("compact layout did not fold the sidebar:\n%s", compact)
 	}
+	// Compact keeps the pre-card feed: no rounded card, no command header.
+	if strings.Contains(compact, "╭") || strings.Contains(compact, "╰") ||
+		strings.Contains(compact, "coterix run") {
+		t.Fatalf("compact layout rendered the wide-only card:\n%s", compact)
+	}
 	if strings.Contains(strings.ToLower(compact), "session-details") {
 		t.Fatal("compact layout exposed the rejected session-details overlay")
 	}
@@ -129,13 +134,44 @@ func TestMainPaneRendersPlanDiffVerdictAndStreamingLogs(t *testing.T) {
 		"clean",
 		"LIVE OUTPUT",
 		"CODEX",
-		"impl_writer#1",
-		"streamed output",
+		"impl_writer#1 · streamed output",
 	} {
 		if !strings.Contains(plain, expected) {
 			t.Fatalf("main pane lacks %q:\n%s", expected, plain)
 		}
 	}
+}
+
+func TestMainHeaderKeepsRealTimeChipTextAcrossStates(t *testing.T) {
+	current := populatedViewModel(t)
+
+	working := renderMainHeader(current, 96)
+	if !strings.Contains(ansi.Strip(working), "● real-time") {
+		t.Fatalf("working header=%q", ansi.Strip(working))
+	}
+	workingChip := findStyledCell(t, working, "●")
+	assertSameColor(
+		t,
+		workingChip.Style.Fg,
+		lipgloss.Color(current.theme.tokens.Status.Busy.FG),
+	)
+
+	current.activeStep = ""
+	current.activeRole = ""
+	current.activeCLI = ""
+	current.operation = ""
+	idle := renderMainHeader(current, 96)
+	plain := ansi.Strip(idle)
+	if !strings.Contains(plain, "● real-time") ||
+		strings.Contains(plain, "idle") {
+		t.Fatalf("idle header=%q", plain)
+	}
+	idleChip := findStyledCell(t, idle, "●")
+	assertSameColor(
+		t,
+		idleChip.Style.Fg,
+		lipgloss.Color(current.theme.tokens.Theme.FGMostSubtle),
+	)
 }
 
 func TestLogLinesRenderColumnarTimeTagAndIcon(t *testing.T) {
@@ -152,9 +188,9 @@ func TestLogLinesRenderColumnarTimeTagAndIcon(t *testing.T) {
 	for _, expected := range []string{
 		"21:42:07",
 		"CODEX",
-		"·",
-		"impl_writer#1",
-		"writing files",
+		// The role separator `·` (not the stdout icon `·`): assert the
+		// full meta prefix so the icon cannot satisfy this check.
+		"impl_writer#1 · writing files",
 	} {
 		if !strings.Contains(line, expected) {
 			t.Fatalf("columnar log line lacks %q: %q", expected, line)
@@ -247,10 +283,19 @@ func TestTopBarShowsWordmarkActivityAndRun(t *testing.T) {
 			t.Fatalf("top bar row %d width=%d exceeds %d", index, width, wideBreakpointWidth)
 		}
 	}
+	// The second row is a full-width rule: gradient under the wordmark,
+	// separator across the remaining width.
 	underline := ansi.Strip(lines[1])
-	if !strings.Contains(underline, strings.Repeat("─", ansi.StringWidth(wordmarkText))) {
-		t.Fatalf("top bar lacks the wordmark underline:\n%s", underline)
+	contentWidth := wideBreakpointWidth - 4
+	if !strings.Contains(underline, strings.Repeat("─", contentWidth)) {
+		t.Fatalf("top bar underline does not span the content width:\n%s", underline)
 	}
+	separatorCell := styledCellAt(t, lines[1], contentWidth-1, 0)
+	assertSameColor(
+		t,
+		separatorCell.Style.Fg,
+		lipgloss.Color(current.theme.tokens.Theme.Separator),
+	)
 
 	activeCell := findStyledCell(t, working, "●")
 	assertSameColor(

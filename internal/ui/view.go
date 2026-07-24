@@ -144,9 +144,40 @@ func dashboardMainInnerWidth(width, height int) int {
 	return max(1, paneWidth-4)
 }
 
+// renderMain wraps the feed in the bordered command card on wide layouts. The
+// compact branch keeps the pre-card feed exactly (design-plan.md v1
+// acceptance: compact runs header+feed+status without the card).
 func renderMain(current model, width, height int) string {
 	innerWidth := max(1, width-4)
+	if !isWide(current.width, current.height) {
+		innerHeight := max(1, height-2)
+		visible := visibleLines(
+			renderFeed(current, innerWidth),
+			innerHeight,
+			current.scroll,
+		)
+		return current.theme.styles.Main.
+			Width(innerWidth).
+			Height(innerHeight).
+			Padding(1, 2).
+			Render(visible)
+	}
+
 	innerHeight := max(1, height-3)
+	visible := visibleLines(
+		renderFeed(current, innerWidth),
+		innerHeight,
+		current.scroll,
+	)
+	body := renderMainHeader(current, innerWidth) + "\n" + visible
+	return current.theme.styles.MainCard.
+		Width(max(1, width)).
+		Height(max(1, height)).
+		Padding(0, 1).
+		Render(body)
+}
+
+func renderFeed(current model, innerWidth int) string {
 	var content strings.Builder
 	content.WriteString(
 		current.theme.styles.SectionTitle.Render("╱╱╱ PIPELINE FEED"),
@@ -155,7 +186,7 @@ func renderMain(current model, width, height int) string {
 
 	if current.artifactRenderErr != nil {
 		content.WriteString(
-			current.theme.styles.Error.Render(
+			current.theme.styles.PhaseError.Render(
 				"× " + current.artifactRenderErr.Error(),
 			),
 		)
@@ -181,14 +212,7 @@ func renderMain(current model, width, height int) string {
 			content.WriteString("\n")
 		}
 	}
-
-	visible := visibleLines(content.String(), innerHeight, current.scroll)
-	body := renderMainHeader(current, innerWidth) + "\n" + visible
-	return current.theme.styles.MainCard.
-		Width(max(1, width)).
-		Height(max(1, height)).
-		Padding(0, 1).
-		Render(body)
+	return content.String()
 }
 
 // renderMainHeader is the feed card's command line: what this dashboard is
@@ -202,10 +226,12 @@ func renderMainHeader(current model, width int) string {
 				"…",
 			),
 		)
-	right := current.theme.styles.Muted.Render("● idle")
+	// The chip text is fixed; only its color answers "is anything running?".
+	chipStyle := current.theme.styles.Muted
 	if current.isWorking() {
-		right = current.theme.styles.PhaseBusy.Render("● real-time")
+		chipStyle = current.theme.styles.PhaseBusy
 	}
+	right := chipStyle.Render("● real-time")
 	return alignStatusLine(left, right, max(1, width))
 }
 
@@ -257,11 +283,13 @@ func renderLogLine(currentTheme theme, line logEntry, width int) string {
 	if line.Attempt > 0 {
 		label += "#" + strconv.Itoa(line.Attempt)
 	}
-	meta := currentTheme.styles.Label.Render(label)
+	// The `role#n ·` prefix marks the meta/message boundary (plan §3); the
+	// columns themselves stay space-aligned like the north-star mock-up.
+	meta := currentTheme.styles.Label.Render(label + " ·")
 
 	text := remapANSI16(line.Text, currentTheme.tokens.ANSI)
 	if line.Stream == runner.StreamStderr {
-		text = currentTheme.styles.Error.Render(text)
+		text = currentTheme.styles.PhaseError.Render(text)
 	} else {
 		text = currentTheme.styles.Value.Render(text)
 	}
@@ -420,24 +448,24 @@ func renderSidebarBody(
 
 	if data.AwaitingApproval {
 		content.WriteString(
-			currentTheme.styles.Warning.Render("! APPROVAL NEEDED"),
+			currentTheme.styles.PhaseWarning.Render("! APPROVAL NEEDED"),
 		)
 		content.WriteString("\n")
 		if showActionHints {
 			content.WriteString(
-				currentTheme.styles.Warning.Render("a approve · r reject"),
+				currentTheme.styles.PhaseWarning.Render("a approve · r reject"),
 			)
 			content.WriteString("\n")
 		}
 	} else if data.PendingKind != "" {
 		content.WriteString(
-			currentTheme.styles.Warning.Render(
+			currentTheme.styles.PhaseWarning.Render(
 				pendingChipText(data.PendingKind),
 			),
 		)
 		content.WriteString("\n")
 		content.WriteString(
-			currentTheme.styles.Warning.Render(
+			currentTheme.styles.PhaseWarning.Render(
 				ansi.HardwrapWc(data.PendingPrompt, innerWidth, false),
 			),
 		)
@@ -445,7 +473,7 @@ func renderSidebarBody(
 	}
 	if data.LastError != "" {
 		content.WriteString(
-			currentTheme.styles.Error.Render(
+			currentTheme.styles.PhaseError.Render(
 				"× " + ansi.HardwrapWc(
 					data.LastError,
 					max(1, innerWidth-2),
@@ -622,9 +650,9 @@ func phaseDot(currentTheme theme, phase state.Phase) string {
 func outcomeIcon(currentTheme theme, outcome evidenceOutcome) string {
 	switch outcome {
 	case evidencePass:
-		return currentTheme.styles.Success.Render("✓")
+		return currentTheme.styles.PhaseSuccess.Render("✓")
 	case evidenceFail:
-		return currentTheme.styles.Error.Render("×")
+		return currentTheme.styles.PhaseError.Render("×")
 	default:
 		return currentTheme.styles.PhaseInfo.Render("⋯")
 	}
@@ -684,7 +712,7 @@ func renderStatusBar(current model, width, height int) string {
 			"enter confirm · esc cancel",
 		)
 		if current.promptError != "" {
-			footer = current.theme.styles.Error.Render(
+			footer = current.theme.styles.PhaseError.Render(
 				"× " + current.promptError,
 			)
 		}
@@ -806,10 +834,16 @@ func renderTopBar(current model, width, height int) string {
 		)
 
 	first := alignTriple(wordmark, activity, identity, contentWidth)
+	wordmarkWidth := ansi.StringWidth(wordmarkText)
 	underline := gradientText(
 		current.theme,
-		strings.Repeat("─", ansi.StringWidth(wordmarkText)),
+		strings.Repeat("─", wordmarkWidth),
 	)
+	if rest := contentWidth - wordmarkWidth; rest > 0 {
+		underline += current.theme.styles.Separator.Render(
+			strings.Repeat("─", rest),
+		)
+	}
 	return current.theme.styles.Header.
 		Width(innerWidth).
 		Height(max(1, height)).
@@ -881,7 +915,7 @@ func statusDetail(current model, width int) string {
 		if prompt := strings.TrimSpace(current.status.PendingAction.Prompt); prompt != "" {
 			parts = append(
 				parts,
-				current.theme.styles.Warning.Render(prompt),
+				current.theme.styles.PhaseWarning.Render(prompt),
 			)
 		}
 	}
@@ -889,13 +923,13 @@ func statusDetail(current model, width int) string {
 		if message := strings.TrimSpace(*current.status.LastError); message != "" {
 			parts = append(
 				parts,
-				current.theme.styles.Error.Render("× "+message),
+				current.theme.styles.PhaseError.Render("× "+message),
 			)
 		}
 	} else if current.operationErr != nil {
 		parts = append(
 			parts,
-			current.theme.styles.Error.Render(
+			current.theme.styles.PhaseError.Render(
 				"× "+current.operationErr.Error(),
 			),
 		)
