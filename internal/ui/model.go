@@ -507,6 +507,13 @@ func (current *model) appendActivity(entry logEntry) {
 	if entry.At.IsZero() && current.now != nil {
 		entry.At = current.now()
 	}
+	// A retry is a fresh subprocess, so its output must not be mixed with the
+	// previous attempt's. The pipeline emits no attempt-started event, so the
+	// attempt number on the line itself is the only boundary signal available.
+	if last := len(current.activity) - 1; last >= 0 &&
+		current.activity[last].Attempt != entry.Attempt {
+		current.resetActivity()
+	}
 	current.activity = append(current.activity, entry)
 	if overflow := len(current.activity) - maxActivityLines; overflow > 0 {
 		copy(current.activity, current.activity[overflow:])

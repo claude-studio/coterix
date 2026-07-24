@@ -345,9 +345,18 @@ func TestActivityTailRendersNewestLinesAndHeightBudget(t *testing.T) {
 // newest/oldest mix-up pass unnoticed (review T13a-1 f1).
 func feedActivityLines(t *testing.T, current model, count int) model {
 	t.Helper()
+	return feedActivityAttempt(t, current, 1, count)
+}
+
+func feedActivityAttempt(
+	t *testing.T,
+	current model,
+	attempt, count int,
+) model {
+	t.Helper()
 	for index := 0; index < count; index++ {
 		line := runner.Line{
-			Attempt: 1,
+			Attempt: attempt,
 			Stream:  runner.StreamStdout,
 			Text:    fmt.Sprintf("line-%02d", index),
 		}
@@ -362,6 +371,50 @@ func feedActivityLines(t *testing.T, current model, count int) model {
 		current = updated.(model)
 	}
 	return current
+}
+
+// A retry is a fresh subprocess, so attempt N+1's output must not be mixed with
+// attempt N's stale tail. The pipeline emits no attempt-started event, so the
+// line's own attempt number is the only boundary signal available — without this
+// the tail keeps showing a finished attempt's output (and stays widened) while a
+// new one is already running, which is exactly the "looks stuck" symptom W2 set
+// out to remove (live-smoke finding, 2026-07-25).
+func TestActivityTailResetsAcrossAttemptBoundary(t *testing.T) {
+	current := feedActivityAttempt(t, testModel(t, &fakeUIControl{}), 1, 6)
+
+	result := runner.RunResult{Exit: 1}
+	updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
+		Kind:    pipeline.EventAttemptFinished,
+		Step:    pipeline.StepPlan,
+		Role:    "plan_writer",
+		Attempt: 1,
+		Result:  &result,
+	}})
+	current = updated.(model)
+	if !current.activityFailed || len(current.activity) != 6 {
+		t.Fatalf(
+			"a failed attempt must keep its widened tail: failed=%v len=%d",
+			current.activityFailed,
+			len(current.activity),
+		)
+	}
+
+	current = feedActivityAttempt(t, current, 2, 1)
+	if len(current.activity) != 1 {
+		t.Fatalf(
+			"attempt 2 kept %d stale lines from attempt 1",
+			len(current.activity),
+		)
+	}
+	if got := current.activity[0].Attempt; got != 2 {
+		t.Fatalf("retained line attempt=%d want=2", got)
+	}
+	if current.activityFailed {
+		t.Fatal("attempt 2 inherited attempt 1's failed flag — tail stays widened")
+	}
+	if limit := activityTailLimit(current); limit != activityTailWide {
+		t.Fatalf("limit=%d want=%d after the boundary reset", limit, activityTailWide)
+	}
 }
 
 func TestWorkingAnimationTicksOnlyWhileActive(t *testing.T) {
