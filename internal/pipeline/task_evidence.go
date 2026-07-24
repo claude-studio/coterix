@@ -185,7 +185,16 @@ func (cycle *TaskCycle) runGate(
 		),
 		OnLine: cycle.OnLine,
 	}
+	finish := observeStep(
+		cycle.observer,
+		currentRun,
+		StepGate,
+		StepGate,
+		request.Command,
+		&request,
+	)
 	result, runErr := cycle.Executor.Run(ctx, request)
+	finish(result, runErr)
 	if result.StdoutLog == "" {
 		result.StdoutLog = request.StdoutLog
 	}
@@ -285,7 +294,7 @@ func (cycle *TaskCycle) runImplementationReview(
 	if err != nil {
 		return cli.ReviewJSON{}, runner.RunResult{}, err
 	}
-	request, _, err := cycle.reviewRequest(
+	request, cliName, err := cycle.reviewRequest(
 		currentRun,
 		task.ID,
 		rendered,
@@ -349,7 +358,16 @@ func (cycle *TaskCycle) runImplementationReview(
 		return nil
 	}
 
+	finish := observeStep(
+		cycle.observer,
+		currentRun,
+		StepImplementationReview,
+		string(cli.RoleImplReviewer),
+		cliName,
+		&request,
+	)
 	result, runErr := cycle.Executor.Run(ctx, request)
+	finish(result, runErr)
 	verifyContext := context.WithoutCancel(nonNilContext(ctx))
 	if err := cycle.verifyCandidateBoundary(
 		verifyContext,
@@ -559,7 +577,16 @@ func (cycle *TaskCycle) repairTask(
 	if err != nil {
 		return cycle.fail(currentRun, err)
 	}
+	finish := observeStep(
+		cycle.observer,
+		currentRun,
+		StepFix,
+		string(cli.RoleFixer),
+		cliName,
+		&request,
+	)
 	result, runErr := cycle.Executor.Run(ctx, request)
+	finish(result, runErr)
 	if runErr != nil {
 		return cycle.handleMutationFailure(
 			ctx,

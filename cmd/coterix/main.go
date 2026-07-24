@@ -11,6 +11,7 @@ import (
 
 	"github.com/ridenow/coterix/internal/pipeline"
 	"github.com/ridenow/coterix/internal/runner"
+	"github.com/ridenow/coterix/internal/ui"
 )
 
 const usageText = `Usage:
@@ -52,6 +53,44 @@ type controlPlane interface {
 	) ([]pipeline.RunStatus, error)
 }
 
+type runDashboard interface {
+	Run(context.Context, string, string) (pipeline.RunStatus, error)
+	Interactive() bool
+}
+
+type charmDashboard struct {
+	executor    pipeline.PlanExecutor
+	input       io.Reader
+	output      io.Writer
+	interactive bool
+	width       int
+	height      int
+}
+
+func (dashboard charmDashboard) Run(
+	ctx context.Context,
+	repoRoot string,
+	request string,
+) (pipeline.RunStatus, error) {
+	return ui.Run(
+		ctx,
+		dashboard.executor,
+		repoRoot,
+		request,
+		ui.RunOptions{
+			Input:       dashboard.input,
+			Output:      dashboard.output,
+			Interactive: dashboard.interactive,
+			Width:       dashboard.width,
+			Height:      dashboard.height,
+		},
+	)
+}
+
+func (dashboard charmDashboard) Interactive() bool {
+	return dashboard.interactive
+}
+
 type usageError struct {
 	message string
 }
@@ -91,8 +130,22 @@ func runMain(
 ) int {
 	processRunner := runner.New()
 	controller := pipeline.NewController(processRunner)
+	dashboard := charmDashboard{
+		executor:    processRunner,
+		input:       os.Stdin,
+		output:      stdout,
+		interactive: ui.IsInteractive(os.Stdin, stdout),
+	}
 
-	exitCode := execute(ctx, controller, ".", args, stdout, stderr)
+	exitCode := execute(
+		ctx,
+		controller,
+		".",
+		args,
+		stdout,
+		stderr,
+		dashboard,
+	)
 	if err := processRunner.Close(); err != nil {
 		fmt.Fprintf(stderr, "coterix: close runner: %v\n", err)
 		if exitCode == 0 {
@@ -109,12 +162,28 @@ func execute(
 	args []string,
 	stdout io.Writer,
 	stderr io.Writer,
+	dashboards ...runDashboard,
 ) int {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	result, err := dispatch(ctx, controller, repoRoot, args)
+	var (
+		result      any
+		err         error
+		interactive bool
+	)
+	if len(dashboards) > 0 && len(args) > 0 && args[0] == "run" {
+		request, parseErr := parseRunArguments(args[1:])
+		if parseErr != nil {
+			err = parseErr
+		} else {
+			result, err = dashboards[0].Run(ctx, repoRoot, request)
+			interactive = dashboards[0].Interactive()
+		}
+	} else {
+		result, err = dispatch(ctx, controller, repoRoot, args)
+	}
 	if err != nil {
 		fmt.Fprintf(stderr, "coterix: %v\n", err)
 		var usageFailure *usageError
@@ -125,6 +194,9 @@ func execute(
 		return 1
 	}
 
+	if interactive {
+		return 0
+	}
 	if err := writeJSON(stdout, result); err != nil {
 		fmt.Fprintf(stderr, "coterix: write JSON output: %v\n", err)
 		return 1

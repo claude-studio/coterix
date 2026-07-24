@@ -21,8 +21,9 @@ import (
 type Controller struct {
 	Executor PlanExecutor
 
-	mu     sync.Mutex
-	active map[string]struct{}
+	observer Observer
+	mu       sync.Mutex
+	active   map[string]struct{}
 }
 
 // RunStatus is a read-only summary of one persisted run.
@@ -41,11 +42,20 @@ type RunStatus struct {
 
 // NewController constructs the shared control plane around the subprocess
 // executor used by planning and implementation cycles.
-func NewController(executor PlanExecutor) *Controller {
-	return &Controller{
+func NewController(
+	executor PlanExecutor,
+	options ...ControllerOption,
+) *Controller {
+	controller := &Controller{
 		Executor: executor,
 		active:   make(map[string]struct{}),
 	}
+	for _, option := range options {
+		if option != nil {
+			option(controller)
+		}
+	}
+	return controller
 }
 
 // Run enforces repository/configuration preconditions, creates one immutable
@@ -68,6 +78,7 @@ func (controller *Controller) Run(
 	if err != nil {
 		return RunStatus{}, err
 	}
+	controller.observeRun(currentRun)
 
 	release, err := controller.begin(root, currentRun.ID)
 	if err != nil {
@@ -75,7 +86,7 @@ func (controller *Controller) Run(
 	}
 	defer release()
 
-	err = NewPlanCycle(controller.Executor).Run(ctx, currentRun, "", nil)
+	err = controller.newPlanCycle().Run(ctx, currentRun, "", nil)
 	return statusFromRun(currentRun), err
 }
 
@@ -106,6 +117,7 @@ func (controller *Controller) Approve(
 	if err != nil {
 		return RunStatus{}, err
 	}
+	controller.observeRun(currentRun)
 	if currentRun.State.Phase != state.PhaseAwaitingApproval {
 		return statusFromRun(currentRun), fmt.Errorf(
 			"pipeline: approve requires awaiting_approval phase, got %s",
@@ -165,7 +177,7 @@ func (controller *Controller) Approve(
 	}
 
 	rollbackMode = false
-	err = NewTaskCycle(controller.Executor).Run(ctx, currentRun)
+	err = controller.newTaskCycle().Run(ctx, currentRun)
 	return statusFromRun(currentRun), err
 }
 
@@ -195,13 +207,14 @@ func (controller *Controller) Reject(
 	if err != nil {
 		return RunStatus{}, err
 	}
+	controller.observeRun(currentRun)
 	rejected, err := currentRun.State.RejectPlan(response)
 	if err != nil {
 		return statusFromRun(currentRun), err
 	}
 	currentRun.State.ApprovedPlanHash = nil
 
-	err = NewPlanCycle(controller.Executor).Run(
+	err = controller.newPlanCycle().Run(
 		ctx,
 		currentRun,
 		rejected.Feedback,
@@ -227,6 +240,7 @@ func (controller *Controller) Status(
 		if err != nil {
 			return nil, err
 		}
+		controller.observeRun(currentRun)
 		return []RunStatus{statusFromRun(currentRun)}, nil
 	}
 
@@ -247,6 +261,7 @@ func (controller *Controller) Status(
 		if err != nil {
 			return nil, err
 		}
+		controller.observeRun(currentRun)
 		statuses = append(statuses, statusFromRun(currentRun))
 	}
 	return statuses, nil
@@ -276,6 +291,7 @@ func (controller *Controller) Resume(
 	if err != nil {
 		return RunStatus{}, err
 	}
+	controller.observeRun(currentRun)
 	if currentRun.State.Phase != state.PhasePausedForInput ||
 		currentRun.State.PendingAction == nil {
 		return statusFromRun(currentRun), fmt.Errorf(
@@ -326,7 +342,7 @@ func (controller *Controller) Resume(
 			persisted, reloadErr := reloadStatus(currentRun)
 			return persisted, errors.Join(err, reloadErr)
 		}
-		err = NewTaskCycle(controller.Executor).RunWithOverride(
+		err = controller.newTaskCycle().RunWithOverride(
 			ctx,
 			currentRun,
 			resumed.Override,
@@ -338,7 +354,7 @@ func (controller *Controller) Resume(
 	if resumed.Action.Response != nil {
 		feedback = *resumed.Action.Response
 	}
-	err = NewPlanCycle(controller.Executor).Run(
+	err = controller.newPlanCycle().Run(
 		ctx,
 		currentRun,
 		feedback,

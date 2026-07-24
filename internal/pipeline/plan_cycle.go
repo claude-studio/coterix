@@ -35,6 +35,7 @@ type PlanExecutor interface {
 type PlanCycle struct {
 	Executor PlanExecutor
 	OnLine   func(runner.Line)
+	observer Observer
 }
 
 // NewPlanCycle constructs a plan cycle around a subprocess executor.
@@ -242,7 +243,16 @@ func (cycle *PlanCycle) runPlanner(
 		return nil
 	}
 
+	finish := observeStep(
+		cycle.observer,
+		currentRun,
+		StepPlan,
+		string(role),
+		cliName,
+		&request,
+	)
 	result, runErr := cycle.Executor.Run(ctx, request)
+	finish(result, runErr)
 	if runErr != nil {
 		return nil, role, result, runErr
 	}
@@ -282,7 +292,7 @@ func (cycle *PlanCycle) runPlanReview(
 	if err != nil {
 		return cli.ReviewVerdict{}, runner.RunResult{}, err
 	}
-	request, _, err := cycle.agentRequest(
+	request, cliName, err := cycle.agentRequest(
 		currentRun,
 		cli.RolePlanReviewer,
 		rendered,
@@ -326,7 +336,16 @@ func (cycle *PlanCycle) runPlanReview(
 		return nil
 	}
 
+	finish := observeStep(
+		cycle.observer,
+		currentRun,
+		StepPlanReview,
+		string(cli.RolePlanReviewer),
+		cliName,
+		&request,
+	)
 	result, runErr := cycle.Executor.Run(ctx, request)
+	finish(result, runErr)
 	if hashErr := requirePlanHash(planPath, targetHash); hashErr != nil {
 		return cli.ReviewVerdict{}, result, hashErr
 	}

@@ -29,6 +29,30 @@ type fakeControlPlane struct {
 	resumeResult pipeline.RunStatus
 }
 
+type fakeRunDashboard struct {
+	calls       []controlCall
+	status      pipeline.RunStatus
+	err         error
+	interactive bool
+}
+
+func (fake *fakeRunDashboard) Run(
+	_ context.Context,
+	repoRoot string,
+	request string,
+) (pipeline.RunStatus, error) {
+	fake.calls = append(fake.calls, controlCall{
+		command:  "run",
+		repoRoot: repoRoot,
+		request:  request,
+	})
+	return fake.status, fake.err
+}
+
+func (fake *fakeRunDashboard) Interactive() bool {
+	return fake.interactive
+}
+
 func (fake *fakeControlPlane) Run(
 	_ context.Context,
 	repoRoot string,
@@ -149,6 +173,65 @@ func TestExecuteRunDistinguishesLiteralAndFileRequests(t *testing.T) {
 			request:  request,
 		})
 	})
+}
+
+func TestExecuteExactRunCommandReachesDashboard(t *testing.T) {
+	controller := &fakeControlPlane{}
+	dashboard := &fakeRunDashboard{
+		status: pipeline.RunStatus{RunID: "run-from-dashboard"},
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := execute(
+		context.Background(),
+		controller,
+		"repo-root",
+		[]string{"run", "implement T9"},
+		&stdout,
+		&stderr,
+		dashboard,
+	)
+	if code != 0 || stderr.String() != "" {
+		t.Fatalf("execute() code=%d stderr=%q", code, stderr.String())
+	}
+	if len(controller.calls) != 0 {
+		t.Fatalf("legacy JSON run path was called: %#v", controller.calls)
+	}
+	if len(dashboard.calls) != 1 {
+		t.Fatalf("dashboard calls=%#v, want one", dashboard.calls)
+	}
+	got := dashboard.calls[0]
+	if got.command != "run" ||
+		got.repoRoot != "repo-root" ||
+		got.request != "implement T9" {
+		t.Fatalf("dashboard call=%#v", got)
+	}
+	var status pipeline.RunStatus
+	if err := json.Unmarshal(stdout.Bytes(), &status); err != nil {
+		t.Fatalf("headless dashboard output is not status JSON: %q: %v", stdout.String(), err)
+	}
+	if status.RunID != "run-from-dashboard" {
+		t.Fatalf("dashboard status run_id=%q", status.RunID)
+	}
+
+	dashboard.interactive = true
+	stdout.Reset()
+	code = execute(
+		context.Background(),
+		controller,
+		"repo-root",
+		[]string{"run", "implement T9"},
+		&stdout,
+		&stderr,
+		dashboard,
+	)
+	if code != 0 || stdout.Len() != 0 {
+		t.Fatalf(
+			"interactive dashboard code=%d stdout=%q",
+			code,
+			stdout.String(),
+		)
+	}
 }
 
 func TestExecuteRunRequiresExactlyOneRequestSource(t *testing.T) {

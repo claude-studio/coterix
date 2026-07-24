@@ -31,7 +31,8 @@ type Run struct {
 	Config   cli.Config
 	State    *state.State
 
-	adapter *cli.OutputAdapter
+	adapter  *cli.OutputAdapter
+	observer Observer
 }
 
 // CreateRun creates a new run without overwriting any existing run artifact.
@@ -199,6 +200,7 @@ func (run *Run) SaveState() error {
 		return fmt.Errorf("pipeline: save state: %w", err)
 	}
 	run.adapter = adapter
+	run.emitStateSnapshot()
 	return nil
 }
 

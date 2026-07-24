@@ -19,6 +19,7 @@ import (
 type TaskCycle struct {
 	Executor PlanExecutor
 	OnLine   func(runner.Line)
+	observer Observer
 }
 
 // NewTaskCycle constructs an implementation cycle around a subprocess executor.
@@ -207,7 +208,16 @@ func (cycle *TaskCycle) implementTask(
 		)
 	}
 
+	finish := observeStep(
+		cycle.observer,
+		currentRun,
+		StepImplementation,
+		string(cli.RoleImplWriter),
+		cliName,
+		&request,
+	)
 	result, runErr := cycle.Executor.Run(ctx, request)
+	finish(result, runErr)
 	if runErr != nil {
 		return cycle.handleMutationFailure(
 			ctx,

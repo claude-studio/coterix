@@ -178,6 +178,10 @@ func TestRunNonzeroExitIsTyped(t *testing.T) {
 	defer executor.Close()
 
 	request, _ := helperRequest(t, EffectReadOnly, "nonzero")
+	var attempts []AttemptDone
+	request.OnAttemptDone = func(done AttemptDone) {
+		attempts = append(attempts, done)
+	}
 	result, err := executor.Run(context.Background(), request)
 
 	var exitErr *ExitError
@@ -190,6 +194,16 @@ func TestRunNonzeroExitIsTyped(t *testing.T) {
 	if exitErr.Attempt != 1 {
 		t.Fatalf("ExitError.Attempt = %d, want 1", exitErr.Attempt)
 	}
+	if len(attempts) != 1 {
+		t.Fatalf("OnAttemptDone calls = %d, want 1", len(attempts))
+	}
+	if attempts[0].Attempt != 1 || attempts[0].Result != result {
+		t.Fatalf("OnAttemptDone event = %#v, want attempt 1 with result %#v", attempts[0], result)
+	}
+	var callbackExitErr *ExitError
+	if !errors.As(attempts[0].Err, &callbackExitErr) {
+		t.Fatalf("OnAttemptDone error = %T %v, want *ExitError", attempts[0].Err, attempts[0].Err)
+	}
 }
 
 func TestRunIdleTimeout(t *testing.T) {
@@ -198,6 +212,10 @@ func TestRunIdleTimeout(t *testing.T) {
 
 	request, _ := helperRequest(t, EffectReadOnly, "hang")
 	request.IdleTimeout = 500 * time.Millisecond
+	var attempts []AttemptDone
+	request.OnAttemptDone = func(done AttemptDone) {
+		attempts = append(attempts, done)
+	}
 
 	started := time.Now()
 	result, err := executor.Run(context.Background(), request)
@@ -212,6 +230,20 @@ func TestRunIdleTimeout(t *testing.T) {
 	}
 	if elapsed > 2*time.Second {
 		t.Fatalf("Run() returned after %v, want bounded idle termination", elapsed)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("OnAttemptDone calls = %d, want 1", len(attempts))
+	}
+	if attempts[0].Attempt != 1 || attempts[0].Result != result {
+		t.Fatalf("OnAttemptDone event = %#v, want attempt 1 with result %#v", attempts[0], result)
+	}
+	var callbackTimeoutErr *TimeoutError
+	if !errors.As(attempts[0].Err, &callbackTimeoutErr) {
+		t.Fatalf(
+			"OnAttemptDone error = %T %v, want *TimeoutError",
+			attempts[0].Err,
+			attempts[0].Err,
+		)
 	}
 }
 
@@ -293,6 +325,10 @@ func TestRunReadOnlyClearsOutputAndRetries(t *testing.T) {
 	request.OutputPaths = []string{output}
 	request.MaxRetries = 1
 	request.ValidateResult = jsonValidator(output)
+	var attempts []AttemptDone
+	request.OnAttemptDone = func(done AttemptDone) {
+		attempts = append(attempts, done)
+	}
 
 	result, err := executor.Run(context.Background(), request)
 	if err != nil {
@@ -303,6 +339,34 @@ func TestRunReadOnlyClearsOutputAndRetries(t *testing.T) {
 	}
 	assertFileContent(t, counter, "2")
 	assertFileContent(t, output, `{"ok":true}`)
+	if len(attempts) != 2 {
+		t.Fatalf("OnAttemptDone calls = %d, want 2", len(attempts))
+	}
+	if attempts[0].Attempt != 1 || attempts[1].Attempt != 2 {
+		t.Fatalf(
+			"OnAttemptDone attempt order = [%d %d], want [1 2]",
+			attempts[0].Attempt,
+			attempts[1].Attempt,
+		)
+	}
+	var firstResultErr *ResultError
+	if !errors.As(attempts[0].Err, &firstResultErr) {
+		t.Fatalf(
+			"first OnAttemptDone error = %T %v, want *ResultError",
+			attempts[0].Err,
+			attempts[0].Err,
+		)
+	}
+	if attempts[0].Result.Exit != 0 || attempts[0].Result.TimedOut {
+		t.Fatalf("first OnAttemptDone result = %#v, want successful subprocess exit", attempts[0].Result)
+	}
+	if attempts[1].Err != nil || attempts[1].Result != result {
+		t.Fatalf(
+			"second OnAttemptDone event = %#v, want successful final result %#v",
+			attempts[1],
+			result,
+		)
+	}
 }
 
 func TestRunArtifactOnlyPreservesCanonicalInput(t *testing.T) {

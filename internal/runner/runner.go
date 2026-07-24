@@ -176,7 +176,7 @@ func (runner *Runner) Run(ctx context.Context, request RunRequest) (RunResult, e
 
 		result, lastErr = runner.runAttempt(ctx, normalized, attempt)
 		if err := verifyCanonicalPaths(canonicalSnapshot); err != nil {
-			return result, &SafetyError{
+			lastErr = &SafetyError{
 				Attempt: attempt,
 				Result:  result,
 				Err: errors.Join(
@@ -184,6 +184,8 @@ func (runner *Runner) Run(ctx context.Context, request RunRequest) (RunResult, e
 					fmt.Errorf("canonical input changed during subprocess: %w", err),
 				),
 			}
+			notifyAttemptDone(normalized.OnAttemptDone, attempt, result, lastErr)
+			return result, lastErr
 		}
 		if lastErr == nil && normalized.ValidateResult != nil {
 			if validationErr := normalized.ValidateResult(ctx, result); validationErr != nil {
@@ -195,7 +197,7 @@ func (runner *Runner) Run(ctx context.Context, request RunRequest) (RunResult, e
 			}
 		}
 		if err := verifyCanonicalPaths(canonicalSnapshot); err != nil {
-			return result, &SafetyError{
+			lastErr = &SafetyError{
 				Attempt: attempt,
 				Result:  result,
 				Err: errors.Join(
@@ -203,7 +205,10 @@ func (runner *Runner) Run(ctx context.Context, request RunRequest) (RunResult, e
 					fmt.Errorf("canonical input changed during result validation: %w", err),
 				),
 			}
+			notifyAttemptDone(normalized.OnAttemptDone, attempt, result, lastErr)
+			return result, lastErr
 		}
+		notifyAttemptDone(normalized.OnAttemptDone, attempt, result, lastErr)
 		if lastErr == nil {
 			return result, nil
 		}
@@ -232,6 +237,22 @@ func (runner *Runner) Run(ctx context.Context, request RunRequest) (RunResult, e
 	}
 
 	return result, lastErr
+}
+
+func notifyAttemptDone(
+	callback func(AttemptDone),
+	attempt int,
+	result RunResult,
+	err error,
+) {
+	if callback == nil {
+		return
+	}
+	callback(AttemptDone{
+		Attempt: attempt,
+		Result:  result,
+		Err:     err,
+	})
 }
 
 func (runner *Runner) runAttempt(ctx context.Context, request RunRequest, attempt int) (RunResult, error) {

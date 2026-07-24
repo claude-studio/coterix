@@ -34,6 +34,15 @@ type Line struct {
 	Text    string
 }
 
+// AttemptDone reports the result of one completed subprocess attempt after
+// role-specific result validation. Err is nil only when that attempt fully
+// succeeded.
+type AttemptDone struct {
+	Attempt int
+	Result  RunResult
+	Err     error
+}
+
 // RunRequest describes one logical subprocess step. MaxRetries is the number
 // of additional attempts after the initial attempt.
 type RunRequest struct {
@@ -66,6 +75,9 @@ type RunRequest struct {
 	// OnLine receives stdout and stderr lines serially. The trailing newline is
 	// omitted; a final unterminated line is still delivered.
 	OnLine func(Line)
+	// OnAttemptDone receives completed attempts serially in execution order,
+	// including attempts that time out, exit nonzero, or fail result validation.
+	OnAttemptDone func(AttemptDone)
 }
 
 // RunResult contains hard subprocess evidence and paths to its persisted logs.
