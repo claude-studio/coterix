@@ -122,7 +122,7 @@ func TestTaskCycleHelperProcess(t *testing.T) {
 			taskCycleHelperFail("implementation review state is incomplete")
 		}
 		if scenario == "review-auth" {
-			_, _ = fmt.Fprintln(os.Stderr, "authentication required: please login")
+			_, _ = fmt.Fprintln(os.Stderr, "Not logged in")
 			os.Exit(17)
 		}
 		if scenario == "review-head-drift" && count == 1 {
@@ -165,7 +165,11 @@ func TestTaskCycleHelperProcess(t *testing.T) {
 			planHash = strings.Repeat("f", 64)
 		case "review-inconsistent":
 			findings = `[{"id":"f1","severity":"major","location":"tracked.txt:1","issue":"blocking issue","requested_change":"fix it"}]`
-		case "review-dirty-repair", "review-dirty-cap", "fixer-auth-once":
+		case "review-dirty-repair",
+			"review-dirty-cap",
+			"fixer-auth-once",
+			"fixer-no-commit",
+			"fixer-dirty":
 			if count == 1 {
 				clean = false
 				findings = `[{"id":"f1","severity":"major","location":"tracked.txt:1","issue":"candidate is incomplete","requested_change":"complete it"}]`
@@ -225,7 +229,9 @@ func TestTaskCycleHelperProcess(t *testing.T) {
 		}
 		if (scenario == "review-dirty-repair" ||
 			scenario == "review-dirty-cap" ||
-			scenario == "fixer-auth-once") &&
+			scenario == "fixer-auth-once" ||
+			scenario == "fixer-no-commit" ||
+			scenario == "fixer-dirty") &&
 			!strings.Contains(promptText, "candidate is incomplete") {
 			taskCycleHelperFail("fixer prompt omitted review finding")
 		}
@@ -374,6 +380,427 @@ func TestTaskCycleConfirmsTaskWithoutChangingPlan(t *testing.T) {
 	taskCycleAssertHelperCount(t, fixture.run.Dir, 1)
 	taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "gate.count"), 1)
 	taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "review.count"), 1)
+}
+
+func TestTaskCycleRepairsFailedGateAndDirtyReview(t *testing.T) {
+	tests := []struct {
+		scenario    string
+		wantReviews int
+	}{
+		{scenario: "gate-fail-repair", wantReviews: 1},
+		{scenario: "review-dirty-repair", wantReviews: 2},
+	}
+
+	for _, test := range tests {
+		t.Run(test.scenario, func(t *testing.T) {
+			fixture := newTaskCycleTestRun(t, test.scenario)
+			if err := executeTaskCycle(t, fixture.run); err != nil {
+				t.Fatalf("TaskCycle.Run() error = %v", err)
+			}
+
+			reloaded := controlOpenRun(t, fixture.run.RepoRoot, fixture.run.ID)
+			task := reloaded.State.Tasks["T2"]
+			finalCandidate := taskCycleGitHead(t, fixture.run.RepoRoot)
+			originalCandidate := strings.TrimSpace(
+				controlGit(t, fixture.run.RepoRoot, "rev-parse", "HEAD^"),
+			)
+			if reloaded.State.Phase != state.PhaseDone ||
+				task == nil ||
+				task.Status != state.TaskConfirmed ||
+				task.Attempt != 2 ||
+				task.BaseSHA == nil ||
+				*task.BaseSHA != fixture.baseSHA ||
+				task.CandidateSHA == nil ||
+				*task.CandidateSHA != finalCandidate ||
+				originalCandidate == finalCandidate ||
+				originalCandidate == fixture.baseSHA {
+				t.Fatalf("repaired task state = %#v", reloaded.State)
+			}
+			taskCycleAssertFinalEvidence(
+				t,
+				reloaded,
+				"T2",
+				finalCandidate,
+				originalCandidate,
+			)
+			taskCycleAssertHelperCount(t, fixture.run.Dir, 1)
+			taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "fix.count"), 1)
+			taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "gate.count"), 2)
+			taskCycleAssertCount(
+				t,
+				filepath.Join(fixture.run.Dir, "review.count"),
+				test.wantReviews,
+			)
+		})
+	}
+}
+
+func TestTaskCycleInvalidImplementationReviewFailsWithoutRepair(t *testing.T) {
+	tests := []struct {
+		scenario        string
+		wantReviews     int
+		wantHeadMatches bool
+	}{
+		{scenario: "review-missing", wantReviews: 4, wantHeadMatches: true},
+		{scenario: "review-malformed", wantReviews: 4, wantHeadMatches: true},
+		{scenario: "review-inconsistent", wantReviews: 4, wantHeadMatches: true},
+		{scenario: "review-target-mismatch", wantReviews: 4, wantHeadMatches: true},
+		{scenario: "review-task-mismatch", wantReviews: 4, wantHeadMatches: true},
+		{scenario: "review-plan-mismatch", wantReviews: 4, wantHeadMatches: true},
+		{scenario: "review-head-drift", wantReviews: 1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.scenario, func(t *testing.T) {
+			fixture := newTaskCycleTestRun(t, test.scenario)
+			if err := executeTaskCycle(t, fixture.run); err == nil {
+				t.Fatal("TaskCycle.Run() accepted an invalid implementation review")
+			}
+
+			reloaded := controlOpenRun(t, fixture.run.RepoRoot, fixture.run.ID)
+			task := reloaded.State.Tasks["T2"]
+			if reloaded.State.Phase != state.PhaseFailed ||
+				reloaded.State.LastError == nil ||
+				reloaded.State.PendingAction != nil ||
+				task == nil ||
+				task.Status != state.TaskCandidate ||
+				task.Attempt != 1 ||
+				task.CandidateSHA == nil ||
+				task.GateResult == nil ||
+				*task.GateResult != filepath.Join("tasks", "T2", "gate.json") ||
+				task.ReviewResult != nil {
+				t.Fatalf("invalid-review fail-safe state = %#v", reloaded.State)
+			}
+			head := taskCycleGitHead(t, fixture.run.RepoRoot)
+			if got := head == *task.CandidateSHA; got != test.wantHeadMatches {
+				t.Fatalf(
+					"HEAD matches candidate_sha = %t, want %t (HEAD=%s candidate=%s)",
+					got,
+					test.wantHeadMatches,
+					head,
+					*task.CandidateSHA,
+				)
+			}
+			if got := strings.TrimSpace(
+				controlGit(t, fixture.run.RepoRoot, "status", "--porcelain"),
+			); got != "" {
+				t.Fatalf("invalid-review fail-safe worktree is dirty: %q", got)
+			}
+			taskCycleAssertHelperCount(t, fixture.run.Dir, 1)
+			taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "gate.count"), 1)
+			taskCycleAssertCount(
+				t,
+				filepath.Join(fixture.run.Dir, "review.count"),
+				test.wantReviews,
+			)
+			taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "fix.count"), 0)
+		})
+	}
+}
+
+func TestTaskCycleRepairCapPausesAndRetryUsesFixer(t *testing.T) {
+	tests := []struct {
+		scenario          string
+		wantPausedReviews int
+		wantFinalReviews  int
+	}{
+		{
+			scenario:          "gate-fail-cap",
+			wantPausedReviews: 0,
+			wantFinalReviews:  1,
+		},
+		{
+			scenario:          "review-dirty-cap",
+			wantPausedReviews: 1,
+			wantFinalReviews:  2,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.scenario, func(t *testing.T) {
+			fixture := newTaskCycleTestRunWithMaxTaskAttempts(
+				t,
+				test.scenario,
+				1,
+			)
+			if err := executeTaskCycle(t, fixture.run); err != nil {
+				t.Fatalf("TaskCycle.Run() cap error = %v", err)
+			}
+
+			paused := controlOpenRun(t, fixture.run.RepoRoot, fixture.run.ID)
+			task := paused.State.Tasks["T2"]
+			action := paused.State.PendingAction
+			if paused.State.Phase != state.PhasePausedForInput ||
+				paused.State.LastError != nil ||
+				action == nil ||
+				action.Kind != state.PendingTaskCap ||
+				action.ResumePhase != state.PhaseImplementing ||
+				action.TaskID == nil ||
+				*action.TaskID != "T2" ||
+				action.Response != nil ||
+				task == nil ||
+				task.Status != state.TaskRepairing ||
+				task.Attempt != 1 ||
+				task.CandidateSHA == nil ||
+				task.GateResult == nil {
+				t.Fatalf("repair cap state = %#v", paused.State)
+			}
+			if test.wantPausedReviews == 0 && task.ReviewResult != nil {
+				t.Fatalf("failed gate linked review evidence: %#v", task)
+			}
+			if test.wantPausedReviews > 0 && task.ReviewResult == nil {
+				t.Fatalf("dirty review was not linked before cap: %#v", task)
+			}
+			pausedCandidate := *task.CandidateSHA
+			taskCycleAssertHelperCount(t, fixture.run.Dir, 1)
+			taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "fix.count"), 0)
+			taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "gate.count"), 1)
+			taskCycleAssertCount(
+				t,
+				filepath.Join(fixture.run.Dir, "review.count"),
+				test.wantPausedReviews,
+			)
+
+			executor := runner.New(runner.WithoutSignalHandling())
+			defer executor.Close()
+			retry := "retry"
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			status, err := NewController(executor).Resume(
+				ctx,
+				fixture.run.RepoRoot,
+				fixture.run.ID,
+				&retry,
+			)
+			if err != nil {
+				t.Fatalf("Resume(retry) error = %v", err)
+			}
+			if status.Phase != state.PhaseDone ||
+				status.PendingAction != nil ||
+				status.Tasks["T2"].Status != state.TaskConfirmed ||
+				status.Tasks["T2"].Attempt != 2 {
+				t.Fatalf("repair cap retry status = %#v", status)
+			}
+
+			reloaded := controlOpenRun(t, fixture.run.RepoRoot, fixture.run.ID)
+			finalCandidate := taskCycleGitHead(t, fixture.run.RepoRoot)
+			if finalCandidate == pausedCandidate {
+				t.Fatal("repair cap retry did not create a new candidate")
+			}
+			taskCycleAssertFinalEvidence(
+				t,
+				reloaded,
+				"T2",
+				finalCandidate,
+				pausedCandidate,
+			)
+			taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "fix.count"), 1)
+			taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "gate.count"), 2)
+			taskCycleAssertCount(
+				t,
+				filepath.Join(fixture.run.Dir, "review.count"),
+				test.wantFinalReviews,
+			)
+		})
+	}
+}
+
+func TestTaskCycleReviewerAndFixerAuthPause(t *testing.T) {
+	t.Run("reviewer auth", func(t *testing.T) {
+		fixture := newTaskCycleTestRun(t, "review-auth")
+		if err := executeTaskCycle(t, fixture.run); err != nil {
+			t.Fatalf("TaskCycle.Run() reviewer auth error = %v", err)
+		}
+
+		reloaded := controlOpenRun(t, fixture.run.RepoRoot, fixture.run.ID)
+		task := reloaded.State.Tasks["T2"]
+		taskCycleAssertImplementingAuthPause(t, reloaded)
+		if task.Status != state.TaskCandidate ||
+			task.Attempt != 1 ||
+			task.CandidateSHA == nil ||
+			task.GateResult == nil ||
+			task.ReviewResult != nil {
+			t.Fatalf("reviewer auth task state = %#v", task)
+		}
+		taskCycleAssertHelperCount(t, fixture.run.Dir, 1)
+		taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "gate.count"), 1)
+		taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "review.count"), 4)
+		taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "fix.count"), 0)
+	})
+
+	t.Run("fixer auth resumes through writer route", func(t *testing.T) {
+		fixture := newTaskCycleTestRun(t, "fixer-auth-once")
+		if err := executeTaskCycle(t, fixture.run); err != nil {
+			t.Fatalf("TaskCycle.Run() fixer auth error = %v", err)
+		}
+
+		paused := controlOpenRun(t, fixture.run.RepoRoot, fixture.run.ID)
+		task := paused.State.Tasks["T2"]
+		taskCycleAssertImplementingAuthPause(t, paused)
+		if task.Status != state.TaskRepairing ||
+			task.Attempt != 2 ||
+			task.CandidateSHA == nil ||
+			task.GateResult == nil ||
+			task.ReviewResult == nil {
+			t.Fatalf("fixer auth task state = %#v", task)
+		}
+		pausedCandidate := *task.CandidateSHA
+		taskCycleAssertHelperCount(t, fixture.run.Dir, 1)
+		taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "gate.count"), 1)
+		taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "review.count"), 1)
+		taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "fix.count"), 1)
+
+		executor := runner.New(runner.WithoutSignalHandling())
+		defer executor.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		status, err := NewController(executor).Resume(
+			ctx,
+			fixture.run.RepoRoot,
+			fixture.run.ID,
+			nil,
+		)
+		if err != nil {
+			t.Fatalf("response-free fixer auth Resume() error = %v", err)
+		}
+		if status.Phase != state.PhaseDone ||
+			status.PendingAction != nil ||
+			status.Tasks["T2"].Status != state.TaskConfirmed ||
+			status.Tasks["T2"].Attempt != 3 {
+			t.Fatalf("fixer auth resume status = %#v", status)
+		}
+		reloaded := controlOpenRun(t, fixture.run.RepoRoot, fixture.run.ID)
+		finalCandidate := taskCycleGitHead(t, fixture.run.RepoRoot)
+		taskCycleAssertFinalEvidence(
+			t,
+			reloaded,
+			"T2",
+			finalCandidate,
+			pausedCandidate,
+		)
+		taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "gate.count"), 2)
+		taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "review.count"), 2)
+		taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "fix.count"), 2)
+	})
+}
+
+func TestTaskCycleRepairAndGateBoundariesFailSafe(t *testing.T) {
+	tests := []struct {
+		scenario          string
+		wantStatus        state.TaskStatus
+		wantAttempt       int
+		wantClean         bool
+		wantHeadMatches   bool
+		wantGateLink      bool
+		wantReviewLink    bool
+		wantGateCalls     int
+		wantReviewCalls   int
+		wantFixCalls      int
+		wantTrackedOutput string
+	}{
+		{
+			scenario:          "fixer-no-commit",
+			wantStatus:        state.TaskRepairing,
+			wantAttempt:       2,
+			wantClean:         true,
+			wantHeadMatches:   true,
+			wantGateLink:      true,
+			wantReviewLink:    true,
+			wantGateCalls:     1,
+			wantReviewCalls:   1,
+			wantFixCalls:      1,
+			wantTrackedOutput: "candidate T2\n",
+		},
+		{
+			scenario:          "fixer-dirty",
+			wantStatus:        state.TaskRepairing,
+			wantAttempt:       2,
+			wantHeadMatches:   true,
+			wantGateLink:      true,
+			wantReviewLink:    true,
+			wantGateCalls:     1,
+			wantReviewCalls:   1,
+			wantFixCalls:      1,
+			wantTrackedOutput: "dirty fixer output\n",
+		},
+		{
+			scenario:          "gate-head-drift",
+			wantStatus:        state.TaskCandidate,
+			wantAttempt:       1,
+			wantClean:         true,
+			wantGateCalls:     1,
+			wantTrackedOutput: "gate changed HEAD\n",
+		},
+		{
+			scenario:          "gate-dirty",
+			wantStatus:        state.TaskCandidate,
+			wantAttempt:       1,
+			wantHeadMatches:   true,
+			wantGateCalls:     1,
+			wantTrackedOutput: "gate dirtied worktree\n",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.scenario, func(t *testing.T) {
+			fixture := newTaskCycleTestRun(t, test.scenario)
+			if err := executeTaskCycle(t, fixture.run); err == nil {
+				t.Fatal("TaskCycle.Run() accepted a broken repair/gate boundary")
+			}
+
+			reloaded := controlOpenRun(t, fixture.run.RepoRoot, fixture.run.ID)
+			task := reloaded.State.Tasks["T2"]
+			if reloaded.State.Phase != state.PhaseFailed ||
+				reloaded.State.LastError == nil ||
+				reloaded.State.PendingAction != nil ||
+				task == nil ||
+				task.Status != test.wantStatus ||
+				task.Attempt != test.wantAttempt ||
+				task.CandidateSHA == nil ||
+				(task.GateResult != nil) != test.wantGateLink ||
+				(task.ReviewResult != nil) != test.wantReviewLink {
+				t.Fatalf("boundary fail-safe state = %#v", reloaded.State)
+			}
+			head := taskCycleGitHead(t, fixture.run.RepoRoot)
+			if got := head == *task.CandidateSHA; got != test.wantHeadMatches {
+				t.Fatalf(
+					"HEAD matches candidate_sha = %t, want %t (HEAD=%s candidate=%s)",
+					got,
+					test.wantHeadMatches,
+					head,
+					*task.CandidateSHA,
+				)
+			}
+			clean := strings.TrimSpace(
+				controlGit(t, fixture.run.RepoRoot, "status", "--porcelain"),
+			) == ""
+			if clean != test.wantClean {
+				t.Fatalf("worktree clean = %t, want %t", clean, test.wantClean)
+			}
+			if got := string(taskCycleReadFile(
+				t,
+				filepath.Join(fixture.run.RepoRoot, "tracked.txt"),
+			)); got != test.wantTrackedOutput {
+				t.Fatalf("tracked.txt = %q, want %q", got, test.wantTrackedOutput)
+			}
+			taskCycleAssertHelperCount(t, fixture.run.Dir, 1)
+			taskCycleAssertCount(
+				t,
+				filepath.Join(fixture.run.Dir, "gate.count"),
+				test.wantGateCalls,
+			)
+			taskCycleAssertCount(
+				t,
+				filepath.Join(fixture.run.Dir, "review.count"),
+				test.wantReviewCalls,
+			)
+			taskCycleAssertCount(
+				t,
+				filepath.Join(fixture.run.Dir, "fix.count"),
+				test.wantFixCalls,
+			)
+		})
+	}
 }
 
 func TestTaskCyclePreconditionAndApprovedPlanFailSafe(t *testing.T) {
@@ -637,11 +1064,23 @@ type taskCycleFixture struct {
 
 func newTaskCycleTestRun(t *testing.T, scenario string) taskCycleFixture {
 	t.Helper()
+	return newTaskCycleTestRunWithMaxTaskAttempts(t, scenario, 0)
+}
+
+func newTaskCycleTestRunWithMaxTaskAttempts(
+	t *testing.T,
+	scenario string,
+	maxTaskAttempts int,
+) taskCycleFixture {
+	t.Helper()
 	repoRoot := t.TempDir()
 	runID := "task-cycle-run"
 	runDir := filepath.Join(repoRoot, ".coterix", "runs", runID)
 
 	config := testConfig(t)
+	if maxTaskAttempts > 0 {
+		config.MaxTaskAttempts = maxTaskAttempts
+	}
 	command, err := filepath.Abs(os.Args[0])
 	if err != nil {
 		t.Fatal(err)
@@ -756,6 +1195,91 @@ func executeTaskCycle(t *testing.T, currentRun *Run) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	return NewTaskCycle(executor).Run(ctx, currentRun)
+}
+
+func taskCycleAssertFinalEvidence(
+	t *testing.T,
+	currentRun *Run,
+	taskID string,
+	candidateSHA string,
+	staleCandidateSHA string,
+) {
+	t.Helper()
+	task := currentRun.State.Tasks[taskID]
+	if task == nil ||
+		task.GateResult == nil ||
+		*task.GateResult != taskEvidenceRelativePath(taskID, gateEvidenceName) ||
+		task.ReviewResult == nil ||
+		*task.ReviewResult != taskEvidenceRelativePath(taskID, reviewEvidenceName) {
+		t.Fatalf("task %s evidence links = %#v", taskID, task)
+	}
+	gate, err := readGateEvidence(filepath.Join(currentRun.Dir, *task.GateResult))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateGateEvidence(
+		currentRun,
+		taskID,
+		candidateSHA,
+		gate,
+		true,
+	); err != nil {
+		t.Fatal(err)
+	}
+	review, err := currentRun.adapter.NewAttempt().ValidateReviewResult(
+		cli.RoleImplReviewer,
+		filepath.Join(currentRun.Dir, *task.ReviewResult),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateImplementationReviewTargets(
+		review,
+		*currentRun.State.ApprovedPlanHash,
+		taskID,
+		candidateSHA,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if !review.Verdict.Clean {
+		t.Fatalf("final review is dirty: %#v", review.Verdict)
+	}
+	if staleCandidateSHA != "" &&
+		(gate.CandidateSHA == staleCandidateSHA ||
+			review.Verdict.CandidateSHA == staleCandidateSHA) {
+		t.Fatalf(
+			"repair left stale evidence for candidate %s: gate=%#v review=%#v",
+			staleCandidateSHA,
+			gate,
+			review.Verdict,
+		)
+	}
+}
+
+func taskCycleAssertImplementingAuthPause(t *testing.T, currentRun *Run) {
+	t.Helper()
+	action := currentRun.State.PendingAction
+	task := currentRun.State.Tasks["T2"]
+	if currentRun.State.Phase != state.PhasePausedForInput ||
+		currentRun.State.LastError != nil ||
+		action == nil ||
+		action.Kind != state.PendingAuth ||
+		action.ResumePhase != state.PhaseImplementing ||
+		action.TaskID == nil ||
+		*action.TaskID != "T2" ||
+		action.Response != nil ||
+		task == nil ||
+		task.CandidateSHA == nil {
+		t.Fatalf("implementing auth pause state = %#v", currentRun.State)
+	}
+	if head := taskCycleGitHead(t, currentRun.RepoRoot); head != *task.CandidateSHA {
+		t.Fatalf("auth pause HEAD = %s, want candidate %s", head, *task.CandidateSHA)
+	}
+	if got := strings.TrimSpace(
+		controlGit(t, currentRun.RepoRoot, "status", "--porcelain"),
+	); got != "" {
+		t.Fatalf("auth pause worktree is dirty: %q", got)
+	}
 }
 
 func taskCycleAssertFailedOpenTask(t *testing.T, currentRun *Run) {
