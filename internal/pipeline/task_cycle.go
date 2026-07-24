@@ -14,8 +14,8 @@ import (
 	"github.com/ridenow/coterix/internal/state"
 )
 
-// TaskCycle advances one approved-plan task from open to candidate. Gate,
-// review, repair, and confirmation belong to the next pipeline milestone.
+// TaskCycle advances approved-plan tasks through implementation, trusted gate,
+// review, repair, and harness-owned confirmation.
 type TaskCycle struct {
 	Executor PlanExecutor
 	OnLine   func(runner.Line)
@@ -26,9 +26,19 @@ func NewTaskCycle(executor PlanExecutor) *TaskCycle {
 	return &TaskCycle{Executor: executor}
 }
 
-// Run advances the current task to the candidate boundary. It never advances
-// past a candidate because that task must still pass the later gate and review.
+// Run advances the task cycle without a cap override.
 func (cycle *TaskCycle) Run(ctx context.Context, currentRun *Run) error {
+	return cycle.RunWithOverride(ctx, currentRun, nil)
+}
+
+// RunWithOverride advances tasks until the run is done, failed, or paused. A
+// task-cap retry override is consumed by the immediately following impl/fix
+// attempt.
+func (cycle *TaskCycle) RunWithOverride(
+	ctx context.Context,
+	currentRun *Run,
+	override *state.OneShotOverride,
+) error {
 	if cycle == nil || cycle.Executor == nil {
 		return fmt.Errorf("pipeline: a task executor is required")
 	}
@@ -50,19 +60,70 @@ func (cycle *TaskCycle) Run(ctx context.Context, currentRun *Run) error {
 	if err != nil {
 		return cycle.fail(currentRun, err)
 	}
-	task, cursorChanged, err := currentTask(plan, currentRun.State)
-	if err != nil {
-		return cycle.fail(currentRun, err)
-	}
-	if cursorChanged {
-		if err := currentRun.SaveState(); err != nil {
+
+	for currentRun.State.Phase == state.PhaseImplementing {
+		task, cursorChanged, err := currentTask(plan, currentRun.State)
+		if err != nil {
 			return cycle.fail(currentRun, err)
 		}
-	}
-	if task == nil {
-		return nil
-	}
+		if cursorChanged {
+			if err := currentRun.SaveState(); err != nil {
+				return cycle.fail(currentRun, err)
+			}
+		}
+		if task == nil {
+			if override != nil && !override.Consumed() {
+				return cycle.fail(
+					currentRun,
+					fmt.Errorf("pipeline: task cap override had no task attempt to resume"),
+				)
+			}
+			if err := currentRun.State.TransitionPhase(state.PhaseDone); err != nil {
+				return cycle.fail(currentRun, err)
+			}
+			if err := currentRun.SaveState(); err != nil {
+				return cycle.fail(currentRun, err)
+			}
+			return nil
+		}
 
+		taskState := currentRun.State.Tasks[task.ID]
+		switch taskState.Status {
+		case state.TaskOpen:
+			err = cycle.implementTask(ctx, currentRun, task, override)
+			override = nil
+		case state.TaskCandidate:
+			if override != nil {
+				err = fmt.Errorf(
+					"pipeline: task cap override cannot resume candidate task %s",
+					task.ID,
+				)
+			} else {
+				err = cycle.assessCandidate(ctx, currentRun, task)
+			}
+		case state.TaskRepairing:
+			err = cycle.repairTask(ctx, currentRun, task, override)
+			override = nil
+		default:
+			err = fmt.Errorf(
+				"pipeline: task cycle cannot handle current task %s in status %s",
+				task.ID,
+				taskState.Status,
+			)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (cycle *TaskCycle) implementTask(
+	ctx context.Context,
+	currentRun *Run,
+	task *PlanTask,
+	override *state.OneShotOverride,
+) error {
 	taskState := currentRun.State.Tasks[task.ID]
 	history, err := recentCommitHistory(ctx, currentRun.RepoRoot)
 	if err != nil {
@@ -104,7 +165,7 @@ func (cycle *TaskCycle) Run(ctx context.Context, currentRun *Run) error {
 	if err := currentRun.State.BeginTaskAttempt(
 		task.ID,
 		currentRun.Config.MaxTaskAttempts,
-		nil,
+		override,
 	); err != nil {
 		taskState.BaseSHA = previousBase
 		taskState.Attempt = previousAttempt
@@ -148,11 +209,12 @@ func (cycle *TaskCycle) Run(ctx context.Context, currentRun *Run) error {
 
 	result, runErr := cycle.Executor.Run(ctx, request)
 	if runErr != nil {
-		return cycle.handleExecutionFailure(
+		return cycle.handleMutationFailure(
 			ctx,
 			currentRun,
 			task.ID,
 			cliName,
+			"implementation",
 			start,
 			request.StderrLog,
 			result,
@@ -186,6 +248,9 @@ func (cycle *TaskCycle) Run(ctx context.Context, currentRun *Run) error {
 		)
 	}
 
+	if err := cycle.clearTaskEvidence(currentRun, task.ID); err != nil {
+		return cycle.fail(currentRun, err)
+	}
 	taskState.CandidateSHA = stringPointer(candidate.CandidateSHA)
 	if err := currentRun.State.TransitionTask(task.ID, state.TaskCandidate); err != nil {
 		taskState.CandidateSHA = nil
@@ -233,8 +298,8 @@ func (cycle *TaskCycle) approvedPlan(currentRun *Run) (Plan, error) {
 	return plan, nil
 }
 
-// currentTask returns an open task to implement, or nil at the candidate/all
-// confirmed boundary. It only advances from a confirmed cursor in task_order.
+// currentTask returns the current open, candidate, or repairing task. It only
+// advances from a confirmed cursor in task_order.
 func currentTask(plan Plan, current *state.State) (*PlanTask, bool, error) {
 	start := 0
 	if current.CurrentTaskID != nil {
@@ -264,11 +329,9 @@ func currentTask(plan Plan, current *state.State) (*PlanTask, bool, error) {
 
 		taskState := current.Tasks[*current.CurrentTaskID]
 		switch taskState.Status {
-		case state.TaskOpen:
+		case state.TaskOpen, state.TaskCandidate, state.TaskRepairing:
 			task := plan.Tasks[index]
 			return &task, false, nil
-		case state.TaskCandidate:
-			return nil, false, nil
 		case state.TaskConfirmed:
 			start = index + 1
 		default:
@@ -287,7 +350,8 @@ func currentTask(plan Plan, current *state.State) (*PlanTask, bool, error) {
 			continue
 		}
 		if taskState.Status != state.TaskOpen &&
-			taskState.Status != state.TaskCandidate {
+			taskState.Status != state.TaskCandidate &&
+			taskState.Status != state.TaskRepairing {
 			return nil, false, fmt.Errorf(
 				"pipeline: task cycle cannot select task %s in status %s",
 				taskID,
@@ -295,9 +359,6 @@ func currentTask(plan Plan, current *state.State) (*PlanTask, bool, error) {
 			)
 		}
 		current.CurrentTaskID = stringPointer(taskID)
-		if taskState.Status == state.TaskCandidate {
-			return nil, true, nil
-		}
 		task := plan.Tasks[index]
 		return &task, true, nil
 	}
@@ -371,11 +432,12 @@ func (cycle *TaskCycle) implementationRequest(
 	}, cliName, nil
 }
 
-func (cycle *TaskCycle) handleExecutionFailure(
+func (cycle *TaskCycle) handleMutationFailure(
 	ctx context.Context,
 	currentRun *Run,
 	taskID string,
 	cliName string,
+	step string,
 	start runner.MutationSnapshot,
 	stderrLog string,
 	result runner.RunResult,
@@ -393,7 +455,8 @@ func (cycle *TaskCycle) handleExecutionFailure(
 			errors.Join(
 				runErr,
 				fmt.Errorf(
-					"pipeline: implementation starting snapshot no longer matches: %w",
+					"pipeline: %s starting snapshot no longer matches: %w",
+					step,
 					err,
 				),
 			),

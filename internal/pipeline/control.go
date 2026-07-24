@@ -283,9 +283,11 @@ func (controller *Controller) Resume(
 		)
 	}
 	action := *currentRun.State.PendingAction
+	needsTaskRetryExecutor := action.Kind == state.PendingTaskCap &&
+		response != nil && *response == "retry"
 	if (action.ResumePhase == state.PhasePlanning ||
 		(action.ResumePhase == state.PhaseImplementing &&
-			action.Kind == state.PendingAuth)) &&
+			(action.Kind == state.PendingAuth || needsTaskRetryExecutor))) &&
 		(controller == nil || controller.Executor == nil) {
 		return statusFromRun(currentRun), fmt.Errorf(
 			"pipeline: a control-plane executor is required to resume %s",
@@ -312,19 +314,24 @@ func (controller *Controller) Resume(
 	if err != nil {
 		return statusFromRun(currentRun), err
 	}
-	if resumed.Aborted || currentRun.State.Phase != state.PhasePlanning {
+	if resumed.Aborted {
 		if err := currentRun.SaveState(); err != nil {
 			persisted, reloadErr := reloadStatus(currentRun)
 			return persisted, errors.Join(err, reloadErr)
 		}
-		if !resumed.Aborted &&
-			currentRun.State.Phase == state.PhaseImplementing &&
-			resumed.Action.Kind == state.PendingAuth {
-			err = NewTaskCycle(controller.Executor).Run(ctx, currentRun)
-			return statusFromRun(currentRun), err
-		}
-		// Task-cap retry is attached to the gate/repair cycle in T8.
 		return statusFromRun(currentRun), nil
+	}
+	if currentRun.State.Phase == state.PhaseImplementing {
+		if err := currentRun.SaveState(); err != nil {
+			persisted, reloadErr := reloadStatus(currentRun)
+			return persisted, errors.Join(err, reloadErr)
+		}
+		err = NewTaskCycle(controller.Executor).RunWithOverride(
+			ctx,
+			currentRun,
+			resumed.Override,
+		)
+		return statusFromRun(currentRun), err
 	}
 
 	feedback := ""

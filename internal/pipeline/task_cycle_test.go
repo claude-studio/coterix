@@ -33,11 +33,6 @@ const taskCyclePlan = `# Task cycle plan
 - [ ] Implement the ordered first task
 Acceptance: The ordered first task is committed
 Verify: go test ./internal/pipeline/...
-
-## T1: Ordered second task
-- [ ] Implement the ordered second task
-Acceptance: The ordered second task remains open
-Verify: go test ./internal/pipeline/...
 `
 
 const taskCycleFirstBody = `## T2: Ordered first task
@@ -46,12 +41,54 @@ Acceptance: The ordered first task is committed
 Verify: go test ./internal/pipeline/...`
 
 func TestTaskCycleHelperProcess(t *testing.T) {
+	arguments := taskCycleArgumentsAfterDoubleDash(os.Args)
+	if len(arguments) == 0 {
+		return
+	}
+	role := arguments[0]
+	if role == "gate" {
+		if len(arguments) != 5 {
+			taskCycleHelperFail("gate helper arguments are incomplete")
+		}
+		scenario := arguments[1]
+		repoRoot := arguments[2]
+		runDir := arguments[3]
+		count := taskCycleIncrementHelperCount(filepath.Join(runDir, "gate.count"))
+		switch scenario {
+		case "gate-fail-repair", "gate-fail-cap":
+			if count == 1 {
+				_, _ = fmt.Fprintln(os.Stdout, "gate stdout failure")
+				_, _ = fmt.Fprintln(os.Stderr, "gate stderr failure")
+				os.Exit(23)
+			}
+		case "gate-timeout":
+			time.Sleep(10 * time.Second)
+		case "gate-head-drift":
+			taskCycleHelperWrite(
+				filepath.Join(repoRoot, "tracked.txt"),
+				"gate changed HEAD\n",
+			)
+			taskCycleHelperGit(repoRoot, "add", "tracked.txt")
+			taskCycleHelperGit(
+				repoRoot,
+				"-c", "user.name=Coterix Task Test",
+				"-c", "user.email=task@example.invalid",
+				"commit", "-qm", "gate changed HEAD",
+			)
+		case "gate-dirty":
+			taskCycleHelperWrite(
+				filepath.Join(repoRoot, "tracked.txt"),
+				"gate dirtied worktree\n",
+			)
+		}
+		_, _ = fmt.Fprintln(os.Stdout, "trusted gate passed")
+		return
+	}
 	if os.Getenv(taskCycleHelperEnvironment) != "1" {
 		return
 	}
-	arguments := taskCycleArgumentsAfterDoubleDash(os.Args)
-	if len(arguments) != 1 || arguments[0] != "codex" {
-		taskCycleHelperFail("task helper requires the codex role")
+	if len(arguments) != 1 || (role != "codex" && role != "claude") {
+		taskCycleHelperFail("task helper requires the codex or claude role")
 	}
 	rendered, err := io.ReadAll(os.Stdin)
 	if err != nil {
@@ -61,18 +98,152 @@ func TestTaskCycleHelperProcess(t *testing.T) {
 	repoRoot := os.Getenv(taskCycleRepoRootEnv)
 	runDir := os.Getenv(taskCycleRunDirEnv)
 	scenario := os.Getenv(taskCycleScenarioEnv)
-	taskID := os.Getenv(taskCycleExpectedTaskEnv)
-	if repoRoot == "" || runDir == "" || scenario == "" || taskID == "" {
+	if repoRoot == "" || runDir == "" || scenario == "" {
 		taskCycleHelperFail("task helper environment is incomplete")
 	}
-	taskCycleIncrementHelperCount(filepath.Join(runDir, "impl.count"))
-
 	current, err := state.Load(filepath.Join(runDir, stateFileName))
 	if err != nil {
 		taskCycleHelperFail(err.Error())
 	}
-	head := strings.TrimSpace(taskCycleHelperGit(repoRoot, "rev-parse", "--verify", "HEAD"))
+	if current.CurrentTaskID == nil {
+		taskCycleHelperFail("task helper state has no current task")
+	}
+	taskID := *current.CurrentTaskID
 	task := current.Tasks[taskID]
+	head := strings.TrimSpace(taskCycleHelperGit(repoRoot, "rev-parse", "--verify", "HEAD"))
+	promptText := string(rendered)
+
+	if role == "claude" {
+		count := taskCycleIncrementHelperCount(filepath.Join(runDir, "review.count"))
+		if current.ApprovedPlanHash == nil || task == nil ||
+			task.Status != state.TaskCandidate ||
+			task.CandidateSHA == nil ||
+			*task.CandidateSHA != head {
+			taskCycleHelperFail("implementation review state is incomplete")
+		}
+		if scenario == "review-auth" {
+			_, _ = fmt.Fprintln(os.Stderr, "authentication required: please login")
+			os.Exit(17)
+		}
+		if scenario == "review-head-drift" && count == 1 {
+			taskCycleHelperWrite(
+				filepath.Join(repoRoot, "tracked.txt"),
+				"review changed HEAD\n",
+			)
+			taskCycleHelperGit(repoRoot, "add", "tracked.txt")
+			taskCycleHelperGit(
+				repoRoot,
+				"-c", "user.name=Coterix Task Test",
+				"-c", "user.email=task@example.invalid",
+				"commit", "-qm", "review changed HEAD",
+			)
+		}
+		reviewPath := filepath.Join(
+			runDir,
+			tasksDirectoryName,
+			taskID,
+			reviewEvidenceName,
+		)
+		if scenario == "review-missing" {
+			return
+		}
+		if scenario == "review-malformed" {
+			taskCycleHelperWrite(reviewPath, `{"schema_version":`)
+			return
+		}
+		planHash := *current.ApprovedPlanHash
+		reviewTaskID := taskID
+		candidateSHA := *task.CandidateSHA
+		clean := true
+		findings := "[]"
+		switch scenario {
+		case "review-target-mismatch":
+			candidateSHA = strings.Repeat("0", 40)
+		case "review-task-mismatch":
+			reviewTaskID = "T999"
+		case "review-plan-mismatch":
+			planHash = strings.Repeat("f", 64)
+		case "review-inconsistent":
+			findings = `[{"id":"f1","severity":"major","location":"tracked.txt:1","issue":"blocking issue","requested_change":"fix it"}]`
+		case "review-dirty-repair", "review-dirty-cap", "fixer-auth-once":
+			if count == 1 {
+				clean = false
+				findings = `[{"id":"f1","severity":"major","location":"tracked.txt:1","issue":"candidate is incomplete","requested_change":"complete it"}]`
+			}
+		case "review-minor":
+			findings = `[{"id":"f1","severity":"minor","location":null,"issue":"non-blocking note","requested_change":"consider later"}]`
+		}
+		review := fmt.Sprintf(
+			`{"schema_version":1,"plan_hash":%q,"task_id":%q,"candidate_sha":%q,"clean":%t,"findings":%s}`,
+			planHash,
+			reviewTaskID,
+			candidateSHA,
+			clean,
+			findings,
+		)
+		taskCycleHelperWrite(reviewPath, review)
+		return
+	}
+
+	planPath := filepath.Join(runDir, planFileName)
+	planInfo, err := os.Stat(planPath)
+	if err != nil {
+		taskCycleHelperFail(err.Error())
+	}
+	if planInfo.Mode().Perm()&0o222 != 0 {
+		taskCycleHelperFail("approved plan was writable during mutation")
+	}
+	trackedPath := filepath.Join(repoRoot, "tracked.txt")
+	if strings.Contains(promptText, "You are a FIXER.") {
+		count := taskCycleIncrementHelperCount(filepath.Join(runDir, "fix.count"))
+		if current.Phase != state.PhaseImplementing ||
+			task == nil ||
+			task.Status != state.TaskRepairing ||
+			task.Attempt < 2 ||
+			task.CandidateSHA == nil ||
+			*task.CandidateSHA != head {
+			taskCycleHelperFail(fmt.Sprintf(
+				"fixer snapshot was not persisted before invocation: %#v",
+				current,
+			))
+		}
+		if scenario == "fixer-auth-once" && count == 1 {
+			_, _ = fmt.Fprintln(os.Stderr, "API key auth is missing a key")
+			os.Exit(17)
+		}
+		if scenario == "fixer-no-commit" {
+			return
+		}
+		if scenario == "fixer-dirty" {
+			taskCycleHelperWrite(trackedPath, "dirty fixer output\n")
+			return
+		}
+		if scenario == "gate-fail-repair" &&
+			(!strings.Contains(promptText, "exit: 23") ||
+				!strings.Contains(promptText, "gate stderr failure")) {
+			taskCycleHelperFail("fixer prompt omitted trusted gate failure")
+		}
+		if (scenario == "review-dirty-repair" ||
+			scenario == "review-dirty-cap" ||
+			scenario == "fixer-auth-once") &&
+			!strings.Contains(promptText, "candidate is incomplete") {
+			taskCycleHelperFail("fixer prompt omitted review finding")
+		}
+		taskCycleHelperWrite(
+			trackedPath,
+			fmt.Sprintf("fixed %s attempt %d\n", taskID, task.Attempt),
+		)
+		taskCycleHelperGit(repoRoot, "add", "tracked.txt")
+		taskCycleHelperGit(
+			repoRoot,
+			"-c", "user.name=Coterix Task Test",
+			"-c", "user.email=task@example.invalid",
+			"commit", "-qm", "repair task candidate",
+		)
+		return
+	}
+
+	taskCycleIncrementHelperCount(filepath.Join(runDir, "impl.count"))
 	if current.Phase != state.PhaseImplementing ||
 		current.CurrentTaskID == nil ||
 		*current.CurrentTaskID != taskID ||
@@ -88,27 +259,36 @@ func TestTaskCycleHelperProcess(t *testing.T) {
 		))
 	}
 
-	planPath := filepath.Join(runDir, planFileName)
-	planInfo, err := os.Stat(planPath)
-	if err != nil {
-		taskCycleHelperFail(err.Error())
-	}
-	if planInfo.Mode().Perm()&0o222 != 0 {
-		taskCycleHelperFail("approved plan was writable during implementation")
-	}
-	promptText := string(rendered)
 	if !strings.Contains(promptText, planPath) ||
-		!strings.Contains(
-			promptText,
-			"Task to implement THIS iteration:\n"+taskCycleFirstBody,
-		) {
+		!strings.Contains(promptText, "## "+taskID+":") {
 		taskCycleHelperFail("implementation prompt omitted the frozen plan or ordered task body")
 	}
 
-	trackedPath := filepath.Join(repoRoot, "tracked.txt")
 	switch scenario {
-	case "success":
-		taskCycleHelperWrite(trackedPath, "candidate\n")
+	case "success",
+		"review-minor",
+		"gate-fail-repair",
+		"gate-fail-cap",
+		"gate-timeout",
+		"gate-head-drift",
+		"gate-dirty",
+		"review-dirty-repair",
+		"review-dirty-cap",
+		"review-target-mismatch",
+		"review-task-mismatch",
+		"review-plan-mismatch",
+		"review-inconsistent",
+		"review-malformed",
+		"review-missing",
+		"review-auth",
+		"review-head-drift",
+		"fixer-auth-once",
+		"fixer-no-commit",
+		"fixer-dirty":
+		taskCycleHelperWrite(
+			trackedPath,
+			fmt.Sprintf("candidate %s\n", taskID),
+		)
 		taskCycleHelperGit(repoRoot, "add", "tracked.txt")
 		taskCycleHelperGit(
 			repoRoot,
@@ -148,7 +328,7 @@ func TestTaskCycleHelperProcess(t *testing.T) {
 	}
 }
 
-func TestTaskCycleRecordsOrderedCandidateWithoutChangingPlan(t *testing.T) {
+func TestTaskCycleConfirmsTaskWithoutChangingPlan(t *testing.T) {
 	fixture := newTaskCycleTestRun(t, "success")
 	beforePlan := taskCycleReadFile(t, filepath.Join(fixture.run.Dir, planFileName))
 
@@ -157,8 +337,8 @@ func TestTaskCycleRecordsOrderedCandidateWithoutChangingPlan(t *testing.T) {
 	}
 
 	reloaded := controlOpenRun(t, fixture.run.RepoRoot, fixture.run.ID)
-	if reloaded.State.Phase != state.PhaseImplementing {
-		t.Fatalf("phase = %s, want implementing", reloaded.State.Phase)
+	if reloaded.State.Phase != state.PhaseDone {
+		t.Fatalf("phase = %s, want done", reloaded.State.Phase)
 	}
 	if reloaded.State.CurrentTaskID == nil ||
 		*reloaded.State.CurrentTaskID != "T2" {
@@ -167,24 +347,18 @@ func TestTaskCycleRecordsOrderedCandidateWithoutChangingPlan(t *testing.T) {
 	first := reloaded.State.Tasks["T2"]
 	head := taskCycleGitHead(t, fixture.run.RepoRoot)
 	if first == nil ||
-		first.Status != state.TaskCandidate ||
+		first.Status != state.TaskConfirmed ||
 		first.Attempt != 1 ||
 		first.BaseSHA == nil ||
 		*first.BaseSHA != fixture.baseSHA ||
 		first.CandidateSHA == nil ||
 		*first.CandidateSHA != head ||
 		*first.CandidateSHA == *first.BaseSHA ||
-		first.GateResult != nil ||
-		first.ReviewResult != nil {
+		first.GateResult == nil ||
+		*first.GateResult != filepath.Join("tasks", "T2", "gate.json") ||
+		first.ReviewResult == nil ||
+		*first.ReviewResult != filepath.Join("tasks", "T2", "review.json") {
 		t.Fatalf("T2 state = %#v", first)
-	}
-	second := reloaded.State.Tasks["T1"]
-	if second == nil ||
-		second.Status != state.TaskOpen ||
-		second.Attempt != 0 ||
-		second.BaseSHA != nil ||
-		second.CandidateSHA != nil {
-		t.Fatalf("T1 state = %#v, want untouched open task", second)
 	}
 	if got := strings.TrimSpace(controlGit(t, fixture.run.RepoRoot, "status", "--porcelain")); got != "" {
 		t.Fatalf("candidate worktree is dirty: %q", got)
@@ -194,10 +368,12 @@ func TestTaskCycleRecordsOrderedCandidateWithoutChangingPlan(t *testing.T) {
 		t.Fatal("task cycle changed frozen plan.md")
 	}
 	if bytes.Contains(afterPlan, []byte("- [x]")) ||
-		bytes.Count(afterPlan, []byte("- [ ]")) != 2 {
+		bytes.Count(afterPlan, []byte("- [ ]")) != 1 {
 		t.Fatalf("task cycle ticked a plan checkbox: %q", afterPlan)
 	}
 	taskCycleAssertHelperCount(t, fixture.run.Dir, 1)
+	taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "gate.count"), 1)
+	taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "review.count"), 1)
 }
 
 func TestTaskCyclePreconditionAndApprovedPlanFailSafe(t *testing.T) {
@@ -486,6 +662,32 @@ func newTaskCycleTestRun(t *testing.T, scenario string) taskCycleFixture {
 			taskCycleExpectedTaskEnv:   "T2",
 		},
 	}
+	config.CLIs["claude"] = cli.CliConfig{
+		Command: command,
+		Args: []string{
+			"-test.run=^TestTaskCycleHelperProcess$",
+			"--",
+			"claude",
+		},
+		Stdin: true,
+		Env: map[string]string{
+			taskCycleHelperEnvironment: "1",
+			taskCycleScenarioEnv:       scenario,
+			taskCycleRepoRootEnv:       repoRoot,
+			taskCycleRunDirEnv:         runDir,
+			taskCycleExpectedTaskEnv:   "T2",
+		},
+	}
+	config.GateCommand = []string{
+		command,
+		"-test.run=^TestTaskCycleHelperProcess$",
+		"--",
+		"gate",
+		scenario,
+		repoRoot,
+		runDir,
+		"T2",
+	}
 	config.IdleTimeoutSecs = 3
 	config.MaxRetries = 3
 
@@ -527,10 +729,9 @@ func newTaskCycleTestRun(t *testing.T, scenario string) taskCycleFixture {
 	}
 	planHash := hashBytes([]byte(taskCyclePlan))
 	currentRun.State.PlanHash = stringPointer(planHash)
-	currentRun.State.TaskOrder = []string{"T2", "T1"}
+	currentRun.State.TaskOrder = []string{"T2"}
 	currentRun.State.Tasks = map[string]*state.TaskState{
 		"T2": {Status: state.TaskOpen},
-		"T1": {Status: state.TaskOpen},
 	}
 	if err := currentRun.State.TransitionPhase(state.PhaseAwaitingApproval); err != nil {
 		t.Fatal(err)
@@ -571,7 +772,11 @@ func taskCycleAssertFailedOpenTask(t *testing.T, currentRun *Run) {
 
 func taskCycleAssertHelperCount(t *testing.T, runDir string, want int) {
 	t.Helper()
-	path := filepath.Join(runDir, "impl.count")
+	taskCycleAssertCount(t, filepath.Join(runDir, "impl.count"), want)
+}
+
+func taskCycleAssertCount(t *testing.T, path string, want int) {
+	t.Helper()
 	content, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		if want == 0 {
@@ -614,7 +819,7 @@ func taskCycleArgumentsAfterDoubleDash(arguments []string) []string {
 	return nil
 }
 
-func taskCycleIncrementHelperCount(path string) {
+func taskCycleIncrementHelperCount(path string) int {
 	value := 0
 	content, err := os.ReadFile(path)
 	if err == nil {
@@ -625,6 +830,7 @@ func taskCycleIncrementHelperCount(path string) {
 	}
 	value++
 	taskCycleHelperWrite(path, strconv.Itoa(value))
+	return value
 }
 
 func taskCycleHelperGit(repoRoot string, arguments ...string) string {

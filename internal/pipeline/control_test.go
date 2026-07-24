@@ -60,6 +60,14 @@ func (executor *controlPlanExecutor) Run(
 			return runner.RunResult{}, err
 		}
 	}
+	for _, path := range []string{request.StdoutLog, request.StderrLog} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return runner.RunResult{}, err
+		}
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			return runner.RunResult{}, err
+		}
+	}
 
 	prompt := controlRequestPrompt(request)
 	executor.mu.Lock()
@@ -99,6 +107,39 @@ func (executor *controlPlanExecutor) Run(
 		}
 
 	case runner.EffectReadOnly:
+		if len(request.OutputPaths) == 0 {
+			break
+		}
+		if filepath.Base(request.OutputPaths[0]) == reviewEvidenceName {
+			runDir := filepath.Dir(filepath.Dir(filepath.Dir(request.OutputPaths[0])))
+			current, err := state.Load(filepath.Join(runDir, stateFileName))
+			if err != nil {
+				return runner.RunResult{}, err
+			}
+			taskID := filepath.Base(filepath.Dir(request.OutputPaths[0]))
+			task := current.Tasks[taskID]
+			if current.ApprovedPlanHash == nil || task == nil ||
+				task.CandidateSHA == nil {
+				return runner.RunResult{}, fmt.Errorf(
+					"control fake: implementation review state is incomplete",
+				)
+			}
+			review := fmt.Sprintf(
+				`{"schema_version":1,"plan_hash":%q,"task_id":%q,"candidate_sha":%q,"clean":true,"findings":[]}`,
+				*current.ApprovedPlanHash,
+				taskID,
+				*task.CandidateSHA,
+			)
+			if err := os.WriteFile(
+				request.OutputPaths[0],
+				[]byte(review),
+				0o600,
+			); err != nil {
+				return runner.RunResult{}, err
+			}
+			break
+		}
+
 		executor.mu.Lock()
 		reviewIndex := executor.reviewerCalls
 		executor.reviewerCalls++
@@ -168,7 +209,11 @@ func (executor *controlPlanExecutor) Run(
 		)
 	}
 
-	result := runner.RunResult{Exit: 0}
+	result := runner.RunResult{
+		Exit:      0,
+		StdoutLog: request.StdoutLog,
+		StderrLog: request.StderrLog,
+	}
 	if request.ValidateResult != nil {
 		if err := request.ValidateResult(ctx, result); err != nil {
 			return result, err
@@ -349,15 +394,17 @@ func TestControllerApproveRehashesAndFreezes(t *testing.T) {
 			t.Fatalf("Approve() error = %v", err)
 		}
 		task := status.Tasks["T1"]
-		if status.Phase != state.PhaseImplementing ||
+		if status.Phase != state.PhaseDone ||
 			status.ApprovedPlanHash == nil ||
 			*status.ApprovedPlanHash != wantHash ||
 			status.CurrentTaskID == nil ||
 			*status.CurrentTaskID != "T1" ||
-			task.Status != state.TaskCandidate ||
+			task.Status != state.TaskConfirmed ||
 			task.BaseSHA == nil ||
 			task.CandidateSHA == nil ||
-			*task.BaseSHA == *task.CandidateSHA {
+			*task.BaseSHA == *task.CandidateSHA ||
+			task.GateResult == nil ||
+			task.ReviewResult == nil {
 			t.Fatalf("approved status = %#v", status)
 		}
 		info, err := os.Stat(planPath)
@@ -537,16 +584,18 @@ func TestControllerResumeImplementingAuthRunsCurrentTask(t *testing.T) {
 		t.Fatalf("Resume() implementing auth error = %v", err)
 	}
 	task := status.Tasks["T1"]
-	if status.Phase != state.PhaseImplementing ||
+	if status.Phase != state.PhaseDone ||
 		status.PendingAction != nil ||
 		status.CurrentTaskID == nil ||
 		*status.CurrentTaskID != "T1" ||
-		task.Status != state.TaskCandidate ||
+		task.Status != state.TaskConfirmed ||
 		task.Attempt != 2 ||
 		task.BaseSHA == nil ||
 		*task.BaseSHA != base ||
 		task.CandidateSHA == nil ||
-		*task.CandidateSHA == base {
+		*task.CandidateSHA == base ||
+		task.GateResult == nil ||
+		task.ReviewResult == nil {
 		t.Fatalf("implementing auth resume status = %#v", status)
 	}
 	if !executor.containsPrompt("## T1: Control task") {
@@ -636,7 +685,7 @@ func TestControllerResumeImplementingAuthRejectsBaseDrift(t *testing.T) {
 func TestControllerResumeTaskCapResponseRules(t *testing.T) {
 	t.Run("invalid responses preserve paused state and retry resumes", func(t *testing.T) {
 		root, run := controlSeedTaskCapPause(t)
-		controller := NewController(nil)
+		controller := NewController(&controlPlanExecutor{})
 		statePath := filepath.Join(run.Dir, stateFileName)
 		before := controlReadFile(t, statePath)
 
@@ -675,9 +724,10 @@ func TestControllerResumeTaskCapResponseRules(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Resume(retry) error = %v", err)
 		}
-		if status.Phase != state.PhaseImplementing ||
+		if status.Phase != state.PhaseDone ||
 			status.PendingAction != nil ||
-			status.Tasks["T1"].Status != state.TaskOpen {
+			status.Tasks["T1"].Status != state.TaskConfirmed ||
+			status.Tasks["T1"].Attempt != run.Config.MaxTaskAttempts+1 {
 			t.Fatalf("task_cap retry status = %#v", status)
 		}
 	})
@@ -1057,6 +1107,9 @@ func controlSeedTaskCapPause(t *testing.T) (string, *Run) {
 	taskID := "T1"
 	run.State.CurrentTaskID = &taskID
 	run.State.Tasks[taskID].Attempt = run.Config.MaxTaskAttempts
+	if _, err := freezePlan(filepath.Join(run.Dir, planFileName)); err != nil {
+		t.Fatal(err)
+	}
 	if err := run.State.TransitionPhase(state.PhaseImplementing); err != nil {
 		t.Fatal(err)
 	}
