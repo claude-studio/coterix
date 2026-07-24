@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/ridenow/coterix/internal/pipeline"
 	"github.com/ridenow/coterix/internal/runner"
 	"github.com/ridenow/coterix/internal/state"
@@ -205,19 +207,149 @@ func TestActivityTailKeepsStderrFailureIcon(t *testing.T) {
 	if current.activity[0].Stream != runner.StreamStderr {
 		t.Fatalf("stream=%v want stderr", current.activity[0].Stream)
 	}
-	rendered := renderActivityTail(current, 120, activityTailLimit(current))
-	if !containsAll(rendered, "ACTIVITY", "boom") {
+	rendered := ansi.Strip(
+		renderActivityTail(current, 120, activityTailLimit(current)),
+	)
+	if !containsAll(rendered, "ACTIVITY", "×", "boom") {
 		t.Fatalf("activity tail render=%q", rendered)
 	}
 }
 
+// The tail must render the *newest* lines within its limit, widen to the whole
+// buffer on failure, and claim its rows without dropping the lifecycle signal or
+// overflowing the card (review T13a-1 f1).
+func TestActivityTailRendersNewestLinesAndHeightBudget(t *testing.T) {
+	const produced = 22
+	oldestRetained := fmt.Sprintf("line-%02d", produced-maxActivityLines)
+	newest := fmt.Sprintf("line-%02d", produced-1)
+
+	current := feedActivityLines(t, populatedViewModel(t), produced)
+	if got := current.activity[0].Text; got != oldestRetained {
+		t.Fatalf(
+			"oldest retained=%q want=%q — buffer must keep the newest %d lines",
+			got,
+			oldestRetained,
+			maxActivityLines,
+		)
+	}
+	if got := current.activity[len(current.activity)-1].Text; got != newest {
+		t.Fatalf("newest retained=%q want=%q", got, newest)
+	}
+
+	wide := ansi.Strip(
+		renderActivityTail(current, 120, activityTailLimit(current)),
+	)
+	for offset := 0; offset < activityTailWide; offset++ {
+		want := fmt.Sprintf("line-%02d", produced-1-offset)
+		if !strings.Contains(wide, want) {
+			t.Fatalf("wide tail lacks %q:\n%s", want, wide)
+		}
+	}
+	if cut := fmt.Sprintf(
+		"line-%02d",
+		produced-1-activityTailWide,
+	); strings.Contains(wide, cut) {
+		t.Fatalf(
+			"wide tail rendered %q past its %d-line limit:\n%s",
+			cut,
+			activityTailWide,
+			wide,
+		)
+	}
+
+	compact := current
+	compact.width = wideBreakpointWidth - 1
+	compact.height = wideBreakpointHeight - 1
+	compactTail := ansi.Strip(
+		renderActivityTail(compact, 80, activityTailLimit(compact)),
+	)
+	if !strings.Contains(compactTail, newest) {
+		t.Fatalf("compact tail lacks the newest line:\n%s", compactTail)
+	}
+	if cut := fmt.Sprintf(
+		"line-%02d",
+		produced-1-activityTailCompact,
+	); strings.Contains(compactTail, cut) {
+		t.Fatalf(
+			"compact tail rendered %q past its %d-line limit:\n%s",
+			cut,
+			activityTailCompact,
+			compactTail,
+		)
+	}
+
+	// A failed attempt widens the window to the whole buffer so the line that
+	// actually caused the failure is still on screen (R4).
+	result := runner.RunResult{Exit: 2}
+	updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
+		Kind:    pipeline.EventAttemptFinished,
+		Step:    pipeline.StepPlan,
+		Role:    "plan_writer",
+		Attempt: 1,
+		Result:  &result,
+	}})
+	afterAttempt := updated.(model)
+	widened := ansi.Strip(
+		renderActivityTail(afterAttempt, 120, activityTailLimit(afterAttempt)),
+	)
+	if !containsAll(widened, oldestRetained, newest) {
+		t.Fatalf(
+			"failed tail must span %q..%q:\n%s",
+			oldestRetained,
+			newest,
+			widened,
+		)
+	}
+
+	stepFailed := feedActivityLines(t, populatedViewModel(t), produced)
+	updated, _ = stepFailed.Update(pipelineEventMsg{Event: pipeline.Event{
+		Kind: pipeline.EventStepFinished,
+		Step: pipeline.StepPlan,
+		Role: "plan_writer",
+		Err:  errors.New("gate failed"),
+	}})
+	stepFailed = updated.(model)
+	if !stepFailed.activityFailed {
+		t.Fatal("EventStepFinished error did not widen the tail")
+	}
+	stepTail := ansi.Strip(
+		renderActivityTail(stepFailed, 120, activityTailLimit(stepFailed)),
+	)
+	if !strings.Contains(stepTail, oldestRetained) {
+		t.Fatalf("step-failure tail lacks %q:\n%s", oldestRetained, stepTail)
+	}
+
+	current.logs = []logEntry{{
+		Role: "plan_writer",
+		CLI:  "claude",
+		Icon: logIconStart,
+		Text: "plan_writer · claude started",
+	}}
+	frame := ansi.Strip(renderMain(current, 140, 40))
+	if rows := strings.Count(frame, "\n") + 1; rows > 40 {
+		t.Fatalf("main pane overflowed its height budget: %d rows want <=40", rows)
+	}
+	for _, want := range []string{
+		"plan_writer · claude started",
+		"ACTIVITY",
+		newest,
+	} {
+		if !strings.Contains(frame, want) {
+			t.Fatalf("main pane lacks %q:\n%s", want, frame)
+		}
+	}
+}
+
+// feedActivityLines emits numbered lines so tests can assert *which* lines
+// survive the buffer and the render limit — identical text would let a
+// newest/oldest mix-up pass unnoticed (review T13a-1 f1).
 func feedActivityLines(t *testing.T, current model, count int) model {
 	t.Helper()
 	for index := 0; index < count; index++ {
 		line := runner.Line{
 			Attempt: 1,
 			Stream:  runner.StreamStdout,
-			Text:    "line",
+			Text:    fmt.Sprintf("line-%02d", index),
 		}
 		updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
 			Kind:  pipeline.EventStepLog,
