@@ -1,0 +1,276 @@
+{
+  "meta": {
+    "name": "COTERIX Color System",
+    "version": "1.0.0",
+    "mode": "dark",
+    "description": "Dark CLI color tokens derived from assets/coterix.png and modeled after Crush's semantic theme architecture.",
+    "logo": "assets/coterix.png",
+    "crushCommit": "e4175c52b8e14a4e158106ac5988fd42a8958457"
+  },
+  "palette": {
+    "ink": {
+      "50": "#FAF8FF",
+      "100": "#F1EDFA",
+      "200": "#DDD7E7",
+      "300": "#C0B8CA",
+      "400": "#A098AA",
+      "500": "#7E7689",
+      "600": "#625A6D",
+      "700": "#494151",
+      "800": "#342C3B",
+      "900": "#241C2B",
+      "950": "#160F1D"
+    },
+    "codex": {
+      "50": "#F4F4FF",
+      "100": "#E4E5FF",
+      "200": "#C9CCFF",
+      "300": "#A6A1FB",
+      "400": "#8892FF",
+      "500": "#7487FD",
+      "600": "#5E67FA",
+      "700": "#4B56E6",
+      "800": "#3942BE",
+      "900": "#2C338F",
+      "950": "#1A1D52"
+    },
+    "claude": {
+      "50": "#FFF5F1",
+      "100": "#FFE6DC",
+      "200": "#FFCDBB",
+      "300": "#FFAC8D",
+      "400": "#FD8E5A",
+      "500": "#EF7658",
+      "600": "#D97757",
+      "700": "#B75B43",
+      "800": "#934331",
+      "900": "#6E3026",
+      "950": "#3E1914"
+    },
+    "violet": {
+      "50": "#F7F2FF",
+      "100": "#EADFFF",
+      "200": "#D9C6FF",
+      "300": "#BE97FF",
+      "400": "#9C6CF3",
+      "500": "#7B43F0",
+      "600": "#5B24E2",
+      "700": "#4D18EE",
+      "800": "#3813CD",
+      "900": "#2D0FAD",
+      "950": "#1A086E"
+    },
+    "success": {
+      "50": "#EDFFF8",
+      "100": "#D3FCEC",
+      "200": "#A8F5D8",
+      "300": "#78EBC3",
+      "400": "#4CDFAD",
+      "500": "#2CCF98",
+      "600": "#1BA77A",
+      "700": "#168461",
+      "800": "#14684F",
+      "900": "#125541",
+      "950": "#073023"
+    },
+    "warning": {
+      "50": "#FFFBEB",
+      "100": "#FFF4C6",
+      "200": "#FFE88A",
+      "300": "#FFD86A",
+      "400": "#FFC857",
+      "500": "#E9A93E",
+      "600": "#C7862D",
+      "700": "#9F6524",
+      "800": "#805022",
+      "900": "#6A421F",
+      "950": "#3D210D"
+    },
+    "danger": {
+      "50": "#FFF1F4",
+      "100": "#FFE1E7",
+      "200": "#FFC7D2",
+      "300": "#FF9CAF",
+      "400": "#FF718B",
+      "500": "#FF5D75",
+      "600": "#E33C5C",
+      "700": "#BE2C4B",
+      "800": "#9D2743",
+      "900": "#84243D",
+      "950": "#490F1E"
+    },
+    "cyan": {
+      "50": "#ECFCFF",
+      "100": "#CFF8FF",
+      "200": "#9DEFFF",
+      "300": "#6FE6F5",
+      "400": "#41D8ED",
+      "500": "#23C3DC",
+      "600": "#159BB4",
+      "700": "#147C91",
+      "800": "#166475",
+      "900": "#175363",
+      "950": "#0A303B"
+    }
+  },
+  "gradient": {
+    "brandLeftToRight": [
+      "#FD8E5A",
+      "#F79E9D",
+      "#D9A3EB",
+      "#A6A1FB",
+      "#5E67FA"
+    ],
+    "brandReverse": [
+      "#5E67FA",
+      "#A6A1FB",
+      "#D9A3EB",
+      "#F79E9D",
+      "#FD8E5A"
+    ],
+    "codex": [
+      "#A6A1FB",
+      "#7487FD",
+      "#5E67FA"
+    ],
+    "claude": [
+      "#FFAC8D",
+      "#FD8E5A",
+      "#D97757"
+    ],
+    "ambient": [
+      "#5B24E2",
+      "#3813CD",
+      "#2D0FAD",
+      "#1A086E"
+    ]
+  },
+  "theme": {
+    "primary": "#7487FD",
+    "secondary": "#FD8E5A",
+    "accent": "#A6A1FB",
+    "keyword": "#D9A3EB",
+    "fgBase": "#F1EDFA",
+    "fgSubtle": "#C0B8CA",
+    "fgMoreSubtle": "#A098AA",
+    "fgMostSubtle": "#7E7689",
+    "onPrimary": "#160F1D",
+    "bgBase": "#160F1D",
+    "bgLeastVisible": "#1E1628",
+    "bgLessVisible": "#2A2034",
+    "bgMostVisible": "#3A2E46",
+    "separator": "#493A58",
+    "destructive": "#FF5D75",
+    "error": "#E33C5C",
+    "warning": "#FFC857",
+    "warningSubtle": "#FFD86A",
+    "denied": "#FD8E5A",
+    "busy": "#D9A3EB",
+    "info": "#7487FD",
+    "infoMoreSubtle": "#A6A1FB",
+    "infoMostSubtle": "#4B56E6",
+    "success": "#4CDFAD",
+    "successMoreSubtle": "#78EBC3",
+    "successMostSubtle": "#1BA77A"
+  },
+  "component": {
+    "focusRing": "#A6A1FB",
+    "selectionBg": "#3942BE",
+    "selectionFg": "#FAF8FF",
+    "cursor": "#FD8E5A",
+    "borderFocused": "#7487FD",
+    "borderBlurred": "#493A58",
+    "link": "#6FE6F5",
+    "linkVisited": "#D9A3EB",
+    "codeInlineFg": "#FF9CAF",
+    "codeInlineBg": "#2A2034",
+    "workingGradientFrom": "#FD8E5A",
+    "workingGradientTo": "#5E67FA"
+  },
+  "status": {
+    "success": {
+      "fg": "#4CDFAD",
+      "subtle": "#1BA77A",
+      "bg": "#142C27",
+      "emphasisBg": "#1D3B33"
+    },
+    "warning": {
+      "fg": "#FFD86A",
+      "subtle": "#C7862D",
+      "bg": "#30260F",
+      "emphasisBg": "#433515"
+    },
+    "error": {
+      "fg": "#FF718B",
+      "subtle": "#E33C5C",
+      "bg": "#321722",
+      "emphasisBg": "#45202E"
+    },
+    "info": {
+      "fg": "#A6A1FB",
+      "subtle": "#7487FD",
+      "bg": "#1B1D42",
+      "emphasisBg": "#25285A"
+    },
+    "busy": {
+      "fg": "#D9A3EB",
+      "subtle": "#9C6CF3",
+      "bg": "#2A1638",
+      "emphasisBg": "#3A1D4D"
+    }
+  },
+  "diff": {
+    "insertFg": "#78EBC3",
+    "insertSymbol": "#4CDFAD",
+    "insertLineBg": "#142C27",
+    "insertEmphasisBg": "#1D3B33",
+    "deleteFg": "#FF9CAF",
+    "deleteSymbol": "#FF718B",
+    "deleteLineBg": "#321722",
+    "deleteEmphasisBg": "#45202E",
+    "dividerFg": "#7E7689",
+    "dividerBg": "#1E1628"
+  },
+  "syntax": {
+    "text": "#C0B8CA",
+    "error": "#FF718B",
+    "comment": "#7E7689",
+    "preprocessor": "#FD8E5A",
+    "keyword": "#7487FD",
+    "keywordReserved": "#D9A3EB",
+    "keywordNamespace": "#D9A3EB",
+    "type": "#A6A1FB",
+    "operator": "#F79E9D",
+    "punctuation": "#FFD86A",
+    "name": "#C0B8CA",
+    "builtin": "#FF9CAF",
+    "tag": "#9C6CF3",
+    "attribute": "#8892FF",
+    "class": "#FAF8FF",
+    "decorator": "#FFC857",
+    "function": "#4CDFAD",
+    "number": "#6FE6F5",
+    "string": "#FFAC8D",
+    "stringEscape": "#78EBC3",
+    "inserted": "#4CDFAD",
+    "deleted": "#FF718B"
+  },
+  "ansi": {
+    "black": "#1E1628",
+    "red": "#E33C5C",
+    "green": "#1BA77A",
+    "yellow": "#C7862D",
+    "blue": "#4B56E6",
+    "magenta": "#A83EBD",
+    "cyan": "#159BB4",
+    "white": "#C0B8CA",
+    "brightBlack": "#493A58",
+    "brightRed": "#FF718B",
+    "brightGreen": "#4CDFAD",
+    "brightYellow": "#FFD86A",
+    "brightBlue": "#8892FF",
+    "brightMagenta": "#D9A3EB",
+    "brightCyan": "#6FE6F5",
+    "brightWhite": "#FAF8FF"
+  }
+}
