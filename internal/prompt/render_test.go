@@ -11,7 +11,7 @@ func TestEmbeddedSourcesMatchCanonicalPrompts(t *testing.T) {
 	t.Parallel()
 
 	expected := map[Template]string{
-		PlanTemplate:           "7714041e2b14a495237b529fad98e34c1833c9668dc56713f53f4fe859ab448d",
+		PlanTemplate:           "b791416f40943a2fc4c81d99f5a5f5e040f201ac25100aa1250bd8789dd87e39",
 		PlanReviewTemplate:     "34980e365c6e5c0d41f212cf0a99d46aa96b88b39e371157c399a8c0b6867820",
 		ImplementationTemplate: "2eb80ac83794343929e1b985e109d7afc196f6509035d3fcb77cf6dff10f55b4",
 		ImplReviewTemplate:     "607dbd5d9f42426eeceb70d73aa9d858cb6ae8ede789ee5c2d8e18bba9920490",
@@ -57,7 +57,7 @@ func TestRenderPlanTemplate(t *testing.T) {
 	rendered := mustRender(t, PlanTemplate, base)
 	assertOccurrences(t, rendered, map[string]int{
 		"request-value":     1,
-		"plan-output-value": 5,
+		"plan-output-value": 6,
 		"questions-value":   3,
 	})
 	assertAbsent(t, rendered, "This is a REVISION.", "current-plan-value", "{{")
@@ -68,7 +68,7 @@ func TestRenderPlanTemplate(t *testing.T) {
 	rendered = mustRender(t, PlanTemplate, revision)
 	assertOccurrences(t, rendered, map[string]int{
 		"request-value":       1,
-		"plan-output-value":   6,
+		"plan-output-value":   7,
 		"questions-value":     4,
 		"feedback-value":      1,
 		"current-plan-value":  4,

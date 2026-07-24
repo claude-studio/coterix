@@ -38,10 +38,20 @@ Verify: ...
 ```
 
 Strict rules the parser enforces:
+- **NOTHING but the goal line and task blocks may appear in the file.** No background, no premises,
+  no tables, no summaries, no closing notes, no prose between blocks. The parser reads line 1 as the
+  goal and then demands `## T<n>: <title>` immediately — one extra line there rejects the whole plan
+  and burns the attempt. This is the single most common failure.
+- Blank lines are allowed ONLY after the goal line and BETWEEN task blocks — never inside a block.
 - Each task heading is `## T<n>: <title>` with a STABLE unique id (`T1`, `T2`, …). No duplicate ids.
 - Exactly ONE `- [ ]` line per task, immediately under the heading. Never more.
-- `Acceptance:` and `Verify:` lines are required per task. No empty task body.
+- `Acceptance:` and `Verify:` lines are required per task, in that order, on the two lines directly
+  after the checkbox. No empty task body.
 - Tasks are independently implementable in the given order.
+
+Have context to convey — findings, premises, out-of-scope observations, caveats? **Print it to stdout.**
+Only {{PLAN_OUTPUT_PATH}} is machine-parsed; your stdout is shown to the human and is the right place
+for anything that is not a task block. Never put it in the file.
 
 Other rules:
 - Do NOT tick checkboxes — leave every box `- [ ]`. Completion is recorded by the harness in its own
