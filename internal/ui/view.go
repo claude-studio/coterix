@@ -703,7 +703,10 @@ func renderLogTag(currentTheme theme, line logEntry) string {
 	case "codex":
 		style = currentTheme.styles.Codex
 	case "coterix", "":
-		tag = "INFO"
+		// The tag column names the *source*, so the harness gets a source token
+		// too. `INFO` was severity vocabulary and clashed with the icon column —
+		// a failed row read `INFO × … failed` (T14 W11).
+		tag = "CTRX"
 	}
 	tag = ansi.TruncateWc(tag, logTagCellWidth, "…")
 	if pad := logTagCellWidth - ansi.StringWidth(tag); pad > 0 {

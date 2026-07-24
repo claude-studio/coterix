@@ -361,6 +361,49 @@ func TestMainHeaderKeepsDescriptorAtMinimumWideWidth(t *testing.T) {
 	}
 }
 
+// The tag column names the *source* and the meta column names the step. The
+// harness used to render `INFO` — severity vocabulary that clashed with the icon
+// column, so a failed row read `INFO × … failed` — and repeated `control ·` on
+// every row while the text carried the real role (T14 W11, user-reported).
+func TestLifecycleEntriesNameSourceAndStep(t *testing.T) {
+	current := testModel(t, &fakeUIControl{})
+	updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
+		Kind: pipeline.EventStepStarted,
+		Step: pipeline.StepPlan,
+		Role: "plan_writer",
+		CLI:  "claude",
+	}})
+	current = updated.(model)
+
+	result := runner.RunResult{Exit: 1}
+	updated, _ = current.Update(pipelineEventMsg{Event: pipeline.Event{
+		Kind:    pipeline.EventAttemptFinished,
+		Step:    pipeline.StepPlan,
+		Role:    "plan_writer",
+		Attempt: 2,
+		Result:  &result,
+	}})
+	current = updated.(model)
+
+	feed := ansi.Strip(renderFeed(current, 120))
+	if strings.Contains(feed, "INFO") {
+		t.Fatalf("harness tag still uses severity vocabulary:\n%s", feed)
+	}
+	if strings.Contains(feed, "control ·") {
+		t.Fatalf("meta column still repeats a constant role:\n%s", feed)
+	}
+	for _, want := range []string{
+		"CTRX",
+		"plan_writer ·",
+		"claude started",
+		"attempt 2 exited 1",
+	} {
+		if !strings.Contains(feed, want) {
+			t.Fatalf("lifecycle feed lacks %q:\n%s", want, feed)
+		}
+	}
+}
+
 func TestLogLinesRenderColumnarTimeTagAndIcon(t *testing.T) {
 	current := populatedViewModel(t)
 	at := time.Date(2026, 7, 24, 21, 42, 7, 0, time.UTC)

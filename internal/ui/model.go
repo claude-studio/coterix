@@ -199,6 +199,7 @@ func (current model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				current.appendSystemLog(
 					runner.StreamStderr,
 					logIconFail,
+					"",
 					fmt.Sprintf("artifact refresh: %v", message.err),
 				)
 			} else {
@@ -270,7 +271,8 @@ func (current model) updatePipelineEvent(
 		current.appendSystemLog(
 			runner.StreamStdout,
 			logIconStart,
-			fmt.Sprintf("%s · %s started", displayStep(event), event.CLI),
+			displayStep(event),
+			event.CLI+" started",
 		)
 	case pipeline.EventStepLog:
 		if event.Line != nil {
@@ -326,6 +328,7 @@ func (current model) finishOperation(
 		current.appendSystemLog(
 			runner.StreamStderr,
 			logIconFail,
+			"",
 			result.err.Error(),
 		)
 	}
@@ -593,14 +596,21 @@ func eventFailed(event pipeline.Event) bool {
 	return event.Result.Exit != 0 || event.Result.TimedOut
 }
 
+// role names whose step the entry is about. It used to be the constant "control",
+// which made the meta column repeat `control ·` on every row while the text
+// carried the real role — the same information twice (T14 W11).
 func (current *model) appendSystemLog(
 	stream runner.Stream,
 	icon logIcon,
+	role string,
 	text string,
 ) {
+	if role == "" {
+		role = "coterix"
+	}
 	current.appendLog(logEntry{
 		Step:   "coterix",
-		Role:   "control",
+		Role:   role,
 		CLI:    "coterix",
 		Stream: stream,
 		Text:   text,
@@ -613,8 +623,7 @@ func (current *model) appendAttempt(event pipeline.Event) {
 		return
 	}
 	message := fmt.Sprintf(
-		"%s · attempt %d exited %d",
-		displayStep(event),
+		"attempt %d exited %d",
 		event.Attempt,
 		event.Result.Exit,
 	)
@@ -630,11 +639,11 @@ func (current *model) appendAttempt(event pipeline.Event) {
 		stream = runner.StreamStderr
 		icon = logIconFail
 	}
-	current.appendSystemLog(stream, icon, message)
+	current.appendSystemLog(stream, icon, displayStep(event), message)
 }
 
 func (current *model) appendStepFinished(event pipeline.Event) {
-	message := displayStep(event) + " · finished"
+	message := "finished"
 	stream := runner.StreamStdout
 	icon := logIconDone
 	if event.Err != nil {
@@ -642,7 +651,7 @@ func (current *model) appendStepFinished(event pipeline.Event) {
 		stream = runner.StreamStderr
 		icon = logIconFail
 	}
-	current.appendSystemLog(stream, icon, message)
+	current.appendSystemLog(stream, icon, displayStep(event), message)
 }
 
 func displayStep(event pipeline.Event) string {
