@@ -96,7 +96,7 @@ func (runner *Runner) Run(ctx context.Context, request RunRequest) (RunResult, e
 	}
 
 	var canonicalSnapshot map[string][]byte
-	if normalized.Effect == EffectArtifactOnly && len(normalized.CanonicalPaths) > 0 {
+	if normalized.Effect != EffectMutating && len(normalized.CanonicalPaths) > 0 {
 		canonicalSnapshot, err = snapshotCanonicalPaths(normalized.CanonicalPaths)
 		if err != nil {
 			return result, &SafetyError{

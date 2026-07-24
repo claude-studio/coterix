@@ -359,6 +359,32 @@ func TestRunArtifactOnlyCanonicalDriftFailsSafeWithoutRetry(t *testing.T) {
 	assertFileContent(t, canonical, "mutated")
 }
 
+func TestRunReadOnlyCanonicalDriftFailsSafeWithoutRetry(t *testing.T) {
+	executor := New(WithoutSignalHandling())
+	defer executor.Close()
+
+	request, dir := helperRequest(t, EffectReadOnly, "mutate-canonical")
+	canonical := filepath.Join(dir, "plan.md")
+	output := filepath.Join(dir, "review.json")
+	counter := filepath.Join(dir, "attempts")
+	if err := os.WriteFile(canonical, []byte("canonical"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request.Args = append(request.Args, output, counter, canonical)
+	request.OutputPaths = []string{output}
+	request.CanonicalPaths = []string{canonical}
+	request.MaxRetries = 3
+	request.ValidateResult = jsonValidator(output)
+
+	_, err := executor.Run(context.Background(), request)
+	var safetyErr *SafetyError
+	if !errors.As(err, &safetyErr) {
+		t.Fatalf("Run() error = %T %v, want *SafetyError", err, err)
+	}
+	assertFileContent(t, counter, "1")
+	assertFileContent(t, canonical, "mutated")
+}
+
 func TestRunArtifactPreparationDriftFailsSafeWithoutRetry(t *testing.T) {
 	executor := New(WithoutSignalHandling())
 	defer executor.Close()
