@@ -404,6 +404,85 @@ func TestLifecycleEntriesNameSourceAndStep(t *testing.T) {
 	}
 }
 
+// The artifact markdown is cached at one width, so that width must equal the real
+// body width of the box that shows it. Too wide and the right edge is truncated
+// (wide) or lipgloss re-wraps and silently adds rows that push the bottom box off
+// screen (compact) — review T14a f1.
+func TestArtifactCacheWidthMatchesBoxBodyWidth(t *testing.T) {
+	mainWidth := wideBreakpointWidth - sidebarWidth
+	cached := dashboardMainInnerWidth(wideBreakpointWidth, wideBreakpointHeight)
+	if want := max(8, mainWidth-4) - 4; cached != want {
+		t.Fatalf("wide cache width=%d want=%d", cached, want)
+	}
+	if got, want := dashboardMainInnerWidth(80, 24), 80-4-4; got != want {
+		t.Fatalf("compact cache width=%d want=%d", got, want)
+	}
+
+	// A line exactly as wide as the cache must survive to its last cell.
+	current := populatedViewModel(t)
+	current.artifactRender = strings.Repeat("x", cached-3) + "END"
+	frame := ansi.Strip(renderMain(
+		current,
+		mainWidth,
+		wideBreakpointHeight-topBarHeight-2,
+	))
+	if !strings.Contains(frame, "END") {
+		t.Fatalf("artifact right edge was truncated:\n%s", frame)
+	}
+}
+
+// Priority — not render order — decides which boxes survive a tight budget:
+// ACTIVITY (the live edge) must outlive FEED (review T14a f5).
+func TestBoxHeightPriorityDecidesSurvivors(t *testing.T) {
+	order := []mainBox{boxPending, boxFeed, boxLiveOutput, boxActivity}
+	bodies := []string{"question", "artifacts", "lifecycle", "activity"}
+
+	for _, testCase := range []struct {
+		name   string
+		total  int
+		chrome int
+		want   []mainBox
+	}{
+		{"wide: one box fits", 3, 2, []mainBox{boxPending}},
+		{"wide: two boxes fit", 6, 2, []mainBox{boxPending, boxActivity}},
+		{
+			"wide: three boxes fit",
+			9,
+			2,
+			[]mainBox{boxPending, boxLiveOutput, boxActivity},
+		},
+		{"compact: two boxes fit", 4, 1, []mainBox{boxPending, boxActivity}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			heights := distributeMainBoxHeights(
+				order,
+				bodies,
+				testCase.total,
+				testCase.chrome,
+			)
+			alive := make([]mainBox, 0, len(order))
+			sum := 0
+			for index, box := range order {
+				sum += heights[index]
+				if heights[index] > 0 {
+					alive = append(alive, box)
+				}
+			}
+			if sum > testCase.total {
+				t.Fatalf("allocated %d rows, total is %d", sum, testCase.total)
+			}
+			if len(alive) != len(testCase.want) {
+				t.Fatalf("survivors=%v want=%v", alive, testCase.want)
+			}
+			for index, box := range testCase.want {
+				if alive[index] != box {
+					t.Fatalf("survivors=%v want=%v", alive, testCase.want)
+				}
+			}
+		})
+	}
+}
+
 func TestLogLinesRenderColumnarTimeTagAndIcon(t *testing.T) {
 	current := populatedViewModel(t)
 	at := time.Date(2026, 7, 24, 21, 42, 7, 0, time.UTC)

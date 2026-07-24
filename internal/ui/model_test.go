@@ -515,18 +515,23 @@ func TestMainBoxesScrollIndependentlyAndTabCyclesFocus(t *testing.T) {
 		)
 	}
 
-	// end parks the focused box at the live edge without touching the others.
-	updated, _ = current.Update(printableKey('e'))
-	_ = updated
-	updated, _ = current.Update(specialKey(tea.KeyTab))
-	current = updated.(model)
-	if current.focus != boxActivity {
-		t.Fatalf("focus=%d want boxActivity", current.focus)
+	// The cycle ends at the sidebar and wraps back to the feed.
+	for _, want := range []mainBox{boxActivity, boxSidebar, boxFeed} {
+		updated, _ = current.Update(specialKey(tea.KeyTab))
+		current = updated.(model)
+		if current.focus != want {
+			t.Fatalf("focus=%d want %d", current.focus, want)
+		}
 	}
-	updated, _ = current.Update(specialKey(tea.KeyTab))
+
+	// shift+tab walks the same cycle backwards.
+	updated, _ = current.Update(tea.KeyPressMsg(tea.Key{
+		Code: tea.KeyTab,
+		Mod:  tea.ModShift,
+	}))
 	current = updated.(model)
-	if current.focus != boxFeed {
-		t.Fatalf("focus wrapped to %d want boxFeed", current.focus)
+	if current.focus != boxSidebar {
+		t.Fatalf("shift+tab focus=%d want boxSidebar", current.focus)
 	}
 
 	// PENDING joins the cycle only while the run is blocked on a question.
@@ -587,6 +592,102 @@ func TestMainPaneRendersOneBoxPerSection(t *testing.T) {
 	if !strings.Contains(plain, "retry or abort") {
 		t.Fatalf("compact pane dropped the pending question:\n%s", plain)
 	}
+}
+
+// The focus contract: compact has no focus concept, focus never rests on a box
+// that is off screen, and the focused box carries a non-color cue as well as the
+// focused border color (review T14a f3).
+func TestFocusContractCompactHiddenBoxesAndCues(t *testing.T) {
+	wide := feedActivityLines(t, populatedViewModel(t), 4)
+	wide.status.PendingAction = nil
+
+	t.Run("compact ignores focus keys", func(t *testing.T) {
+		compact := wide
+		compact.width = 80
+		compact.height = 24
+		compact.focus = boxFeed
+
+		updated, _ := compact.Update(specialKey(tea.KeyTab))
+		moved := updated.(model)
+		if moved.focus != boxFeed {
+			t.Fatalf("compact tab moved focus to %d", moved.focus)
+		}
+		// One scroll still drives the single column.
+		updated, _ = moved.Update(printableKey('k'))
+		scrolled := updated.(model)
+		if scrolled.boxScroll[boxFeed] != 1 {
+			t.Fatalf("compact scroll=%v want the feed offset to move", scrolled.boxScroll)
+		}
+	})
+
+	t.Run("hidden focus normalizes", func(t *testing.T) {
+		blocked := wide
+		blocked.status.PendingAction = &state.PendingAction{
+			Kind:   state.PendingTaskCap,
+			Prompt: "retry or abort",
+		}
+		blocked.focus = boxPending
+		if got := blocked.normalizedFocus(); got != boxPending {
+			t.Fatalf("focus=%d want boxPending while blocked", got)
+		}
+
+		// The run resumes: PENDING leaves the screen and focus must follow.
+		resumed := blocked
+		resumed.status.PendingAction = nil
+		if got := resumed.normalizedFocus(); got == boxPending {
+			t.Fatal("focus stayed on the vanished PENDING box")
+		}
+		if got := resumed.scrollTarget(); got == boxPending {
+			t.Fatal("j/k would drive an off-screen offset")
+		}
+		// Some box must still be drawn as focused.
+		frame := ansi.Strip(renderMain(resumed, 140, 40))
+		if !strings.Contains(frame, "▸ ") {
+			t.Fatalf("no box carries the focus cue:\n%s", frame)
+		}
+	})
+
+	t.Run("focus cue is not color alone", func(t *testing.T) {
+		focused := wide
+		focused.focus = boxLiveOutput
+		frame := renderMain(focused, 140, 40)
+		plain := ansi.Strip(frame)
+		if !strings.Contains(plain, "▸ LIVE OUTPUT") {
+			t.Fatalf("focused box lacks its non-color cue:\n%s", plain)
+		}
+		if strings.Contains(plain, "▸ PIPELINE FEED") {
+			t.Fatalf("unfocused box carries the cue:\n%s", plain)
+		}
+		// And the border really uses the focused token. Assert on the box chrome
+		// directly — the first `╭` in a full frame belongs to MainCard.
+		assertSameColor(
+			t,
+			findStyledCell(
+				t,
+				renderBoxCard(focused.theme, "T", "body", 20, true),
+				"╭",
+			).Style.Fg,
+			lipgloss.Color(focused.theme.tokens.Component.BorderFocused),
+		)
+		assertSameColor(
+			t,
+			findStyledCell(
+				t,
+				renderBoxCard(focused.theme, "T", "body", 20, false),
+				"╭",
+			).Style.Fg,
+			lipgloss.Color(focused.theme.tokens.Theme.Separator),
+		)
+	})
+
+	t.Run("sidebar takes focus chrome", func(t *testing.T) {
+		side := wide
+		side.focus = boxSidebar
+		plain := ansi.Strip(renderSidebar(side, sidebarWidth, 26))
+		if !strings.Contains(plain, "▸ PIPELINE") {
+			t.Fatalf("focused sidebar lacks its cue:\n%s", plain)
+		}
+	})
 }
 
 // A widened failure tail, a long PENDING question and a last_error all compete

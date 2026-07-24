@@ -139,12 +139,20 @@ func isWide(width, height int) bool {
 	return width >= wideBreakpointWidth && height >= wideBreakpointHeight
 }
 
+// dashboardMainInnerWidth is the width the artifact markdown is rendered (and
+// cached) at. It has to equal the *actual* body width of the box that shows it,
+// otherwise the cached lines are either truncated on the right (wide) or re-wrapped
+// by lipgloss, which silently adds rows and pushes the bottom box off screen
+// (compact) — review T14a f1.
+//
+// wide:    pane − MainCard(border 2 + padding 2) − box(border 2 + padding 2)
+// compact: pane − Main padding(2 each side)
 func dashboardMainInnerWidth(width, height int) int {
-	paneWidth := max(1, width)
 	if isWide(width, height) {
-		paneWidth = max(1, width-sidebarWidth)
+		boxWidth := max(8, max(1, width-sidebarWidth)-4)
+		return max(1, boxWidth-4)
 	}
-	return max(1, paneWidth-4)
+	return max(1, max(1, width-4)-4)
 }
 
 // renderMain wraps the feed in the bordered command card on wide layouts. The
@@ -203,7 +211,7 @@ func renderMain(current model, width, height int) string {
 			mainBoxTitle(current, box),
 			body,
 			boxWidth,
-			current.focus == box,
+			current.normalizedFocus() == box,
 		))
 	}
 	return current.theme.styles.MainCard.
@@ -402,25 +410,33 @@ func distributeMainBoxHeights(
 		return heights
 	}
 
-	visible := len(order)
-	for visible > 1 && visible*minRows > total {
-		visible--
+	// Priority decides *which* boxes survive; the render order only decides where
+	// they go. Trimming the order's tail instead dropped ACTIVITY (the highest
+	// priority after PENDING) before FEED (the lowest) — review T14a f5.
+	priority := []mainBox{boxPending, boxActivity, boxLiveOutput, boxFeed}
+	capacity := total / minRows
+	survivors := make(map[mainBox]bool, len(order))
+	for _, box := range priority {
+		if len(survivors) >= capacity {
+			break
+		}
+		if indexOfBox(order, box) >= 0 {
+			survivors[box] = true
+		}
 	}
+
 	remaining := total
-	for index := 0; index < visible; index++ {
-		heights[index] = minRows
-		remaining -= minRows
+	for index, box := range order {
+		if survivors[box] {
+			heights[index] = minRows
+			remaining -= minRows
+		}
 	}
 	remaining = max(0, remaining)
 
-	for _, box := range []mainBox{
-		boxPending,
-		boxActivity,
-		boxLiveOutput,
-		boxFeed,
-	} {
-		index := indexOfBox(order[:visible], box)
-		if index < 0 {
+	for _, box := range priority {
+		index := indexOfBox(order, box)
+		if index < 0 || !survivors[box] {
 			continue
 		}
 		want := countRows(bodies[index]) + chrome
@@ -434,8 +450,16 @@ func distributeMainBoxHeights(
 		heights[index] += grow
 		remaining -= grow
 	}
-	if index := indexOfBox(order[:visible], boxFeed); index >= 0 {
+	if index := indexOfBox(order, boxFeed); index >= 0 && survivors[boxFeed] {
 		heights[index] += remaining
+		return heights
+	}
+	// FEED was dropped, so the slack goes to the highest-priority survivor.
+	for _, box := range priority {
+		if survivors[box] {
+			heights[indexOfBox(order, box)] += remaining
+			break
+		}
 	}
 	return heights
 }
@@ -734,13 +758,18 @@ func renderLogIcon(currentTheme theme, line logEntry, muteStream bool) string {
 func renderSidebar(current model, width, height int) string {
 	cardWidth := max(8, width-2)
 	innerWidth := max(1, cardWidth-4)
-	pipelineCard := renderSidebarCard(
+	// The sidebar is part of the focus cycle, so it takes the focused chrome too
+	// (T14 W2 · review T14a f3).
+	focused := isWide(current.width, current.height) &&
+		current.normalizedFocus() == boxSidebar
+	pipelineCard := renderBoxCard(
 		current.theme,
 		"PIPELINE",
 		renderStepper(current.theme, deriveStepper(current), innerWidth),
 		cardWidth,
+		focused,
 	)
-	statusCard := renderSidebarCard(
+	statusCard := renderBoxCard(
 		current.theme,
 		"STATUS",
 		renderSidebarBody(
@@ -751,6 +780,7 @@ func renderSidebar(current model, width, height int) string {
 			false, // the main pane's PENDING box owns the question body
 		),
 		cardWidth,
+		focused,
 	)
 	content := pipelineCard + "\n" + statusCard
 	indented := make([]string, 0, strings.Count(content, "\n")+1)

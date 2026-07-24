@@ -312,6 +312,9 @@ func renderBoxCard(
 	border := currentTheme.styles.Separator
 	if focused {
 		border = currentTheme.styles.BorderFocus
+		// A non-color cue alongside the color: color-system.md forbids conveying
+		// state by color alone (T14 W2 · review T14a f3).
+		title = "▸ " + title
 	}
 
 	// Top border cells: "╭─ " + title + " " + fill + "╮" == width.

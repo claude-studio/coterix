@@ -44,6 +44,9 @@ const (
 	boxLiveOutput
 	boxActivity
 	boxPending
+	// boxSidebar takes part in the focus cycle but has no scroll offset of its
+	// own — it always shows the full pipeline/status cards (T14 W2).
+	boxSidebar
 	mainBoxCount
 )
 
@@ -358,19 +361,24 @@ func (current model) updateKey(
 		return current.requestStop()
 	case "up", "k":
 		// Scrolling drives the focused box only (T14 W2).
-		current.boxScroll[current.focus]++
+		current.boxScroll[current.scrollTarget()]++
 	case "down", "j":
-		if current.boxScroll[current.focus] > 0 {
-			current.boxScroll[current.focus]--
+		if target := current.scrollTarget(); current.boxScroll[target] > 0 {
+			current.boxScroll[target]--
 		}
 	case "home":
-		current.boxScroll[current.focus] = maxScrollSentinel
+		current.boxScroll[current.scrollTarget()] = maxScrollSentinel
 	case "end":
-		current.boxScroll[current.focus] = 0
+		current.boxScroll[current.scrollTarget()] = 0
 	case "tab":
-		current.focus = shiftMainFocus(current, 1)
+		// compact has no focus concept (T14 W2) — the whole column scrolls as one.
+		if isWide(current.width, current.height) {
+			current.focus = shiftMainFocus(current, 1)
+		}
 	case "shift+tab":
-		current.focus = shiftMainFocus(current, -1)
+		if isWide(current.width, current.height) {
+			current.focus = shiftMainFocus(current, -1)
+		}
 	}
 
 	if !current.hasStatus || current.operation != "" {
@@ -573,15 +581,46 @@ func mainBoxOrder(current model) []mainBox {
 	return append(order, boxFeed, boxLiveOutput, boxActivity)
 }
 
-// shiftMainFocus cycles focus through the boxes that are actually on screen.
-func shiftMainFocus(current model, delta int) mainBox {
-	order := mainBoxOrder(current)
-	for index, box := range order {
+// focusCycle is the tab order: the main pane's boxes top-to-bottom, then the
+// sidebar (T14 W2). Only boxes that are actually on screen take part.
+func focusCycle(current model) []mainBox {
+	return append(mainBoxOrder(current), boxSidebar)
+}
+
+// normalizedFocus keeps focus on something visible. PENDING disappears when the
+// run resumes, and a box can be dropped for space — leaving focus on it would
+// make j/k drive an off-screen offset and no box would draw a focused border
+// (review T14a f3).
+func (current model) normalizedFocus() mainBox {
+	cycle := focusCycle(current)
+	for _, box := range cycle {
 		if box == current.focus {
-			return order[(index+delta+len(order))%len(order)]
+			return box
 		}
 	}
-	return order[0]
+	return cycle[0]
+}
+
+// scrollTarget is the box j/k drives: the focused box on wide layouts, and always
+// FEED on compact, where the contract says there is no focus concept and one
+// scroll drives the single column (review T14a f3).
+func (current model) scrollTarget() mainBox {
+	if !isWide(current.width, current.height) {
+		return boxFeed
+	}
+	return current.normalizedFocus()
+}
+
+// shiftMainFocus cycles focus through the boxes that are actually on screen.
+func shiftMainFocus(current model, delta int) mainBox {
+	cycle := focusCycle(current)
+	from := current.normalizedFocus()
+	for index, box := range cycle {
+		if box == from {
+			return cycle[(index+delta+len(cycle))%len(cycle)]
+		}
+	}
+	return cycle[0]
 }
 
 // eventFailed reports whether a step/attempt event carries a failure, which is
