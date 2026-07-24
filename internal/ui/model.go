@@ -21,6 +21,17 @@ const (
 	wideBreakpointHeight = 30
 )
 
+// Activity tail limits (plan T13 W2). The buffer always retains
+// maxActivityLines so a step that turns out to have failed can widen its tail
+// after the fact — the failure signal arrives only once the lines are already
+// in. Rendering truncates to the wide/compact limit while the step looks
+// healthy, and to the full buffer once it failed.
+const (
+	maxActivityLines    = 15
+	activityTailWide    = 5
+	activityTailCompact = 3
+)
+
 type promptMode uint8
 
 const (
@@ -79,6 +90,8 @@ type model struct {
 	now                 func() time.Time
 	stages              stageClock
 	logs                []logEntry
+	activity            []logEntry
+	activityFailed      bool
 	artifacts           artifactData
 	artifactKey         string
 	artifactLoadingKey  string
@@ -234,6 +247,7 @@ func (current model) updatePipelineEvent(
 		current.activeRole = event.Role
 		current.activeCLI = event.CLI
 		current.stages.stepStarted(event.Step, current.now())
+		current.resetActivity()
 		current.appendSystemLog(
 			runner.StreamStdout,
 			logIconStart,
@@ -241,7 +255,9 @@ func (current model) updatePipelineEvent(
 		)
 	case pipeline.EventStepLog:
 		if event.Line != nil {
-			current.appendLog(logEntry{
+			// Subprocess lines feed the pinned tail only — never the
+			// scrolling lifecycle history (plan T13 W2).
+			current.appendActivity(logEntry{
 				Step:    event.Step,
 				Role:    event.Role,
 				CLI:     event.CLI,
@@ -251,8 +267,14 @@ func (current model) updatePipelineEvent(
 			})
 		}
 	case pipeline.EventAttemptFinished:
+		if eventFailed(event) {
+			current.activityFailed = true
+		}
 		current.appendAttempt(event)
 	case pipeline.EventStepFinished:
+		if eventFailed(event) {
+			current.activityFailed = true
+		}
 		current.stages.stepFinished(event.Step, current.now())
 		current.appendStepFinished(event)
 		if current.activeStep == event.Step &&
@@ -475,6 +497,41 @@ func (current *model) appendLog(entry logEntry) {
 		copy(current.logs, current.logs[overflow:])
 		current.logs = current.logs[:maxLogLines]
 	}
+}
+
+// appendActivity feeds the pinned activity tail instead of the lifecycle feed:
+// subprocess output must not accumulate in the scrolling history (plan T13 W2).
+// The buffer keeps maxActivityLines even while only the wide/compact limit is
+// rendered, so a step that later reports failure can widen its tail (R4).
+func (current *model) appendActivity(entry logEntry) {
+	if entry.At.IsZero() && current.now != nil {
+		entry.At = current.now()
+	}
+	current.activity = append(current.activity, entry)
+	if overflow := len(current.activity) - maxActivityLines; overflow > 0 {
+		copy(current.activity, current.activity[overflow:])
+		current.activity = current.activity[:maxActivityLines]
+	}
+}
+
+// resetActivity clears the tail at a step boundary. A finished step keeps its
+// tail until the next step starts, so the context right before a gate failure
+// stays on screen (plan T13 W2).
+func (current *model) resetActivity() {
+	current.activity = current.activity[:0]
+	current.activityFailed = false
+}
+
+// eventFailed reports whether a step/attempt event carries a failure, which is
+// what widens the activity tail to the full buffer (plan T13 W2 · R4).
+func eventFailed(event pipeline.Event) bool {
+	if event.Err != nil {
+		return true
+	}
+	if event.Result == nil {
+		return false
+	}
+	return event.Result.Exit != 0 || event.Result.TimedOut
 }
 
 func (current *model) appendSystemLog(

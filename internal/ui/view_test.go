@@ -104,7 +104,7 @@ func TestSidebarDerivesStateSnapshotFields(t *testing.T) {
 	}
 }
 
-func TestMainPaneRendersPlanDiffVerdictAndStreamingLogs(t *testing.T) {
+func TestMainPaneRendersPlanDiffVerdictAndSplitFeed(t *testing.T) {
 	current := populatedViewModel(t)
 	diff := "@@ file.go @@\n-old\n+new\n"
 	current.artifacts = artifactData{
@@ -115,7 +115,16 @@ func TestMainPaneRendersPlanDiffVerdictAndStreamingLogs(t *testing.T) {
 			JSON: `{"clean":true}`,
 		}},
 	}
+	// The lifecycle feed carries harness entries only; subprocess output lives
+	// in the pinned activity tail below it (plan T13 W2).
 	current.logs = []logEntry{{
+		Role:    "impl_writer",
+		CLI:     "codex",
+		Attempt: 1,
+		Icon:    logIconStart,
+		Text:    "impl_writer · codex started",
+	}}
+	current.activity = []logEntry{{
 		Role:    "impl_writer",
 		CLI:     "codex",
 		Attempt: 1,
@@ -133,6 +142,8 @@ func TestMainPaneRendersPlanDiffVerdictAndStreamingLogs(t *testing.T) {
 		"Verdict",
 		"clean",
 		"LIVE OUTPUT",
+		"impl_writer · codex started",
+		"ACTIVITY",
 		"CODEX",
 		"impl_writer#1 · streamed output",
 	} {

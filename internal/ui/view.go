@@ -149,13 +149,23 @@ func dashboardMainInnerWidth(width, height int) int {
 // acceptance: compact runs header+feed+status without the card).
 func renderMain(current model, width, height int) string {
 	innerWidth := max(1, width-4)
+	// The activity tail is pinned under the scrolling feed, so it claims its
+	// rows first and the feed scrolls within what is left (plan T13 W2).
+	tail := renderActivityTail(current, innerWidth, activityTailLimit(current))
+	tailHeight := 0
+	if tail != "" {
+		tailHeight = strings.Count(tail, "\n") + 1
+	}
 	if !isWide(current.width, current.height) {
 		innerHeight := max(1, height-2)
 		visible := visibleLines(
 			renderFeed(current, innerWidth),
-			innerHeight,
+			max(1, innerHeight-tailHeight),
 			current.scroll,
 		)
+		if tail != "" {
+			visible += "\n" + tail
+		}
 		return current.theme.styles.Main.
 			Width(innerWidth).
 			Height(innerHeight).
@@ -166,9 +176,12 @@ func renderMain(current model, width, height int) string {
 	innerHeight := max(1, height-3)
 	visible := visibleLines(
 		renderFeed(current, innerWidth),
-		innerHeight,
+		max(1, innerHeight-tailHeight),
 		current.scroll,
 	)
+	if tail != "" {
+		visible += "\n" + tail
+	}
 	body := renderMainHeader(current, innerWidth) + "\n" + visible
 	return current.theme.styles.MainCard.
 		Width(max(1, width)).
@@ -202,7 +215,7 @@ func renderFeed(current model, innerWidth int) string {
 	if len(current.logs) == 0 {
 		content.WriteString(
 			current.theme.styles.Muted.Render(
-				"⋯ Waiting for the first subprocess line",
+				"⋯ Waiting for the first pipeline step",
 			),
 		)
 		content.WriteString("\n")
@@ -213,6 +226,46 @@ func renderFeed(current model, innerWidth int) string {
 		}
 	}
 	return content.String()
+}
+
+// renderActivityTail is the fixed pane under the scrolling feed: only the
+// newest subprocess lines of the current step (plan T13 W2). Subprocess output
+// no longer accumulates in the lifecycle feed, so this is where "what is it
+// doing right now" shows up. Returns "" when there is nothing to show.
+func renderActivityTail(current model, innerWidth, limit int) string {
+	if len(current.activity) == 0 || limit <= 0 {
+		return ""
+	}
+	lines := current.activity
+	if len(lines) > limit {
+		lines = lines[len(lines)-limit:]
+	}
+
+	var content strings.Builder
+	content.WriteString(
+		current.theme.styles.SectionTitle.Render("╱╱╱ ACTIVITY"),
+	)
+	content.WriteString("\n")
+	for index, line := range lines {
+		content.WriteString(renderLogLine(current.theme, line, innerWidth))
+		if index < len(lines)-1 {
+			content.WriteString("\n")
+		}
+	}
+	return content.String()
+}
+
+// activityTailLimit is the render-time truncation width: the compact layout
+// gets fewer rows, and a failed step keeps the whole buffer so the failure
+// body is not cut off (plan T13 W2 · R4).
+func activityTailLimit(current model) int {
+	if current.activityFailed {
+		return maxActivityLines
+	}
+	if !isWide(current.width, current.height) {
+		return activityTailCompact
+	}
+	return activityTailWide
 }
 
 // renderMainHeader is the feed card's command line: what this dashboard is

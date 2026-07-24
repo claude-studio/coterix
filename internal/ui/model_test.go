@@ -84,26 +84,23 @@ func (fake *fakeUIControl) Status(
 	return nil, fake.err
 }
 
-func TestModelStreamsBoundedLogsAndAttemptCompletion(t *testing.T) {
+func TestModelStreamsBoundedActivityTailAndAttemptCompletion(t *testing.T) {
 	current := testModel(t, &fakeUIControl{})
-	for index := 0; index < maxLogLines+25; index++ {
-		line := runner.Line{
-			Attempt: 1,
-			Stream:  runner.StreamStdout,
-			Text:    "line",
-		}
-		updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
-			Kind:  pipeline.EventStepLog,
-			RunID: "run-1",
-			Step:  pipeline.StepPlan,
-			Role:  "plan_writer",
-			CLI:   "claude",
-			Line:  &line,
-		}})
-		current = updated.(model)
+	current = feedActivityLines(t, current, maxActivityLines+25)
+	// Subprocess output lands in the pinned tail bounded by maxActivityLines and
+	// never accumulates in the scrolling lifecycle feed (plan T13 W2).
+	if len(current.activity) != maxActivityLines {
+		t.Fatalf(
+			"activity buffer length=%d want=%d",
+			len(current.activity),
+			maxActivityLines,
+		)
 	}
-	if len(current.logs) != maxLogLines {
-		t.Fatalf("log buffer length=%d want=%d", len(current.logs), maxLogLines)
+	if len(current.logs) != 0 {
+		t.Fatalf(
+			"lifecycle feed must stay free of subprocess lines, got %d",
+			len(current.logs),
+		)
 	}
 
 	result := runner.RunResult{Exit: -1, TimedOut: true}
@@ -123,6 +120,116 @@ func TestModelStreamsBoundedLogsAndAttemptCompletion(t *testing.T) {
 		!containsAll(last.Text, "attempt 2", "timed out", "idle timeout") {
 		t.Fatalf("attempt completion log=%#v", last)
 	}
+}
+
+// The tail is per-step: a new step clears it, a finished step keeps it until the
+// next one starts (so gate-failure context survives), and a failed step widens
+// the rendered window to the whole buffer (plan T13 W2 · R4).
+func TestActivityTailStepBoundariesAndFailureWidening(t *testing.T) {
+	current := testModel(t, &fakeUIControl{})
+	current = feedActivityLines(t, current, 8)
+
+	if limit := activityTailLimit(current); limit != activityTailWide {
+		t.Fatalf("healthy wide limit=%d want=%d", limit, activityTailWide)
+	}
+	compact := current
+	compact.width = wideBreakpointWidth - 1
+	compact.height = wideBreakpointHeight - 1
+	if limit := activityTailLimit(compact); limit != activityTailCompact {
+		t.Fatalf("compact limit=%d want=%d", limit, activityTailCompact)
+	}
+
+	updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
+		Kind: pipeline.EventStepFinished,
+		Step: pipeline.StepPlan,
+		Role: "plan_writer",
+	}})
+	current = updated.(model)
+	if len(current.activity) != 8 {
+		t.Fatalf(
+			"a finished step must keep its tail, got %d entries",
+			len(current.activity),
+		)
+	}
+
+	updated, _ = current.Update(pipelineEventMsg{Event: pipeline.Event{
+		Kind: pipeline.EventStepStarted,
+		Step: pipeline.StepPlanReview,
+		Role: "plan_reviewer",
+		CLI:  "codex",
+	}})
+	current = updated.(model)
+	if len(current.activity) != 0 {
+		t.Fatalf("new step kept %d stale tail entries", len(current.activity))
+	}
+	if current.activityFailed {
+		t.Fatal("new step inherited the failed flag")
+	}
+
+	current = feedActivityLines(t, current, maxActivityLines)
+	result := runner.RunResult{Exit: 1}
+	updated, _ = current.Update(pipelineEventMsg{Event: pipeline.Event{
+		Kind:    pipeline.EventAttemptFinished,
+		Step:    pipeline.StepPlanReview,
+		Role:    "plan_reviewer",
+		Attempt: 1,
+		Result:  &result,
+	}})
+	current = updated.(model)
+	if !current.activityFailed {
+		t.Fatal("a nonzero exit did not mark the tail as failed")
+	}
+	if limit := activityTailLimit(current); limit != maxActivityLines {
+		t.Fatalf("failed limit=%d want=%d", limit, maxActivityLines)
+	}
+}
+
+// stderr lines keep the failure icon in the tail (plan T13 W2 — the icon rule
+// itself is unchanged; v4 measurement retired the R5 downgrade).
+func TestActivityTailKeepsStderrFailureIcon(t *testing.T) {
+	current := testModel(t, &fakeUIControl{})
+	line := runner.Line{Attempt: 1, Stream: runner.StreamStderr, Text: "boom"}
+	updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
+		Kind:  pipeline.EventStepLog,
+		RunID: "run-1",
+		Step:  pipeline.StepPlan,
+		Role:  "plan_writer",
+		CLI:   "claude",
+		Line:  &line,
+	}})
+	current = updated.(model)
+
+	if len(current.activity) != 1 {
+		t.Fatalf("activity length=%d want=1", len(current.activity))
+	}
+	if current.activity[0].Stream != runner.StreamStderr {
+		t.Fatalf("stream=%v want stderr", current.activity[0].Stream)
+	}
+	rendered := renderActivityTail(current, 120, activityTailLimit(current))
+	if !containsAll(rendered, "ACTIVITY", "boom") {
+		t.Fatalf("activity tail render=%q", rendered)
+	}
+}
+
+func feedActivityLines(t *testing.T, current model, count int) model {
+	t.Helper()
+	for index := 0; index < count; index++ {
+		line := runner.Line{
+			Attempt: 1,
+			Stream:  runner.StreamStdout,
+			Text:    "line",
+		}
+		updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
+			Kind:  pipeline.EventStepLog,
+			RunID: "run-1",
+			Step:  pipeline.StepPlan,
+			Role:  "plan_writer",
+			CLI:   "claude",
+			Line:  &line,
+		}})
+		current = updated.(model)
+	}
+	return current
 }
 
 func TestWorkingAnimationTicksOnlyWhileActive(t *testing.T) {
