@@ -2400,10 +2400,19 @@ func pressureFileBody(index, attempt, attempts int) string {
 // UI decoder happens to accept (review T13b b4 f1).
 //
 //   - gate.json needs all seven fields present; readGateEvidence rejects a missing one and
-//     also rejects unknown ones (task_evidence.go:1016-1043). It does **not** check that the
-//     two log paths exist — that constraint belongs to the writer, which derives them with
-//     runRelativeRegularFile (:1104-1125) — but real files are written here anyway so the
-//     fixture matches what a completed gate leaves on disk.
+//     also rejects unknown ones (task_evidence.go:1016-1043). Reading is only half of it:
+//     validateGateEvidence runs right after (loadRepairEvidence, :725-736) and cross-checks
+//     command and cwd against the config snapshot, candidate_sha against the task, and both
+//     log paths with validateRunRelativePath + runRelativeRegularFile — so the logs must be
+//     real regular files inside the run directory on the **read** path too, not just when the
+//     writer derives them (:204-217, :1058-1091; review T13b b9 f1). This fixture writes real
+//     logs and takes command/cwd from the run's own config, so it satisfies that validator
+//     rather than merely decoding.
+//   - The review side is validated on read the same way: loadRepairEvidence runs the real
+//     ValidateReviewResult and then validateImplementationReviewTargets, which requires
+//     plan_hash to equal ApprovedPlanHash, task_id and candidate_sha to match the task, and
+//     the verdict to be **not** clean for a repairing task (:747-775, :1135-1150). This
+//     fixture is built to satisfy all four.
 //   - review.json needs schema_version, plan_hash, task_id, candidate_sha, clean and
 //     findings, and `clean` must be false **only** with at least one blocking finding —
 //     `clean != (blocking == 0)` is rejected (internal/cli/result.go:286-318, :426-437).
@@ -2446,10 +2455,13 @@ func writePressureEvidence(
 	}
 	review, err := json.Marshal(map[string]any{
 		"schema_version": 1,
-		"plan_hash":      *currentRun.State.PlanHash,
-		"task_id":        taskID,
-		"candidate_sha":  candidateSHA,
-		"clean":          false,
+		// ApprovedPlanHash, not PlanHash: validateImplementationReviewTargets compares the
+		// verdict against the *approved* hash (task_evidence.go:1135-1150). They are equal in
+		// this run, but the approved one is what is actually checked.
+		"plan_hash":     *currentRun.State.ApprovedPlanHash,
+		"task_id":       taskID,
+		"candidate_sha": candidateSHA,
+		"clean":         false,
 		"findings": []map[string]any{{
 			"id":               "f1",
 			"severity":         "major",
