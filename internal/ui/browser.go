@@ -261,28 +261,71 @@ func renderBrowser(current browserModel) string {
 	return constrainSnapshotWidth(strings.Join(rows, "\n"), width)
 }
 
-// renderBrowserList marks the cursor with the same background-free gutter the
-// lifecycle feed uses, so selection never depends on colour alone (T14 W4 policy).
+// renderBrowserList draws one row per run with the cursor gutter attached **in the
+// same loop as the data**, so the marker cannot drift off its run.
+//
+// Reusing `renderSnapshotTable` and adding gutters afterwards was wrong: the table
+// carries a top border, a header and a separator, so counting non-blank lines put the
+// marker two rows above the selected run — what was marked and what `enter` opened
+// disagreed (review T16 f1). The picker therefore formats its own rows; the one-shot
+// table stays exactly as it was for `RenderSnapshot`.
 func renderBrowserList(current browserModel, width int) string {
-	table := renderSnapshotTable(current.theme, current.statuses, width-2)
-	lines := strings.Split(table, "\n")
-	// The table's first line is its header; run rows follow in order.
-	out := make([]string, 0, len(lines))
-	runRow := 0
-	for index, line := range lines {
-		if index == 0 || strings.TrimSpace(ansi.Strip(line)) == "" {
-			out = append(out, "  "+line)
-			continue
+	const gutterWidth = 2
+	columns := []string{"run_id", "phase", "task", "confirmed", "signal"}
+	cells := make([][]string, 0, len(current.statuses))
+	for _, status := range current.statuses {
+		data := deriveStatusFields(status)
+		cells = append(cells, []string{
+			snapshotCell(data.RunID),
+			snapshotCell(string(data.Phase)),
+			snapshotCell(data.TaskID),
+			fmt.Sprintf("%d/%d", data.Confirmed, data.Total),
+			snapshotSignal(data),
+		})
+	}
+
+	widths := make([]int, len(columns))
+	for index, header := range columns {
+		widths[index] = ansi.StringWidth(header)
+	}
+	for _, row := range cells {
+		for index, cell := range row {
+			widths[index] = max(widths[index], ansi.StringWidth(cell))
 		}
-		gutter := "  "
-		if runRow == current.selected {
+	}
+
+	pad := func(text string, size int) string {
+		gap := size - ansi.StringWidth(text)
+		if gap <= 0 {
+			return text
+		}
+		return text + strings.Repeat(" ", gap)
+	}
+	joinRow := func(row []string) string {
+		parts := make([]string, 0, len(row))
+		for index, cell := range row {
+			parts = append(parts, pad(cell, widths[index]))
+		}
+		return strings.TrimRight(strings.Join(parts, "  "), " ")
+	}
+
+	body := max(1, width-gutterWidth)
+	lines := []string{
+		strings.Repeat(" ", gutterWidth) + current.theme.styles.SectionTitle.Render(
+			ansi.TruncateWc(joinRow(columns), body, "…"),
+		),
+	}
+	for index, row := range cells {
+		gutter := strings.Repeat(" ", gutterWidth)
+		if index == current.selected {
 			gutter = current.theme.styles.BorderFocus.Render("▌") +
 				current.theme.styles.TabActive.Render("▸")
 		}
-		out = append(out, gutter+line)
-		runRow++
+		lines = append(lines, gutter+current.theme.styles.Value.Render(
+			ansi.TruncateWc(joinRow(row), body, "…"),
+		))
 	}
-	return strings.Join(out, "\n")
+	return strings.Join(lines, "\n")
 }
 
 func browserHints(current browserModel) string {
