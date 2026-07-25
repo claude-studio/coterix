@@ -51,6 +51,11 @@ const (
 	mainBoxCount
 )
 
+// toastDuration is how long an acknowledgement stays in the status bar (T14 W8).
+// Expiry is decided against the injected clock so the tests are deterministic; the
+// tick only wakes the view up.
+const toastDuration = 3 * time.Second
+
 // maxScrollSentinel parks a box at its oldest line; visibleLines clamps it.
 const maxScrollSentinel = 1 << 20
 
@@ -114,6 +119,10 @@ type logEntry struct {
 	Icon    logIcon
 }
 
+// toastExpiredMsg is the scheduled redraw that lets an expired acknowledgement
+// disappear (T14 W8).
+type toastExpiredMsg struct{}
+
 type artifactsLoadedMsg struct {
 	runID string
 	key   string
@@ -165,7 +174,11 @@ type model struct {
 	// helpOpen shows the key overlay (T14 W6). It is the only overlay — there is no
 	// dialog stack, so a bool is the whole state.
 	helpOpen bool
-	focus    mainBox
+	// toast is a transient acknowledgement in the status bar (T14 W8). It says a
+	// keypress was *accepted*, which is otherwise invisible while the operation runs.
+	toast      string
+	toastUntil time.Time
+	focus      mainBox
 	// boxScroll is each box's distance from its newest line. 0 means "follow the
 	// live edge". A paused box (>0) is nudged by preserveReading when content
 	// arrives, which keeps the same absolute lines on screen — without that the
@@ -264,6 +277,11 @@ func (current model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				current.artifactLoadedKey = message.key
 				current.refreshArtifactRender()
 			}
+		}
+		return current, nil
+	case toastExpiredMsg:
+		if !current.toastLive() {
+			current.toast = ""
 		}
 		return current, nil
 	case spinner.TickMsg:
@@ -645,6 +663,7 @@ func (current model) beginOperation(
 	wasWorking := current.isWorking()
 	current.operation = kind
 	current.operationErr = nil
+	current.showToast(operationAcknowledgement(kind))
 	operation := runOperation(
 		current.ctx,
 		current.control,
@@ -656,9 +675,61 @@ func (current model) beginOperation(
 		response,
 	)
 	if wasWorking {
-		return current, operation
+		return current, tea.Batch(operation, toastExpiryCommand())
 	}
-	return current, tea.Batch(operation, current.spinnerTickCommand())
+	return current, tea.Batch(
+		operation,
+		current.spinnerTickCommand(),
+		toastExpiryCommand(),
+	)
+}
+
+// showToast records an acknowledgement and when it stops being shown.
+func (current *model) showToast(text string) {
+	if text == "" {
+		return
+	}
+	current.toast = text
+	current.toastUntil = current.nowOrZero().Add(toastDuration)
+}
+
+// toastLive reports whether the acknowledgement is still within its window. A zero
+// clock (tests that never inject one) means it stays until the next one replaces it.
+func (current model) toastLive() bool {
+	if current.toast == "" {
+		return false
+	}
+	if current.toastUntil.IsZero() {
+		return true
+	}
+	return current.nowOrZero().Before(current.toastUntil)
+}
+
+func (current model) nowOrZero() time.Time {
+	if current.now == nil {
+		return time.Time{}
+	}
+	return current.now()
+}
+
+// toastExpiryCommand wakes the view up when the acknowledgement should disappear.
+// The decision is still the clock's — this only schedules a redraw.
+func toastExpiryCommand() tea.Cmd {
+	return tea.Tick(toastDuration, func(time.Time) tea.Msg {
+		return toastExpiredMsg{}
+	})
+}
+
+func operationAcknowledgement(kind operationKind) string {
+	switch kind {
+	case operationApprove:
+		return "✓ approve sent"
+	case operationReject:
+		return "✓ reject sent"
+	case operationResume:
+		return "✓ response sent"
+	}
+	return ""
 }
 
 func (current model) isWorking() bool {

@@ -1464,9 +1464,18 @@ func renderStatusBar(current model, width, height int) string {
 	// The hint line is derived from the same table as the `?` overlay, so a key
 	// cannot be advertised in one and missing from the other (T14 W6).
 	hints := keyHintLine(current)
+	hintStyle := current.theme.styles.Hint
+	if current.toastLive() {
+		// A live acknowledgement takes the hint slot: the keys are always available
+		// and documented under `?`, whereas "your keypress was accepted" is only true
+		// for a moment (T14 W8). It never reaches here while a prompt is open — that
+		// branch returns above, so the prompt keeps the whole region.
+		hints = ansi.TruncateWc(current.toast, contentWidth, "…")
+		hintStyle = current.theme.styles.PhaseSuccess
+	}
 	content := alignStatusLine(
 		primary,
-		current.theme.styles.Hint.Render(hints),
+		hintStyle.Render(hints),
 		contentWidth,
 	)
 	if detail := statusDetail(current, contentWidth); detail != "" {

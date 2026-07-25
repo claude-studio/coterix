@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
@@ -2398,5 +2399,109 @@ func TestOpeningAPromptCollapsesTheExpandedBlock(t *testing.T) {
 				t.Fatalf("a truncated block is still drawn behind the prompt:\n%s", frame)
 			}
 		})
+	}
+}
+
+// W8: accepting a keypress is otherwise invisible while the operation runs, so the
+// status bar acknowledges it for a few seconds. Expiry is decided by the injected
+// clock, not by the tick, so the test is deterministic (T14 W8).
+func TestOperationAcknowledgementAppearsAndExpires(t *testing.T) {
+	clock := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	fake := &fakeUIControl{}
+	current := testModel(t, fake)
+	current.now = func() time.Time { return clock }
+	current.hasStatus = true
+	current.status = pipeline.RunStatus{
+		RunID: "run-t",
+		Phase: state.PhaseAwaitingApproval,
+	}
+
+	// The real path: `a` arms, `enter` commits.
+	updated, _ := current.Update(printableKey('a'))
+	current = updated.(model)
+	if current.toastLive() {
+		t.Fatal("arming the confirmation already acknowledged it")
+	}
+	updated, command := current.Update(specialKey(tea.KeyEnter))
+	current = updated.(model)
+	if command == nil {
+		t.Fatal("the confirmation did not start the operation")
+	}
+	if !current.toastLive() {
+		t.Fatal("accepting the approval was not acknowledged")
+	}
+	frame := ansi.Strip(renderStatusBar(current, 120, 2))
+	if !strings.Contains(frame, "approve sent") {
+		t.Fatalf("the acknowledgement is not in the status bar:\n%s", frame)
+	}
+	// It *replaces* the hints rather than pushing them anywhere. Row counting alone
+	// cannot see this: the status bar is height-clamped, so an extra row silently
+	// displaces the hints into the detail slot instead of overflowing.
+	if strings.Contains(frame, "j/k scroll") {
+		t.Fatalf("the hints survived alongside the acknowledgement:\n%s", frame)
+	}
+	if rows := strings.Count(frame, "\n"); rows > 1 {
+		t.Fatalf("the acknowledgement added rows: %d newlines", rows)
+	}
+
+	// Just before the window closes it is still there; after, it is gone.
+	clock = clock.Add(toastDuration - time.Millisecond)
+	if !current.toastLive() {
+		t.Fatal("the acknowledgement expired early")
+	}
+	clock = clock.Add(2 * time.Millisecond)
+	if current.toastLive() {
+		t.Fatal("the acknowledgement outlived its window")
+	}
+	if strings.Contains(ansi.Strip(renderStatusBar(current, 120, 2)), "approve sent") {
+		t.Fatal("an expired acknowledgement is still drawn")
+	}
+	// The scheduled redraw clears the text so it cannot come back.
+	updated, _ = current.Update(toastExpiredMsg{})
+	if updated.(model).toast != "" {
+		t.Fatal("the expiry tick did not clear the acknowledgement")
+	}
+	// Hints are back.
+	if !strings.Contains(ansi.Strip(renderStatusBar(updated.(model), 120, 2)), "quit") {
+		t.Fatal("the hints did not return after the acknowledgement")
+	}
+}
+
+// A prompt owns the whole status region, so an acknowledgement must not compete with
+// it — the reject/resume acknowledgement only appears once the prompt has closed
+// (T14 W8 item 7).
+func TestAcknowledgementNeverSharesTheStatusBarWithAPrompt(t *testing.T) {
+	clock := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	fake := &fakeUIControl{}
+	current := testModel(t, fake)
+	current.now = func() time.Time { return clock }
+	current.hasStatus = true
+	current.status = pipeline.RunStatus{
+		RunID: "run-p",
+		Phase: state.PhaseAwaitingApproval,
+	}
+
+	updated, _ := current.Update(printableKey('r'))
+	current = updated.(model)
+	if !current.usesTextarea() {
+		t.Fatal("reject did not open the editor")
+	}
+	updated, _ = current.Update(tea.PasteMsg{Content: "needs another gate"})
+	current = updated.(model)
+
+	// While the editor is open the region is the editor's.
+	editor := ansi.Strip(renderStatusBar(current, 120, promptRowsArea))
+	if strings.Contains(editor, "sent") {
+		t.Fatalf("an acknowledgement leaked into the prompt region:\n%s", editor)
+	}
+
+	updated, command := current.Update(specialKey(tea.KeyEnter))
+	current = updated.(model)
+	if command == nil || current.prompt != promptNone {
+		t.Fatal("enter did not submit and close the editor")
+	}
+	frame := ansi.Strip(renderStatusBar(current, 120, 2))
+	if !strings.Contains(frame, "reject sent") {
+		t.Fatalf("submitting was not acknowledged once the prompt closed:\n%s", frame)
 	}
 }
