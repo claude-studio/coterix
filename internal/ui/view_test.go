@@ -2481,6 +2481,34 @@ func writePressureEvidence(
 	task := currentRun.State.Tasks[taskID]
 	task.GateResult = &gatePath
 	task.ReviewResult = &reviewPath
+
+	// The claims above are asserted, not just described. validateGateEvidence and
+	// validateImplementationReviewTargets are private to internal/pipeline, so their
+	// conditions are checked here directly — six review rounds were spent on comments that
+	// asserted things about this fixture, and an assertion cannot go stale the way a comment
+	// can.
+	for _, relative := range []string{stdoutLog, stderrLog} {
+		info, err := os.Lstat(filepath.Join(currentRun.Dir, relative))
+		if err != nil {
+			t.Fatalf("gate log %q is not readable: %v", relative, err)
+		}
+		if !info.Mode().IsRegular() {
+			t.Fatalf("gate log %q is not a regular file", relative)
+		}
+		if filepath.Clean(relative) != relative || filepath.IsAbs(relative) {
+			t.Fatalf("gate log %q is not a clean run-relative path", relative)
+		}
+	}
+	if *currentRun.State.ApprovedPlanHash == "" {
+		t.Fatal("the review verdict cites an empty approved plan hash")
+	}
+	switch stored := currentRun.State.Tasks[taskID].CandidateSHA; {
+	case stored == nil:
+		t.Fatalf("the evidence cites %s but the task has no candidate", candidateSHA)
+	case *stored != candidateSHA:
+		t.Fatalf("the evidence cites %s but the task's candidate is %s",
+			candidateSHA, *stored)
+	}
 }
 
 func writePressureFile(t *testing.T, root string, index int, body string) {
