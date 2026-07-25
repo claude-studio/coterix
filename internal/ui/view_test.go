@@ -1863,6 +1863,20 @@ func TestWorkingTextShimmerBlendsOncePerTextAndTheme(t *testing.T) {
 	if blends != 3 {
 		t.Fatalf("re-rendering either theme blended again: %d", blends)
 	}
+
+	// A theme with no stops has nothing to blend, so it must not blend — the memo stores
+	// only successes, so an unguarded failure path pays the per-frame cost forever on the
+	// one input that has no palette at all.
+	stopless := current.theme
+	stopless.tokens.Gradient.BrandLeftToRight = nil
+	for phase := 0; phase < 3; phase++ {
+		if workingGradientText(stopless, sameWidth, phase) == "" {
+			t.Fatal("a stopless theme rendered nothing instead of the plain chip")
+		}
+	}
+	if blends != 3 {
+		t.Fatalf("a stopless theme blended %d times in total, want none added", blends)
+	}
 }
 
 // T13 W5: the changed-files list is last in the rail and only uses rows the signals did

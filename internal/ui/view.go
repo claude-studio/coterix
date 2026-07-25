@@ -2024,6 +2024,14 @@ type shimmerKey struct {
 
 func shimmerPalette(currentTheme theme, width int) []color.Color {
 	tokens := currentTheme.tokens.Gradient.BrandLeftToRight
+	// A theme with no gradient stops has no palette to compute. Measured: Blend1D with
+	// zero stops returns an empty slice rather than panicking, so without this guard the
+	// caller's fallback worked but blended **once per frame** — the memo never stores a
+	// failure, so the per-frame cost came back on exactly the input that has nothing to
+	// compute.
+	if len(tokens) == 0 || width <= 0 {
+		return nil
+	}
 	key := shimmerKey{stops: strings.Join(tokens, ","), width: width}
 	if cached, found := shimmerPalettes.Load(key); found {
 		return cached.([]color.Color)
