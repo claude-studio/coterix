@@ -58,6 +58,16 @@ type controlPlane interface {
 
 type runDashboard interface {
 	Run(context.Context, string, string) (pipeline.RunStatus, error)
+	// Open attaches the dashboard to an existing run and dispatches one control
+	// operation on it (T15 W1/W2). command is the CLI command name; response is the
+	// parsed --response value, or nil when none was given.
+	Open(
+		ctx context.Context,
+		repoRoot string,
+		runID string,
+		command string,
+		response *string,
+	) (pipeline.RunStatus, error)
 	Interactive() bool
 }
 
@@ -68,6 +78,30 @@ type charmDashboard struct {
 	interactive bool
 	width       int
 	height      int
+}
+
+func (dashboard charmDashboard) Open(
+	ctx context.Context,
+	repoRoot string,
+	runID string,
+	command string,
+	response *string,
+) (pipeline.RunStatus, error) {
+	return ui.Open(
+		ctx,
+		dashboard.executor,
+		repoRoot,
+		runID,
+		command,
+		response,
+		ui.RunOptions{
+			Input:       dashboard.input,
+			Output:      dashboard.output,
+			Interactive: dashboard.interactive,
+			Width:       dashboard.width,
+			Height:      dashboard.height,
+		},
+	)
 }
 
 func (dashboard charmDashboard) Run(
@@ -189,7 +223,8 @@ func execute(
 		err         error
 		interactive bool
 	)
-	if len(dashboards) > 0 && len(args) > 0 && args[0] == "run" {
+	switch {
+	case len(dashboards) > 0 && len(args) > 0 && args[0] == "run":
 		request, parseErr := parseRunArguments(args[1:])
 		if parseErr != nil {
 			err = parseErr
@@ -197,7 +232,26 @@ func execute(
 			result, err = dashboards[0].Run(ctx, repoRoot, request)
 			interactive = dashboards[0].Interactive()
 		}
-	} else {
+	// approve/reject/resume run for minutes and used to print nothing until they
+	// finished, then a single snapshot. On a TTY they now open the live dashboard
+	// (T15 W2). Headless they keep the exact JSON and exit codes they always had, and
+	// `status` keeps its one-shot snapshot either way.
+	case len(dashboards) > 0 && len(args) > 0 &&
+		dashboards[0].Interactive() && isInteractiveControlCommand(args[0]):
+		runID, response, parseErr := parseControlEntry(args)
+		if parseErr != nil {
+			err = parseErr
+		} else {
+			result, err = dashboards[0].Open(
+				ctx,
+				repoRoot,
+				runID,
+				args[0],
+				response,
+			)
+			interactive = true
+		}
+	default:
 		result, err = dispatch(ctx, controller, repoRoot, args)
 	}
 	if err != nil {
@@ -380,16 +434,56 @@ func parseRequiredRunID(command string, args []string) (string, error) {
 	return args[0], nil
 }
 
-func parseRejectArguments(args []string) (string, string, error) {
-	if len(args) == 0 {
-		return "", "", newUsageError("reject: run_id is required")
+func isInteractiveControlCommand(command string) bool {
+	switch command {
+	case "approve", "reject", "resume":
+		return true
 	}
-	runID := args[0]
-	response, err := parseResponseSource("reject", args[1:], true)
+	return false
+}
+
+// parseControlEntry parses the argv of a control command that is about to open the
+// dashboard. It reuses the same parsers the headless path uses so the two cannot
+// diverge — only reject's `--response` requirement differs, and that difference is
+// the TTY flag itself.
+func parseControlEntry(args []string) (string, *string, error) {
+	switch args[0] {
+	case "approve":
+		runID, err := parseRequiredRunID("approve", args[1:])
+		return runID, nil, err
+	case "reject":
+		return parseRejectArgumentsFor(args[1:], true)
+	case "resume":
+		return parseResumeArguments(args[1:])
+	}
+	return "", nil, newUsageError("unknown command %q", args[0])
+}
+
+func parseRejectArguments(args []string) (string, string, error) {
+	runID, response, err := parseRejectArgumentsFor(args, false)
 	if err != nil {
 		return "", "", err
 	}
 	return runID, *response, nil
+}
+
+// parseRejectArgumentsFor makes `--response` optional on a TTY and required without
+// one (T15 W2 · R1 option a, a deliberate reversal of T11 f1's argv objection). A
+// bare `coterix reject <id>` in a terminal opens the dashboard and asks for the
+// feedback; headless it stays a usage error, so scripts see no change.
+func parseRejectArgumentsFor(
+	args []string,
+	interactive bool,
+) (string, *string, error) {
+	if len(args) == 0 {
+		return "", nil, newUsageError("reject: run_id is required")
+	}
+	runID := args[0]
+	response, err := parseResponseSource("reject", args[1:], !interactive)
+	if err != nil {
+		return "", nil, err
+	}
+	return runID, response, nil
 }
 
 func parseResumeArguments(args []string) (string, *string, error) {

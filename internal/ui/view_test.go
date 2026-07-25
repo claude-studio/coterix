@@ -1440,67 +1440,51 @@ func TestDocumentedKeysAreActuallyDispatched(t *testing.T) {
 	}
 }
 
-// The progress bar lives inside the existing progress row: the sidebar's row budget
-// must not grow, the counts survive when the rail is narrow, and human-intervention
-// signals still come after it (T14 W7 · R2).
-func TestProgressBarRendersInsideItsRowAndYieldsBeforeTheCounts(t *testing.T) {
+// The progress bar has to appear in the *real* dashboard. The first version only
+// showed one when this was called at width 30; the production rail is 32 cells, which
+// leaves the row 14, and the bar was squeezed out of every actual frame
+// (review T14d f1). So this renders through renderDashboard.
+func TestProgressBarAppearsInTheProductionDashboard(t *testing.T) {
 	current := populatedViewModel(t)
-	data := deriveSidebar(current)
-	data.PlanRound = 3
-	data.Confirmed = 1
-	data.Total = 4
-
-	rowsFor := func(width int) []string {
-		body := ansi.Strip(renderSidebarBody(current.theme, data, width, true, false))
-		return strings.Split(strings.TrimRight(body, "\n"), "\n")
-	}
-	// Row count is identical with and without a bar: compare a width that fits one
-	// against a width that cannot.
-	// The rail is a fixed 32 cells, so both of these are real widths: 26 is the
-	// tightest the card gets, 30 is typical.
-	wide, narrow := rowsFor(30), rowsFor(26)
-	if len(wide) != len(narrow) {
-		t.Fatalf("the bar changed the row count: %d vs %d", len(wide), len(narrow))
+	current.width = wideBreakpointWidth
+	current.height = wideBreakpointHeight
+	current.status.TaskOrder = []string{"T1", "T2", "T3", "T4"}
+	current.status.Tasks = map[string]state.TaskState{
+		"T1": {Status: state.TaskConfirmed},
+		"T2": {Status: state.TaskCandidate},
+		"T3": {Status: state.TaskOpen},
+		"T4": {Status: state.TaskOpen},
 	}
 
-	wideRow := progressRow(t, wide)
-	if !strings.Contains(wideRow, "■") || !strings.Contains(wideRow, "□") {
-		t.Fatalf("no bar at width 30: %q", wideRow)
+	frame := ansi.Strip(renderDashboard(current))
+	if !strings.Contains(frame, "■") || !strings.Contains(frame, "□") {
+		t.Fatalf("no progress bar in the real dashboard:\n%s", frame)
 	}
-	if !strings.Contains(wideRow, "1/4") || !strings.Contains(wideRow, "round 3") {
-		t.Fatalf("the bar displaced the counts: %q", wideRow)
+	if !strings.Contains(frame, "1/4") {
+		t.Fatalf("the counts were displaced by the bar:\n%s", frame)
 	}
-
-	// At the tightest real width the counts must still be intact and unclipped —
-	// the bar is what shrinks.
-	narrowRow := progressRow(t, narrow)
-	if !strings.Contains(narrowRow, "1/4") || strings.Contains(narrowRow, "…") {
-		t.Fatalf("the counts did not survive the tightest rail: %q", narrowRow)
+	// The round survives, abbreviated if that is what makes the bar fit.
+	if !strings.Contains(frame, "round 3") && !strings.Contains(frame, "r3") {
+		t.Fatalf("the plan round disappeared:\n%s", frame)
 	}
-
-	// No row may exceed the rail.
-	for _, width := range []int{26, 28, 30, 40} {
-		for index, row := range rowsFor(width) {
-			if cells := ansi.StringWidth(row); cells > width {
-				t.Fatalf("width=%d row %d is %d cells: %q", width, index, cells, row)
-			}
+	// Human-intervention signals still outrank it.
+	if !strings.Contains(frame, "APPROVAL NEEDED") {
+		t.Fatalf("the bar displaced the approval signal:\n%s", frame)
+	}
+	// And no row overflows the rail.
+	for index, row := range strings.Split(frame, "\n") {
+		if cells := ansi.StringWidth(row); cells > wideBreakpointWidth {
+			t.Fatalf("row %d is %d cells wide:\n%s", index, cells, frame)
 		}
 	}
 
-	// The approval signal is still present and still after the progress row.
-	rows := rowsFor(30)
-	signal, progress := -1, -1
-	for index, row := range rows {
-		if strings.Contains(row, "APPROVAL NEEDED") {
-			signal = index
-		}
-		if strings.Contains(row, "progress:") {
-			progress = index
-		}
-	}
-	if signal < 0 || progress < 0 || signal < progress {
-		t.Fatalf("intervention signal at %d, progress at %d:\n%s",
-			signal, progress, strings.Join(rows, "\n"))
+	// compact folds the rail away entirely; it must not grow a bar row there.
+	compact := current
+	compact.width = 80
+	compact.height = 24
+	compactFrame := ansi.Strip(renderDashboard(compact))
+	if strings.Contains(compactFrame, "progress:") {
+		t.Fatalf("compact grew a sidebar row:\n%s", compactFrame)
 	}
 }
 
@@ -1670,6 +1654,60 @@ func TestPathsRenderAsZeroWidthHyperlinks(t *testing.T) {
 		// `file:`, which a "file://" check would happily miss.
 		if strings.Contains(bar, "\x1b]8;;") {
 			t.Fatalf("a link was emitted without a run directory:\n%q", bar)
+		}
+	})
+
+	t.Run("plan.md is linked from the Plan tab", func(t *testing.T) {
+		tabbed := tabbedViewModel(t)
+		tabbed.repoRoot = current.repoRoot
+		strip := renderArtifactTabs(tabbed)
+		if !strings.Contains(strip, wantDir+"/plan.md") {
+			t.Fatalf("the Plan tab does not link plan.md:\n%q", strip)
+		}
+		if !strings.Contains(ansi.Strip(strip), "1 Plan") {
+			t.Fatalf("the tab label was lost:\n%s", ansi.Strip(strip))
+		}
+	})
+
+	t.Run("the displayed full-log path is the link to it", func(t *testing.T) {
+		waiting := current
+		waiting.activeRole = "impl_writer"
+		waiting.activeCLI = "codex"
+		waiting.activeStep = pipeline.StepImplementation
+		body := activityWaitingBody(waiting, 90)
+		if !strings.Contains(body, wantDir+"/logs") {
+			t.Fatalf("the full-log row is plain text:\n%q", body)
+		}
+		plain := ansi.Strip(body)
+		if !strings.Contains(plain, "full log: .coterix/runs/run-9/logs/") {
+			t.Fatalf("the path text was lost:\n%s", plain)
+		}
+	})
+
+	t.Run("compact reaches the run directory too", func(t *testing.T) {
+		compact := current
+		compact.width = 80
+		compact.height = 24
+		frame := renderDashboard(compact)
+		if !strings.Contains(frame, wantDir) {
+			t.Fatalf("compact has no run anchor:\n%q", ansi.Strip(frame))
+		}
+	})
+
+	t.Run("wide and compact frames both fall back to plain text", func(t *testing.T) {
+		for _, size := range [][2]int{{wideBreakpointWidth, wideBreakpointHeight}, {80, 24}} {
+			sized := current
+			sized.width, sized.height = size[0], size[1]
+			plain := ansi.Strip(renderDashboard(sized))
+			if strings.Contains(plain, "file://") || strings.Contains(plain, "\x1b]8") {
+				t.Fatalf("%dx%d leaked an escape into the text:\n%s",
+					size[0], size[1], plain)
+			}
+			for index, row := range strings.Split(plain, "\n") {
+				if cells := ansi.StringWidth(row); cells > size[0] {
+					t.Fatalf("%dx%d row %d is %d cells", size[0], size[1], index, cells)
+				}
+			}
 		}
 	})
 

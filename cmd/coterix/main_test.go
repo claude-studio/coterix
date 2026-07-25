@@ -52,6 +52,30 @@ func (fake *fakeRunDashboard) Run(
 	return fake.status, fake.err
 }
 
+func copyResponseForTest(response *string) *string {
+	if response == nil {
+		return nil
+	}
+	copied := *response
+	return &copied
+}
+
+func (fake *fakeRunDashboard) Open(
+	_ context.Context,
+	repoRoot string,
+	runID string,
+	command string,
+	response *string,
+) (pipeline.RunStatus, error) {
+	fake.calls = append(fake.calls, controlCall{
+		command:  command,
+		repoRoot: repoRoot,
+		runID:    runID,
+		response: copyResponseForTest(response),
+	})
+	return fake.status, fake.err
+}
+
 func (fake *fakeRunDashboard) Interactive() bool {
 	fake.interactiveCalls++
 	return fake.interactive
@@ -846,7 +870,10 @@ func TestExecuteControlCommandsPreserveExactHeadlessJSON(t *testing.T) {
 	}
 }
 
-func TestExecuteControlCommandsRenderInteractiveSnapshots(t *testing.T) {
+// Only `status` still renders a one-shot snapshot on a TTY: approve/reject/resume now
+// open the live dashboard, because they run for minutes and used to print nothing at
+// all until they finished (T15 W2). Their entry is covered separately.
+func TestExecuteStatusRendersInteractiveSnapshots(t *testing.T) {
 	status := pipeline.RunStatus{
 		RunID: "run-tty",
 		Phase: state.PhaseDone,
@@ -858,32 +885,6 @@ func TestExecuteControlCommandsRenderInteractiveSnapshots(t *testing.T) {
 		wantTable   bool
 		wantDetails bool
 	}{
-		{
-			name: "approve detail",
-			args: []string{"approve", "run-tty"},
-			wantCall: controlCall{
-				command:  "approve",
-				repoRoot: "repo-root",
-				runID:    "run-tty",
-			},
-			wantDetails: true,
-		},
-		{
-			name: "reject detail",
-			args: []string{
-				"reject",
-				"run-tty",
-				"--response",
-				"revise",
-			},
-			wantCall: controlCall{
-				command:  "reject",
-				repoRoot: "repo-root",
-				runID:    "run-tty",
-				response: stringPointer("revise"),
-			},
-			wantDetails: true,
-		},
 		{
 			name: "bare status table with one run",
 			args: []string{"status"},
@@ -898,16 +899,6 @@ func TestExecuteControlCommandsRenderInteractiveSnapshots(t *testing.T) {
 			args: []string{"status", "run-tty"},
 			wantCall: controlCall{
 				command:  "status",
-				repoRoot: "repo-root",
-				runID:    "run-tty",
-			},
-			wantDetails: true,
-		},
-		{
-			name: "resume detail",
-			args: []string{"resume", "run-tty"},
-			wantCall: controlCall{
-				command:  "resume",
 				repoRoot: "repo-root",
 				runID:    "run-tty",
 			},
@@ -966,12 +957,6 @@ func TestExecuteInteractiveControlErrorsAreNotIntercepted(t *testing.T) {
 		wantStderr string
 	}{
 		{
-			name: "reject response missing",
-			args: []string{"reject", "run-tty"},
-			wantStderr: "coterix: reject: exactly one of --response or " +
-				"--response-file is required\n" + usageText,
-		},
-		{
 			name:       "reject unknown flag",
 			args:       []string{"reject", "run-tty", "--unknown"},
 			wantStderr: "coterix: reject: flag provided but not defined: -unknown\n" + usageText,
@@ -1013,10 +998,13 @@ func TestExecuteInteractiveControlErrorsAreNotIntercepted(t *testing.T) {
 		})
 	}
 
-	t.Run("core failure", func(t *testing.T) {
-		coreErr := errors.New("core rejected the interactive operation")
-		fake := &fakeControlPlane{err: coreErr}
-		dashboard := &fakeRunDashboard{interactive: true}
+	// The dashboard now owns approve on a TTY, so a failure surfaces from `ui.Open`
+	// rather than from the controller — it must still exit 1 with the bare message and
+	// no usage text (T15 W2/W4).
+	t.Run("dashboard entry failure exits 1", func(t *testing.T) {
+		openErr := errors.New("ui: open run: no such run")
+		fake := &fakeControlPlane{}
+		dashboard := &fakeRunDashboard{interactive: true, err: openErr}
 		code, stdout, stderr := executeWithDashboardForTest(
 			t,
 			fake,
@@ -1025,27 +1013,15 @@ func TestExecuteInteractiveControlErrorsAreNotIntercepted(t *testing.T) {
 			"approve",
 			"run-tty",
 		)
-		if code != 1 ||
-			stdout != "" ||
-			stderr != "coterix: "+coreErr.Error()+"\n" {
-			t.Fatalf(
-				"execute() code=%d stdout=%q stderr=%q",
-				code,
-				stdout,
-				stderr,
-			)
+		if code != 1 || stdout != "" ||
+			stderr != "coterix: "+openErr.Error()+"\n" {
+			t.Fatalf("execute() code=%d stdout=%q stderr=%q", code, stdout, stderr)
 		}
-		assertSingleCall(t, fake, controlCall{
-			command:  "approve",
-			repoRoot: "repo-root",
-			runID:    "run-tty",
-		})
-		if dashboard.interactiveCalls != 0 || len(dashboard.calls) != 0 {
-			t.Fatalf(
-				"core failure reached snapshot/dashboard: interactive=%d calls=%#v",
-				dashboard.interactiveCalls,
-				dashboard.calls,
-			)
+		if len(dashboard.calls) != 1 {
+			t.Fatalf("approve did not reach the dashboard: %#v", dashboard.calls)
+		}
+		if len(fake.calls) != 0 {
+			t.Fatalf("approve also called the controller: %#v", fake.calls)
 		}
 	})
 }
@@ -1209,6 +1185,158 @@ func TestHelpDoesNotChangeBareInvocationOrSubcommandHelp(t *testing.T) {
 		}
 		if !strings.Contains(stderr, "Usage:") {
 			t.Fatalf("subcommand help lost its usage text: %q", stderr)
+		}
+	})
+}
+
+// approve/reject/resume enter the live dashboard on a TTY, carrying the parsed run id
+// and response. Before T15 they ran to completion with no output and then printed one
+// snapshot (T15 W2).
+func TestExecuteControlCommandsEnterTheDashboardOnATTY(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		args []string
+		want controlCall
+	}{
+		{
+			name: "approve",
+			args: []string{"approve", "run-tty"},
+			want: controlCall{
+				command:  "approve",
+				repoRoot: "repo-root",
+				runID:    "run-tty",
+			},
+		},
+		{
+			name: "reject with a response",
+			args: []string{"reject", "run-tty", "--response", "revise"},
+			want: controlCall{
+				command:  "reject",
+				repoRoot: "repo-root",
+				runID:    "run-tty",
+				response: stringPointer("revise"),
+			},
+		},
+		{
+			// The reversal of T11 f1's argv objection: a bare reject is legal on a TTY
+			// and the dashboard asks for the feedback (R1 option a).
+			name: "bare reject",
+			args: []string{"reject", "run-tty"},
+			want: controlCall{
+				command:  "reject",
+				repoRoot: "repo-root",
+				runID:    "run-tty",
+			},
+		},
+		{
+			name: "resume with a response",
+			args: []string{"resume", "run-tty", "--response", "retry"},
+			want: controlCall{
+				command:  "resume",
+				repoRoot: "repo-root",
+				runID:    "run-tty",
+				response: stringPointer("retry"),
+			},
+		},
+		{
+			name: "bare resume",
+			args: []string{"resume", "run-tty"},
+			want: controlCall{
+				command:  "resume",
+				repoRoot: "repo-root",
+				runID:    "run-tty",
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fake := &fakeControlPlane{}
+			dashboard := &fakeRunDashboard{
+				interactive: true,
+				status:      pipeline.RunStatus{RunID: "run-tty"},
+			}
+			code, _, stderr := executeWithDashboardForTest(
+				t,
+				fake,
+				dashboard,
+				"repo-root",
+				test.args...,
+			)
+			if code != 0 || stderr != "" {
+				t.Fatalf("execute() code=%d stderr=%q", code, stderr)
+			}
+			if len(dashboard.calls) != 1 {
+				t.Fatalf("dashboard calls=%#v", dashboard.calls)
+			}
+			got := dashboard.calls[0]
+			if got.command != test.want.command ||
+				got.repoRoot != test.want.repoRoot ||
+				got.runID != test.want.runID {
+				t.Fatalf("dashboard call=%#v want=%#v", got, test.want)
+			}
+			if (got.response == nil) != (test.want.response == nil) ||
+				(got.response != nil && *got.response != *test.want.response) {
+				t.Fatalf("response=%v want=%v", got.response, test.want.response)
+			}
+			// The headless controller must not be touched on this path.
+			if len(fake.calls) != 0 {
+				t.Fatalf("the controller was also called: %#v", fake.calls)
+			}
+		})
+	}
+}
+
+// The headless contract is untouched: without a TTY these commands keep the dispatch
+// path, and a bare reject is still a usage error there (T15 W2).
+func TestControlCommandsWithoutATTYKeepTheHeadlessContract(t *testing.T) {
+	t.Run("approve dispatches to the controller", func(t *testing.T) {
+		fake := &fakeControlPlane{status: pipeline.RunStatus{RunID: "run-h"}}
+		dashboard := &fakeRunDashboard{interactive: false}
+		code, stdout, stderr := executeWithDashboardForTest(
+			t,
+			fake,
+			dashboard,
+			"repo-root",
+			"approve",
+			"run-h",
+		)
+		if code != 0 || stderr != "" {
+			t.Fatalf("execute() code=%d stderr=%q", code, stderr)
+		}
+		if !json.Valid([]byte(stdout)) {
+			t.Fatalf("headless output is not JSON: %q", stdout)
+		}
+		if len(dashboard.calls) != 0 {
+			t.Fatalf("headless approve reached the dashboard: %#v", dashboard.calls)
+		}
+		assertSingleCall(t, fake, controlCall{
+			command:  "approve",
+			repoRoot: "repo-root",
+			runID:    "run-h",
+		})
+	})
+
+	t.Run("bare reject is still a usage error", func(t *testing.T) {
+		fake := &fakeControlPlane{}
+		dashboard := &fakeRunDashboard{interactive: false}
+		code, stdout, stderr := executeWithDashboardForTest(
+			t,
+			fake,
+			dashboard,
+			"repo-root",
+			"reject",
+			"run-h",
+		)
+		if code != 2 {
+			t.Fatalf("exit=%d want 2", code)
+		}
+		if stdout != "" {
+			t.Fatalf("a usage error wrote to stdout: %q", stdout)
+		}
+		if !strings.Contains(stderr, "exactly one of --response") {
+			t.Fatalf("stderr=%q", stderr)
+		}
+		if len(dashboard.calls) != 0 || len(fake.calls) != 0 {
+			t.Fatal("a rejected argv reached the dashboard or the controller")
 		}
 	})
 }

@@ -68,6 +68,17 @@ func renderLink(currentTheme theme, label, path string) string {
 		ansi.ResetHyperlink()
 }
 
+// renderMutedLink is renderLink for text that must stay de-emphasised: the label
+// keeps Muted rather than taking the link colour, and only the OSC8 target is added.
+func renderMutedLink(currentTheme theme, label, path string) string {
+	rendered := currentTheme.styles.Muted.Render(label)
+	if path == "" {
+		return rendered
+	}
+	target := url.URL{Scheme: "file", Path: path}
+	return ansi.SetHyperlink(target.String()) + rendered + ansi.ResetHyperlink()
+}
+
 // runDirectory is where this run keeps its state, artifacts and logs. It is derived
 // rather than carried on RunStatus: repoRoot and the run id are already in the model
 // and pipeline owns the same layout (pipeline/run.go).
@@ -762,11 +773,17 @@ func activityWaitingBody(current model, innerWidth int) string {
 		current.theme.styles.Muted.Render(" — waiting for the first line")
 	lines := []string{ansi.TruncateWc(headline, max(1, innerWidth), "…")}
 	if current.hasStatus && current.status.RunID != "" {
-		lines = append(lines, current.theme.styles.Muted.Render(ansi.TruncateWc(
+		// This row already names the path; make it the way there (T14 W9).
+		label := ansi.TruncateWc(
 			"  full log: .coterix/runs/"+current.status.RunID+"/logs/",
 			max(1, innerWidth),
 			"…",
-		)))
+		)
+		logs := ""
+		if dir := runDirectory(current); dir != "" {
+			logs = filepath.Join(dir, "logs")
+		}
+		lines = append(lines, renderMutedLink(current.theme, label, logs))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -916,6 +933,23 @@ func renderArtifactTabs(current model) string {
 		style := current.theme.styles.Muted
 		if tab == current.artifactTab {
 			style = current.theme.styles.TabActive
+		}
+		// The Plan tab is the run's plan.md, so it is also the way to the file
+		// (T14 W9 — the contract names plan.md explicitly).
+		if tab == tabPlan {
+			if dir := runDirectory(current); dir != "" {
+				target := url.URL{
+					Scheme: "file",
+					Path:   filepath.Join(dir, "plan.md"),
+				}
+				parts = append(
+					parts,
+					ansi.SetHyperlink(target.String())+
+						style.Render(label)+
+						ansi.ResetHyperlink(),
+				)
+				continue
+			}
 		}
 		parts = append(parts, style.Render(label))
 	}
@@ -1287,37 +1321,51 @@ func deriveStatusFields(status pipeline.RunStatus) sidebarData {
 }
 
 // renderProgressValue draws the task progress as a block bar *inside* the existing
-// progress row — the sidebar's row budget does not grow (T14 W7 · R2). The counts
-// come first: when the rail is too narrow for a bar, the bar is what goes, because
-// `round 3 · 2/5` still answers the question and a clipped bar does not.
+// progress row — the sidebar's row budget does not grow (T14 W7 · R2).
+//
+// The rail is a fixed 32 cells, which leaves this row 14 after its chrome. Spelling
+// out `round 3 · 1/4` uses 13 of them, so the bar was squeezed out of every real
+// dashboard while the tests, which called this at width 30, still saw one
+// (review T14d f1). The round is therefore abbreviated when that is what makes a bar
+// fit: the bar and N/M answer "how far along", and the round number is the piece that
+// can survive in short form.
 func renderProgressValue(
 	currentTheme theme,
 	data sidebarData,
 	innerWidth int,
 ) string {
-	// "▌ " + "progress: " is the row's chrome; whatever is left holds the counts and,
-	// only if there is still room, the bar.
+	// "▌ " + "progress: " is the row's chrome; the rest holds the counts and the bar.
 	const rowChrome = 2 + len("progress: ")
+	const minBarCells = 2
 	available := innerWidth - rowChrome
-	counts := fmt.Sprintf(
-		"round %d · %d/%d",
-		data.PlanRound,
-		data.Confirmed,
-		data.Total,
-	)
-	spare := available - ansi.StringWidth(counts) - 1
-	// No plan yet means no proportion to draw. The width guard is what keeps
-	// strings.Repeat from being handed a negative count; the sidebar rail is a fixed
-	// 32 cells, so it is a safety floor rather than a layout the user will meet.
-	if data.Total <= 0 || spare < 2 {
-		return currentTheme.styles.Value.Render(counts)
+
+	counts := fmt.Sprintf("%d/%d", data.Confirmed, data.Total)
+	// Most explicit first; the first form that still leaves room for a bar wins.
+	forms := []string{
+		fmt.Sprintf("%s · round %d", counts, data.PlanRound),
+		fmt.Sprintf("%s · r%d", counts, data.PlanRound),
 	}
-	cells := min(spare, 10)
+	text := forms[0]
+	cells := 0
+	for _, form := range forms {
+		if spare := available - ansi.StringWidth(form) - 1; spare >= minBarCells {
+			text = form
+			cells = min(spare, 10)
+			break
+		}
+	}
+	// No plan yet means no proportion to draw. The zero guard is also what keeps
+	// strings.Repeat from being handed a negative count.
+	if data.Total <= 0 || cells < minBarCells {
+		return currentTheme.styles.Value.Render(
+			ansi.TruncateWc(text, max(1, available), "…"),
+		)
+	}
 	filled := data.Confirmed * cells / data.Total
 	filled = min(max(filled, 0), cells)
 	bar := currentTheme.styles.PhaseSuccess.Render(strings.Repeat("■", filled)) +
 		currentTheme.styles.Muted.Render(strings.Repeat("□", cells-filled))
-	return bar + " " + currentTheme.styles.Value.Render(counts)
+	return bar + " " + currentTheme.styles.Value.Render(text)
 }
 
 func writeSidebarField(
@@ -1393,8 +1441,12 @@ func renderCompactHeader(current model, width, height int) string {
 	}
 	left := gradientText(current.theme, "COTERIX")
 	middle := phaseValue(current.theme, data.Phase)
-	right := current.theme.styles.Value.Render(
+	// compact folds the top bar away, so the run anchor lives here instead — the run
+	// directory has to be reachable in both layouts (T14 W9).
+	right := renderLink(
+		current.theme,
 		fmt.Sprintf("%s · %d/%d", task, data.Confirmed, data.Total),
+		runDirectory(current),
 	)
 	line := ansi.TruncateWc(
 		left+"  "+middle+"  "+right,
