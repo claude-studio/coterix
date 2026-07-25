@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -1347,5 +1348,93 @@ func assertRenderedHeight(t *testing.T, rendered string, height int) {
 			height,
 			ansi.Strip(rendered),
 		)
+	}
+}
+
+// The `?` overlay is the only overlay: `?` toggles it, `esc` closes it, and nothing
+// stacks on top (T14 W6).
+func TestHelpOverlayTogglesAndCoversTheContent(t *testing.T) {
+	current := populatedViewModel(t)
+	current.width = wideBreakpointWidth
+	current.height = wideBreakpointHeight
+
+	if strings.Contains(ansi.Strip(renderDashboard(current)), "KEYS") {
+		t.Fatal("the overlay is up before `?` was pressed")
+	}
+
+	updated, _ := current.Update(printableKey('?'))
+	current = updated.(model)
+	frame := ansi.Strip(renderDashboard(current))
+	for _, expected := range []string{"KEYS", "esc closes", "tab", "1 · 2 · 3"} {
+		if !strings.Contains(frame, expected) {
+			t.Fatalf("the overlay lacks %q:\n%s", expected, frame)
+		}
+	}
+	// It is drawn over the content, not beside it — the status bar stays visible.
+	if !strings.Contains(frame, "orchestration") {
+		t.Fatalf("the overlay replaced the whole frame:\n%s", frame)
+	}
+
+	// `?` again closes it, and so does `esc` — with no stack to unwind.
+	updated, _ = current.Update(printableKey('?'))
+	if updated.(model).helpOpen {
+		t.Fatal("`?` did not toggle the overlay closed")
+	}
+	updated, _ = current.Update(specialKey(tea.KeyEscape))
+	if updated.(model).helpOpen {
+		t.Fatal("esc did not close the overlay")
+	}
+}
+
+// The overlay and the status-bar hint line come from one table, so a key cannot be
+// advertised in one and missing from the other — and no key may be documented that
+// updateKey does not actually dispatch (T14 W6, the guard that caught `y`/`w` being
+// listed while they are still T13b work).
+func TestDocumentedKeysAreActuallyDispatched(t *testing.T) {
+	source, err := os.ReadFile("model.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch := string(source)
+
+	current := populatedViewModel(t)
+	current.status.Phase = state.PhaseAwaitingApproval
+	seen := 0
+	for _, group := range keyHelpGroups(current) {
+		for _, entry := range group.entries {
+			for _, token := range strings.Split(entry.keys, "·") {
+				token = strings.TrimSpace(token)
+				if token == "" {
+					continue
+				}
+				seen++
+				if !strings.Contains(dispatch, `"`+token+`"`) {
+					t.Fatalf(
+						"the overlay documents %q but no case in model.go handles it",
+						token,
+					)
+				}
+			}
+		}
+	}
+	if seen < 10 {
+		t.Fatalf("only %d keys were checked — the table looks truncated", seen)
+	}
+
+	// The hint line is a projection of the same table.
+	hints := keyHintLine(current)
+	for _, group := range keyHelpGroups(current) {
+		for _, entry := range group.entries {
+			if entry.short == "" {
+				continue
+			}
+			if !strings.Contains(hints, entry.short) {
+				t.Fatalf("hint line %q dropped %q", hints, entry.short)
+			}
+		}
+	}
+	if strings.Contains(hints, "a approve") == (current.status.Phase !=
+		state.PhaseAwaitingApproval) {
+		t.Fatalf("phase actions are not reflected in the hint line: %q", hints)
 	}
 }

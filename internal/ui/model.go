@@ -158,7 +158,10 @@ type model struct {
 	selectedEntry int
 	hasSelection  bool
 	entryExpanded bool
-	focus         mainBox
+	// helpOpen shows the key overlay (T14 W6). It is the only overlay — there is no
+	// dialog stack, so a bool is the whole state.
+	helpOpen bool
+	focus    mainBox
 	// boxScroll is each box's distance from its newest line. 0 means "follow the
 	// live edge". A paused box (>0) is nudged by preserveReading when content
 	// arrives, which keeps the same absolute lines on screen — without that the
@@ -429,7 +432,15 @@ func (current model) updateKey(
 				current.boxScroll[target]--
 			}
 		}
+	case "?":
+		current.helpOpen = !current.helpOpen
 	case "esc":
+		if current.helpOpen {
+			// The overlay is the only thing esc closes while it is up — there is no
+			// dialog stack to unwind (T14 W6).
+			current.helpOpen = false
+			break
+		}
 		// Drop the cursor and follow again (T14 W4).
 		current.clearSelection()
 	case "home":

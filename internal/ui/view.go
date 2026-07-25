@@ -70,7 +70,7 @@ func renderDashboard(current model) string {
 			contentHeight,
 		)
 		statusBar := renderStatusBar(current, width, statusHeight)
-		return composeUV(width, height, []uvRegion{
+		return composeUV(width, height, appendHelpOverlay(current, []uvRegion{
 			{
 				X:       0,
 				Y:       0,
@@ -99,7 +99,7 @@ func renderDashboard(current model) string {
 				Height:  statusHeight,
 				Content: statusBar,
 			},
-		})
+		}))
 	}
 
 	headerHeight := min(2, height)
@@ -107,7 +107,7 @@ func renderDashboard(current model) string {
 	header := renderCompactHeader(current, width, headerHeight)
 	main := renderMain(current, width, contentHeight)
 	statusBar := renderStatusBar(current, width, statusHeight)
-	return composeUV(width, height, []uvRegion{
+	return composeUV(width, height, appendHelpOverlay(current, []uvRegion{
 		{
 			X:       0,
 			Y:       0,
@@ -129,6 +129,26 @@ func renderDashboard(current model) string {
 			Height:  statusHeight,
 			Content: statusBar,
 		},
+	}))
+}
+
+// appendHelpOverlay puts the key overlay on top of everything else — composeUV draws
+// regions in order, so being last is what makes it an overlay rather than a pane
+// (T14 W6). It is centred over the content and leaves the status bar visible.
+func appendHelpOverlay(current model, regions []uvRegion) []uvRegion {
+	if !current.helpOpen {
+		return regions
+	}
+	width := max(1, current.width)
+	height := max(1, current.height)
+	cardWidth := min(max(24, width-8), 78)
+	cardHeight := min(max(6, height-6), 22)
+	return append(regions, uvRegion{
+		X:       max(0, (width-cardWidth)/2),
+		Y:       max(0, (height-cardHeight)/2),
+		Width:   cardWidth,
+		Height:  cardHeight,
+		Content: renderHelpOverlay(current, cardWidth, cardHeight),
 	})
 }
 
@@ -1370,20 +1390,9 @@ func renderStatusBar(current model, width, height int) string {
 
 	primary := statusSignal(current)
 	contentWidth := max(1, innerWidth-2)
-	hints := "j/k scroll · home/end · q quit"
-	if current.hasStatus {
-		switch current.status.Phase {
-		case state.PhaseAwaitingApproval:
-			hints = "a approve · r reject · " + hints
-		case state.PhasePausedForInput:
-			if current.status.PendingAction != nil &&
-				current.status.PendingAction.Kind == state.PendingAuth {
-				hints = "enter resume after login · " + hints
-			} else {
-				hints = "enter respond · " + hints
-			}
-		}
-	}
+	// The hint line is derived from the same table as the `?` overlay, so a key
+	// cannot be advertised in one and missing from the other (T14 W6).
+	hints := keyHintLine(current)
 	content := alignStatusLine(
 		primary,
 		current.theme.styles.Hint.Render(hints),
