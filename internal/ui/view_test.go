@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"image/color"
 	"os"
@@ -1949,9 +1950,35 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 			name: "task_cap pause",
 			seed: func(t *testing.T, currentRun *pipeline.Run, taskID string) {
 				t.Helper()
+				// This mirrors task_cycle.go: attempts are begun until BeginTaskAttempt
+				// reports the cap, and *that* is what pauses. Pausing at an arbitrary
+				// attempt count would be well-formed but not reachable.
+				var capErr *state.CapError
+				for attempt := 0; ; attempt++ {
+					err := currentRun.State.BeginTaskAttempt(
+						taskID,
+						currentRun.Config.MaxTaskAttempts,
+						nil,
+					)
+					if errors.As(err, &capErr) {
+						break
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					if attempt > currentRun.Config.MaxTaskAttempts+1 {
+						t.Fatal("the attempt cap was never reached")
+					}
+				}
 				if err := currentRun.State.PauseForTaskCap(
 					taskID,
-					"attempt cap reached",
+					fmt.Sprintf(
+						"Task %s attempt cap reached (%d >= %d). "+
+							"Respond with retry or abort.",
+						taskID,
+						capErr.Current,
+						capErr.Maximum,
+					),
 				); err != nil {
 					t.Fatal(err)
 				}
@@ -1960,8 +1987,15 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 		},
 		{
 			name: "failed with an error",
-			seed: func(t *testing.T, currentRun *pipeline.Run, _ string) {
+			seed: func(t *testing.T, currentRun *pipeline.Run, taskID string) {
 				t.Helper()
+				if err := currentRun.State.BeginTaskAttempt(
+					taskID,
+					currentRun.Config.MaxTaskAttempts,
+					nil,
+				); err != nil {
+					t.Fatal(err)
+				}
 				if err := currentRun.State.Fail(
 					"gate failed on the second attempt",
 				); err != nil {
@@ -2103,10 +2137,11 @@ func pressureModelFromRealRun(
 			t.Fatal(err)
 		}
 	}
-	// The task cycle owns these three fields directly, exactly as done here, and SaveState
-	// validates the result.
+	// BaseSHA and CandidateSHA are written as direct fields because that is exactly what
+	// the task cycle does (task_cycle.go:165, :264). Attempt is **not** written here: the
+	// cycle only ever moves it through State.BeginTaskAttempt, which enforces the cap, so
+	// each seed drives it through that API instead.
 	task := currentRun.State.Tasks[taskID]
-	task.Attempt = 2
 	task.BaseSHA = &baseSHA
 	task.CandidateSHA = &candidateSHA
 
