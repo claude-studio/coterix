@@ -360,3 +360,138 @@ func writeArtifactTestFile(t *testing.T, path string, content []byte) {
 		t.Fatal(err)
 	}
 }
+
+// The changed-files list reads untrusted git output, so the three shapes `--numstat`
+// actually produces are pinned here. Measured against real git (2026-07-25) rather than
+// assumed: a text change gives `adds\tdels\tpath`, a **binary** change gives `-\t-\tpath`,
+// and an **exact rename** gives `0\t0\told => new` — all three are three fields, so the
+// parser never mistakes a field for a path (T13 W5).
+func TestLoadChangedFilesParsesBinaryAndRenameShapes(t *testing.T) {
+	repoRoot := t.TempDir()
+	git := func(args ...string) string {
+		return artifactTestGit(t, repoRoot, args...)
+	}
+	git("init", "--quiet")
+	git("config", "user.name", "Coterix Test")
+	git("config", "user.email", "test@example.com")
+
+	writeArtifactTestFile(t, filepath.Join(repoRoot, "text.txt"), []byte("one\n"))
+	writeArtifactTestFile(
+		t,
+		filepath.Join(repoRoot, "moved.txt"),
+		[]byte(strings.Repeat("identical\n", 20)),
+	)
+	writeArtifactTestFile(
+		t,
+		filepath.Join(repoRoot, "blob.bin"),
+		[]byte{0, 1, 2, 3, 4, 5, 6, 7},
+	)
+	git("add", ".")
+	git("commit", "--quiet", "-m", "base")
+	baseSHA := git("rev-parse", "HEAD")
+
+	writeArtifactTestFile(t, filepath.Join(repoRoot, "text.txt"), []byte("one\ntwo\n"))
+	if err := os.Rename(
+		filepath.Join(repoRoot, "moved.txt"),
+		filepath.Join(repoRoot, "renamed.txt"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	writeArtifactTestFile(
+		t,
+		filepath.Join(repoRoot, "blob.bin"),
+		[]byte{7, 6, 5, 4, 3, 2, 1, 0},
+	)
+	git("add", "-A")
+	git("commit", "--quiet", "-m", "candidate")
+	candidateSHA := git("rev-parse", "HEAD")
+
+	files, err := loadChangedFiles(
+		context.Background(),
+		repoRoot,
+		&baseSHA,
+		&candidateSHA,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 3 {
+		t.Fatalf("changed files = %#v, want three entries", files)
+	}
+	byPath := make(map[string]changedFile, len(files))
+	for _, file := range files {
+		if file.Path == "" {
+			t.Fatalf("an entry has no path: %#v", files)
+		}
+		byPath[file.Path] = file
+	}
+	if got, ok := byPath["text.txt"]; !ok || got.Additions != 1 || got.Deletions != 0 {
+		t.Fatalf("text change = %#v", byPath)
+	}
+	// Binary counts are "-": the row survives with zero counts rather than being dropped.
+	if got, ok := byPath["blob.bin"]; !ok || got.Additions != 0 || got.Deletions != 0 {
+		t.Fatalf("binary change = %#v", byPath)
+	}
+	// The rename keeps git's own `old => new` rendering, which is what the operator wants
+	// to read; it must not be split into two bogus entries.
+	renamed := ""
+	for path := range byPath {
+		if strings.Contains(path, "=>") {
+			renamed = path
+		}
+	}
+	if renamed == "" ||
+		!strings.Contains(renamed, "moved.txt") ||
+		!strings.Contains(renamed, "renamed.txt") {
+		t.Fatalf("rename entry = %#v", byPath)
+	}
+}
+
+// Guards shared with the diff loader: no base/candidate, identical SHAs, or a malformed
+// object id must not reach git (T13 W5).
+func TestLoadChangedFilesRefusesUnsafeInput(t *testing.T) {
+	repoRoot := t.TempDir()
+	valid := strings.Repeat("a", 40)
+	other := strings.Repeat("b", 40)
+
+	for _, test := range []struct {
+		name      string
+		base      *string
+		candidate *string
+		wantErr   bool
+	}{
+		{name: "no base"},
+		{name: "no candidate", base: &valid},
+		{name: "identical", base: &valid, candidate: &valid},
+		{
+			name:      "malformed base",
+			base:      pointerTo("../../etc/passwd"),
+			candidate: &other,
+			wantErr:   true,
+		},
+		{
+			name:      "malformed candidate",
+			base:      &valid,
+			candidate: pointerTo("HEAD; rm -rf /"),
+			wantErr:   true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			files, err := loadChangedFiles(
+				context.Background(),
+				repoRoot,
+				test.base,
+				test.candidate,
+			)
+			if test.wantErr {
+				if err == nil {
+					t.Fatal("an invalid object id was accepted")
+				}
+				return
+			}
+			if err != nil || files != nil {
+				t.Fatalf("files=%#v err=%v, want no work done", files, err)
+			}
+		})
+	}
+}
