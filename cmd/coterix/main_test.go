@@ -5,12 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/ridenow/coterix/internal/cli"
 	"github.com/ridenow/coterix/internal/pipeline"
+	"github.com/ridenow/coterix/internal/runner"
 	"github.com/ridenow/coterix/internal/state"
 )
 
@@ -1367,4 +1371,128 @@ func TestControlCommandsWithoutATTYKeepTheHeadlessContract(t *testing.T) {
 			t.Fatal("a rejected argv reached the dashboard or the controller")
 		}
 	})
+}
+
+// The production adapter, not a fake: `charmDashboard.Browse` builds the read-only
+// controller and hands it to ui.Browse. Round-1's tests only exercised
+// `fakeRunDashboard.Browse`, so a regression in the adapter's own wiring — including the
+// controller it chooses — went unseen (review T16 f2).
+func TestCharmDashboardBrowseUsesTheReadOnlyController(t *testing.T) {
+	root := seedBrowseRepository(t)
+
+	for _, test := range []struct {
+		name  string
+		runID string
+		want  int
+	}{
+		{name: "no runs yet", runID: "", want: 0},
+		{name: "one run", runID: "browse-one", want: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.runID != "" {
+				seedBrowseRun(t, root, test.runID)
+			}
+			dashboard := charmDashboard{
+				executor: &countingBrowseExecutor{},
+				output:   io.Discard,
+				// Not interactive: ui.Browse loads and returns without a program, which is
+				// exactly the part of the adapter under test. A keyboard-driven browse is
+				// covered in internal/ui.
+				interactive: false,
+				width:       120,
+				height:      40,
+			}
+			status, command, err := dashboard.Browse(
+				context.Background(),
+				root,
+				test.runID,
+			)
+			if err != nil {
+				t.Fatalf("the production adapter failed: %v", err)
+			}
+			if command != "" {
+				t.Fatalf("a non-interactive browse returned the command %q", command)
+			}
+			if test.want == 0 {
+				if status.RunID != "" {
+					t.Fatalf("an empty runs directory produced %q", status.RunID)
+				}
+				return
+			}
+			if status.RunID != test.runID {
+				t.Fatalf("status=%q want %q", status.RunID, test.runID)
+			}
+		})
+	}
+}
+
+type countingBrowseExecutor struct{}
+
+func (countingBrowseExecutor) Run(
+	context.Context,
+	runner.RunRequest,
+) (runner.RunResult, error) {
+	// Browsing is read-only: reaching the executor at all would be the bug.
+	return runner.RunResult{}, errors.New("the browser must not run a subprocess")
+}
+
+func seedBrowseRepository(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	browseGit(t, root, "init", "-q")
+	if err := os.WriteFile(
+		filepath.Join(root, ".gitignore"),
+		[]byte(".coterix/runs/\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	browseGit(t, root, "add", ".")
+	browseGit(
+		t,
+		root,
+		"-c", "user.name=Coterix CLI Test",
+		"-c", "user.email=cli@example.invalid",
+		"commit", "-qm", "test: seed browse repository",
+	)
+	return root
+}
+
+func seedBrowseRun(t *testing.T, root string, runID string) {
+	t.Helper()
+	created, err := pipeline.CreateRun(root, runID, "Browse the run list.", cli.Config{
+		CLIs: map[string]cli.CliConfig{
+			"claude": {Command: "claude", Args: []string{}, Env: map[string]string{}},
+			"codex":  {Command: "codex", Args: []string{}, Env: map[string]string{}},
+		},
+		Roles: map[cli.Role]string{
+			cli.RolePlanWriter:   "claude",
+			cli.RolePlanReviewer: "codex",
+			cli.RolePlanReviser:  "claude",
+			cli.RoleImplWriter:   "codex",
+			cli.RoleImplReviewer: "claude",
+			cli.RoleFixer:        "codex",
+		},
+		IdleTimeoutSecs: 600,
+		MaxRetries:      1,
+		MaxPlanRounds:   5,
+		MaxTaskAttempts: 5,
+		GateCommand:     []string{"go", "test", "./..."},
+		GateCWD:         ".",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := created.SaveState(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func browseGit(t *testing.T, root string, args ...string) {
+	t.Helper()
+	command := exec.Command("git", args...)
+	command.Dir = root
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, output)
+	}
 }

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -252,5 +253,39 @@ func TestCLIForRoleRejectsUnknownRole(t *testing.T) {
 	}
 	if _, err := config.CLIForRole(Role("unknown")); err == nil {
 		t.Fatal("CLIForRole() accepted an unknown role")
+	}
+}
+
+// The versioned config is what an actual run uses, so the flags that make claude
+// stream have to be in it — documenting them in the spec was not enough, and their
+// absence is what made the activity tail silent for whole steps (review T13a-2 f1).
+// This test exists so that regression is caught by the gate rather than by a reviewer.
+func TestVersionedConfigEnablesClaudeStreaming(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", ".coterix", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := ParseConfig(raw)
+	if err != nil {
+		t.Fatalf("the versioned config does not parse: %v", err)
+	}
+	claude, ok := config.CLIs["claude"]
+	if !ok {
+		t.Fatalf("the versioned config has no claude entry: %#v", config.CLIs)
+	}
+	args := strings.Join(claude.Args, " ")
+	for _, flag := range []string{
+		"-p",
+		"--output-format stream-json",
+		"--verbose",
+	} {
+		if !strings.Contains(args, flag) {
+			t.Fatalf("claude args %q lack %q — the tail cannot stream without it",
+				args, flag)
+		}
+	}
+	// The prompt is appended as the final positional argument, so no flag may follow it.
+	if claude.Stdin {
+		t.Fatal("claude is configured to take the prompt on stdin; stream-json expects -p")
 	}
 }

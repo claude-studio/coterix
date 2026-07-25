@@ -2999,14 +2999,58 @@ func TestWrappedTailKeepsItsColumns(t *testing.T) {
 	}
 	// Continuations start under the message column, which is where the head row's own
 	// text starts.
-	messageColumn := strings.Index(rows[0], "wrapped")
+	// Cells, not bytes: the columns hold `·` and the text may hold CJK, so a byte
+	// offset would silently disagree with the screen (review T13a-2-r2 f2).
+	messageColumn := ansi.StringWidth(rows[0][:strings.Index(rows[0], "wrapped")])
 	if messageColumn <= 2 {
 		t.Fatalf("the message column looks wrong (%d): %q", messageColumn, rows[0])
 	}
 	for _, row := range rows[1:] {
-		if got := len(row) - len(strings.TrimLeft(row, " ")); got != messageColumn {
-			t.Fatalf("continuation starts at column %d, want %d: %q",
-				got, messageColumn, row)
+		indent := ansi.StringWidth(
+			row[:len(row)-len(strings.TrimLeft(row, " "))],
+		)
+		if indent != messageColumn {
+			t.Fatalf("continuation starts at cell %d, want %d: %q",
+				indent, messageColumn, row)
+		}
+	}
+}
+
+// The same alignment with wide runes in the columns and the message: a byte-offset
+// indent drifts here, a cell-measured one does not (review T13a-2-r2 f2).
+func TestWrappedTailAlignsWithWideRunes(t *testing.T) {
+	current := populatedViewModel(t)
+	line := runner.Line{
+		Attempt: 1,
+		Stream:  runner.StreamStdout,
+		Text:    strings.Repeat("한국어 진행 상황 텍스트 ", 8),
+	}
+	updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
+		Kind:  pipeline.EventStepLog,
+		RunID: "run-1",
+		Step:  pipeline.StepImplementation,
+		Role:  "impl_writer",
+		CLI:   "codex",
+		Line:  &line,
+	}})
+	current = updated.(model)
+	current.wrapTail = true
+
+	rows := strings.Split(ansi.Strip(activityBody(current, 80, 5)), "\n")
+	if len(rows) < 2 {
+		t.Fatalf("the wide-rune line did not wrap:\n%s", strings.Join(rows, "\n"))
+	}
+	at := strings.Index(rows[0], "한국어")
+	if at < 0 {
+		t.Fatalf("the head row lost its message: %q", rows[0])
+	}
+	want := ansi.StringWidth(rows[0][:at])
+	for _, row := range rows[1:] {
+		indent := ansi.StringWidth(
+			row[:len(row)-len(strings.TrimLeft(row, " "))],
+		)
+		if indent != want {
+			t.Fatalf("continuation starts at cell %d, want %d: %q", indent, want, row)
 		}
 	}
 }

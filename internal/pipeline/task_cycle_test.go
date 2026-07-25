@@ -125,6 +125,15 @@ func TestTaskCycleHelperProcess(t *testing.T) {
 			_, _ = fmt.Fprintln(os.Stderr, "Not logged in")
 			os.Exit(17)
 		}
+		if scenario == "review-auth-stdout" {
+			// stream-json shape: the marker is in stdout and stderr stays empty. This
+			// pins that task_evidence's call site passes the stdout log, independently of
+			// plan_cycle (review T13a-2-r2 f3).
+			_, _ = fmt.Fprintln(os.Stdout,
+				`{"type":"result","subtype":"success","is_error":true,`+
+					`"error":"authentication_failed"}`)
+			os.Exit(17)
+		}
 		if scenario == "review-head-drift" && count == 1 {
 			taskCycleHelperWrite(
 				filepath.Join(repoRoot, "tracked.txt"),
@@ -168,6 +177,7 @@ func TestTaskCycleHelperProcess(t *testing.T) {
 		case "review-dirty-repair",
 			"review-dirty-cap",
 			"fixer-auth-once",
+			"fixer-auth-stdout",
 			"fixer-no-commit",
 			"fixer-dirty":
 			if count == 1 {
@@ -215,6 +225,14 @@ func TestTaskCycleHelperProcess(t *testing.T) {
 			_, _ = fmt.Fprintln(os.Stderr, "API key auth is missing a key")
 			os.Exit(17)
 		}
+		if scenario == "fixer-auth-stdout" && count == 1 {
+			// Same shape on the mutation call site (task_cycle.go), which is a separate
+			// ClassifyFailure caller (review T13a-2-r2 f3).
+			_, _ = fmt.Fprintln(os.Stdout,
+				`{"type":"result","subtype":"success","is_error":true,`+
+					`"error":"authentication_failed"}`)
+			os.Exit(17)
+		}
 		if scenario == "fixer-no-commit" {
 			return
 		}
@@ -230,6 +248,7 @@ func TestTaskCycleHelperProcess(t *testing.T) {
 		if (scenario == "review-dirty-repair" ||
 			scenario == "review-dirty-cap" ||
 			scenario == "fixer-auth-once" ||
+			scenario == "fixer-auth-stdout" ||
 			scenario == "fixer-no-commit" ||
 			scenario == "fixer-dirty") &&
 			!strings.Contains(promptText, "candidate is incomplete") {
@@ -287,8 +306,10 @@ func TestTaskCycleHelperProcess(t *testing.T) {
 		"review-malformed",
 		"review-missing",
 		"review-auth",
+		"review-auth-stdout",
 		"review-head-drift",
 		"fixer-auth-once",
+		"fixer-auth-stdout",
 		"fixer-no-commit",
 		"fixer-dirty":
 		taskCycleHelperWrite(
@@ -626,6 +647,26 @@ func TestTaskCycleReviewerAndFixerAuthPause(t *testing.T) {
 		taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "gate.count"), 1)
 		taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "review.count"), 4)
 		taskCycleAssertCount(t, filepath.Join(fixture.run.Dir, "fix.count"), 0)
+	})
+
+	// The stdout-only shape on both independent call sites: task_evidence (review) and
+	// task_cycle (mutation). plan_cycle alone did not cover them (review T13a-2-r2 f3).
+	t.Run("reviewer auth from stdout only", func(t *testing.T) {
+		fixture := newTaskCycleTestRun(t, "review-auth-stdout")
+		if err := executeTaskCycle(t, fixture.run); err != nil {
+			t.Fatalf("TaskCycle.Run() reviewer stdout auth error = %v", err)
+		}
+		reloaded := controlOpenRun(t, fixture.run.RepoRoot, fixture.run.ID)
+		taskCycleAssertImplementingAuthPause(t, reloaded)
+	})
+
+	t.Run("fixer auth from stdout only", func(t *testing.T) {
+		fixture := newTaskCycleTestRun(t, "fixer-auth-stdout")
+		if err := executeTaskCycle(t, fixture.run); err != nil {
+			t.Fatalf("TaskCycle.Run() fixer stdout auth error = %v", err)
+		}
+		paused := controlOpenRun(t, fixture.run.RepoRoot, fixture.run.ID)
+		taskCycleAssertImplementingAuthPause(t, paused)
 	})
 
 	t.Run("fixer auth resumes through writer route", func(t *testing.T) {

@@ -529,8 +529,14 @@ func wrapTailLine(current model, line logEntry, innerWidth int) []string {
 	// second measurement: the two can disagree by a cell or two, and then the
 	// continuations sit just off the message column.
 	column := prefixWidth
-	if at := strings.Index(ansi.Strip(headRow), fragments[0]); at >= 0 {
-		column = at
+	if plain := ansi.Strip(headRow); true {
+		// strings.Index is a *byte* offset; the columns hold `·` and CJK, so using it as
+		// a cell count put the continuation two cells off. Measure the cells before the
+		// fragment instead — the same len()-vs-StringWidth trap that broke the prompt in
+		// T13a-1 (review T13a-2-r2 f2).
+		if at := strings.Index(plain, fragments[0]); at >= 0 {
+			column = ansi.StringWidth(plain[:at])
+		}
 	}
 
 	rows := []string{headRow}

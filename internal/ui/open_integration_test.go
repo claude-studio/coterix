@@ -3,6 +3,8 @@ package ui
 import (
 	"context"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -404,6 +406,18 @@ func TestOpenPromptPathsRunThroughTheRealProgram(t *testing.T) {
 		taskID := "T1"
 		currentRun.State.CurrentTaskID = &taskID
 		currentRun.State.ApprovedPlanHash = currentRun.State.PlanHash
+		// "frozen" means the plan file is read-only (control.go's VerifyApprovedPlan
+		// checks the mode bits). Approve does that; a hand-seeded run has to as well, or
+		// the resume fails before the value under test is ever used.
+		if err := os.Chmod(
+			filepath.Join(currentRun.Dir, "plan.md"),
+			0o444,
+		); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = os.Chmod(filepath.Join(currentRun.Dir, "plan.md"), 0o600)
+		})
 		// task_cap only exists while implementing, so the run has to get there first.
 		for _, phase := range []state.Phase{
 			state.PhaseAwaitingApproval,
@@ -464,7 +478,21 @@ func TestOpenPromptPathsRunThroughTheRealProgram(t *testing.T) {
 		if _, err := keyboard.Write([]byte("\r")); err != nil {
 			t.Fatal(err)
 		}
-		waitForFrame(t, output, "response sent")
+		// `response sent` only says an operation started — it cannot tell `retry` from a
+		// wrong answer (review T15-r4 f2a). `retry` is the answer that makes the task
+		// cycle run another attempt, so the witness is the mutating subprocess it starts;
+		// `abort` would end the run instead and never reach the executor.
+		deadline := time.Now().Add(10 * time.Second)
+		for executor.mutating() == 0 && time.Now().Before(deadline) {
+			time.Sleep(20 * time.Millisecond)
+		}
+		if executor.mutating() == 0 {
+			t.Fatalf("retry did not start another attempt:\n%s", output.String())
+		}
+		persisted := openIntegrationRun(t, repoRoot, currentRun.ID)
+		if persisted.State.Phase == state.PhaseFailed {
+			t.Fatal("the run aborted — the submitted answer was not retry")
+		}
 	})
 }
 
