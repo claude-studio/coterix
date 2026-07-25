@@ -11,6 +11,7 @@ import (
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
+	"github.com/ridenow/coterix/internal/cli"
 	"github.com/ridenow/coterix/internal/pipeline"
 	"github.com/ridenow/coterix/internal/runner"
 	"github.com/ridenow/coterix/internal/state"
@@ -358,14 +359,30 @@ func (current model) updatePipelineEvent(
 		if event.Line != nil {
 			// Subprocess lines feed the pinned tail only — never the
 			// scrolling lifecycle history (plan T13 W2).
-			current.appendActivity(logEntry{
+			//
+			// Under `--output-format stream-json` most of what claude prints is
+			// session bookkeeping: a one-word answer produced 10 lines of which 7 were
+			// `system/*` or `rate_limit_event` (measured, T13a-2). The decoder drops
+			// those and summarises the rest to one row; a non-JSON line passes through
+			// untouched, so codex and plain-text mode are unaffected.
+			decoded, ok := cli.DecodeStreamLine(event.Line.Text)
+			if !ok {
+				break
+			}
+			entry := logEntry{
 				Step:    event.Step,
 				Role:    event.Role,
 				CLI:     event.CLI,
 				Stream:  event.Line.Stream,
-				Text:    event.Line.Text,
+				Text:    decoded.Text,
 				Attempt: event.Line.Attempt,
-			})
+			}
+			if decoded.Failed {
+				// Severity comes from the payload's own is_error, not from which
+				// stream carried it (T13 R5 · T13a-2).
+				entry.Icon = logIconFail
+			}
+			current.appendActivity(entry)
 		}
 	case pipeline.EventAttemptFinished:
 		if eventFailed(event) {

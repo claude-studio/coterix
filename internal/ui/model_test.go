@@ -2505,3 +2505,79 @@ func TestAcknowledgementNeverSharesTheStatusBarWithAPrompt(t *testing.T) {
 		t.Fatalf("submitting was not acknowledged once the prompt closed:\n%s", frame)
 	}
 }
+
+// T13a-2 wiring: the tail shows what the step is doing, not the CLI's session
+// bookkeeping. This goes through the real event path with the real captured stream,
+// so a decoder that stops being called is caught here and not only in cli's tests.
+func TestActivityTailDecodesStreamJSONFromTheRealCapture(t *testing.T) {
+	raw, err := os.ReadFile("../cli/testdata/claude-stream-json.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := populatedViewModel(t)
+	for _, text := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		line := runner.Line{
+			Attempt: 1,
+			Stream:  runner.StreamStdout,
+			Text:    text,
+		}
+		updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
+			Kind:  pipeline.EventStepLog,
+			RunID: "run-1",
+			Step:  pipeline.StepPlan,
+			Role:  "plan_writer",
+			CLI:   "claude",
+			Line:  &line,
+		}})
+		current = updated.(model)
+	}
+
+	if len(current.activity) != 2 {
+		t.Fatalf("tail kept %d of 10 lines, want 2:\n%#v",
+			len(current.activity), current.activity)
+	}
+	rendered := ansi.Strip(renderActivityTail(current, 120, activityTailLimit(current)))
+	for _, leaked := range []string{"hook", "rate_limit", "\"type\""} {
+		if strings.Contains(strings.ToLower(rendered), leaked) {
+			t.Fatalf("bookkeeping reached the tail (%q):\n%s", leaked, rendered)
+		}
+	}
+	if !strings.Contains(rendered, "OK") {
+		t.Fatalf("the assistant's answer never reached the tail:\n%s", rendered)
+	}
+}
+
+// Severity comes from the payload, not the stream: codex writes progress to stderr
+// and claude reports failures inside a stdout envelope (T13 R5 · T13a-2).
+func TestActivityTailMarksFailureFromThePayloadNotTheStream(t *testing.T) {
+	current := populatedViewModel(t)
+	feed := func(from model, stream runner.Stream, text string) model {
+		line := runner.Line{Attempt: 1, Stream: stream, Text: text}
+		updated, _ := from.Update(pipelineEventMsg{Event: pipeline.Event{
+			Kind:  pipeline.EventStepLog,
+			RunID: "run-1",
+			Step:  pipeline.StepPlan,
+			Role:  "plan_writer",
+			CLI:   "claude",
+			Line:  &line,
+		}})
+		return updated.(model)
+	}
+
+	// A failure envelope on *stdout* must be marked.
+	current = feed(current, runner.StreamStdout,
+		`{"type":"result","subtype":"success","is_error":true,"result":"boom"}`)
+	if len(current.activity) != 1 || current.activity[0].Icon != logIconFail {
+		t.Fatalf("a stdout failure envelope was not marked: %#v", current.activity)
+	}
+
+	// Ordinary progress on *stderr* must not be.
+	current = feed(current, runner.StreamStderr, "compiling internal/ui")
+	last := current.activity[len(current.activity)-1]
+	if last.Icon == logIconFail {
+		t.Fatalf("stderr progress was marked as a failure: %#v", last)
+	}
+	if last.Text != "compiling internal/ui" {
+		t.Fatalf("a non-JSON line was not passed through: %q", last.Text)
+	}
+}
