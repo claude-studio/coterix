@@ -2164,17 +2164,21 @@ func pressureModelFromRealRun(
 	currentRun.State.Tasks = map[string]*state.TaskState{
 		taskID: {Status: state.TaskOpen},
 	}
-	// planning -> awaiting_approval -> implementing is the only route the phase table
-	// allows, and open -> candidate -> repairing the only route to a repairing task
-	// (state/transition.go). Driving both through the real API is what makes this state
+	// The route taken here is planning -> awaiting_approval -> implementing. The phase table
+	// also permits paused_for_input -> implementing (state/transition.go:306-319), but that
+	// edge is only ever taken by ResumePending for a task_cap retry or an auth resume
+	// (:242, :246) — both of which require implementing to have been reached already — so the
+	// **first** entry into implementing is necessarily this one. open -> candidate ->
+	// repairing is genuinely the only route to a repairing task, since repairing is reachable
+	// from candidate alone. Driving both through the real API is what makes this state
 	// reachable rather than merely well-formed.
 	if err := currentRun.State.TransitionPhase(
 		state.PhaseAwaitingApproval,
 	); err != nil {
 		t.Fatal(err)
 	}
-	// implementing is reached only through controller.Approve, which freezes plan.md,
-	// copies PlanHash into ApprovedPlanHash and re-verifies it before transitioning
+	// That first entry goes through controller.Approve, which freezes plan.md, copies
+	// PlanHash into ApprovedPlanHash and re-verifies it before transitioning
 	// (control.go:145-170). Skipping that left `implementing` with no approved plan hash
 	// and a writable plan — a state the pipeline cannot produce. The exported
 	// VerifyApprovedPlan is called here to prove the seeded run satisfies the real
