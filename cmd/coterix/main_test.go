@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/charmbracelet/x/ansi"
 	"github.com/ridenow/coterix/internal/pipeline"
 	"github.com/ridenow/coterix/internal/state"
 )
@@ -33,6 +32,9 @@ type fakeControlPlane struct {
 
 type fakeRunDashboard struct {
 	calls            []controlCall
+	browseStatus     pipeline.RunStatus
+	browseCommand    string
+	browseErr        error
 	status           pipeline.RunStatus
 	err              error
 	interactive      bool
@@ -58,6 +60,19 @@ func copyResponseForTest(response *string) *string {
 	}
 	copied := *response
 	return &copied
+}
+
+func (fake *fakeRunDashboard) Browse(
+	_ context.Context,
+	repoRoot string,
+	runID string,
+) (pipeline.RunStatus, string, error) {
+	fake.calls = append(fake.calls, controlCall{
+		command:  "browse",
+		repoRoot: repoRoot,
+		runID:    runID,
+	})
+	return fake.browseStatus, fake.browseCommand, fake.browseErr
 }
 
 func (fake *fakeRunDashboard) Open(
@@ -870,84 +885,97 @@ func TestExecuteControlCommandsPreserveExactHeadlessJSON(t *testing.T) {
 	}
 }
 
-// Only `status` still renders a one-shot snapshot on a TTY: approve/reject/resume now
-// open the live dashboard, because they run for minutes and used to print nothing at
-// all until they finished (T15 W2). Their entry is covered separately.
-func TestExecuteStatusRendersInteractiveSnapshots(t *testing.T) {
-	status := pipeline.RunStatus{
-		RunID: "run-tty",
-		Phase: state.PhaseDone,
-	}
-	tests := []struct {
-		name        string
-		args        []string
-		wantCall    controlCall
-		wantTable   bool
-		wantDetails bool
+// TTY `status` browses instead of printing one snapshot: bare `status` opens the
+// picker, `status <id>` the detail, and an action chosen there hands off to the live
+// dashboard (T16 W3). Headless `status` keeps its JSON — see
+// TestExecuteControlCommandsPreserveExactHeadlessJSON.
+func TestExecuteStatusEntersTheBrowserOnATTY(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		args      []string
+		wantRunID string
 	}{
+		{name: "bare status opens the picker", args: []string{"status"}},
 		{
-			name: "bare status table with one run",
-			args: []string{"status"},
-			wantCall: controlCall{
-				command:  "status",
-				repoRoot: "repo-root",
-			},
-			wantTable: true,
+			name:      "status with an id opens the detail",
+			args:      []string{"status", "run-tty"},
+			wantRunID: "run-tty",
 		},
-		{
-			name: "status id detail",
-			args: []string{"status", "run-tty"},
-			wantCall: controlCall{
-				command:  "status",
-				repoRoot: "repo-root",
-				runID:    "run-tty",
-			},
-			wantDetails: true,
-		},
-	}
-	for _, test := range tests {
+	} {
 		t.Run(test.name, func(t *testing.T) {
-			fake := &fakeControlPlane{
-				status:       status,
-				statuses:     []pipeline.RunStatus{status},
-				resumeResult: status,
-			}
+			fake := &fakeControlPlane{}
 			dashboard := &fakeRunDashboard{interactive: true}
-			code, stdout, stderr := executeWithDashboardForTest(
+			code, _, stderr := executeWithDashboardForTest(
 				t,
 				fake,
 				dashboard,
 				"repo-root",
 				test.args...,
 			)
-			if code != 0 || stderr != "" || stdout == "" {
-				t.Fatalf(
-					"execute() code=%d stdout=%q stderr=%q",
-					code,
-					stdout,
-					stderr,
-				)
+			if code != 0 || stderr != "" {
+				t.Fatalf("execute() code=%d stderr=%q", code, stderr)
 			}
-			if json.Valid([]byte(stdout)) {
-				t.Fatalf("interactive output remained JSON: %q", stdout)
+			if len(dashboard.calls) != 1 ||
+				dashboard.calls[0].command != "browse" ||
+				dashboard.calls[0].runID != test.wantRunID {
+				t.Fatalf("dashboard calls=%#v", dashboard.calls)
 			}
-			plain := ansi.Strip(stdout)
-			if !strings.Contains(plain, "██████") {
-				t.Fatalf("snapshot lacks block banner:\n%s", plain)
-			}
-			if test.wantTable && (!strings.Contains(plain, "run_id") ||
-				strings.Contains(plain, "╱╱╱ RUN")) {
-				t.Fatalf("bare status did not render a table:\n%s", plain)
-			}
-			if test.wantDetails && !strings.Contains(plain, "╱╱╱ RUN") {
-				t.Fatalf("control result did not render details:\n%s", plain)
-			}
-			assertSingleCall(t, fake, test.wantCall)
-			if len(dashboard.calls) != 0 {
-				t.Fatalf("control command reached dashboard.Run: %#v", dashboard.calls)
+			if len(fake.calls) != 0 {
+				t.Fatalf("status also called the controller: %#v", fake.calls)
 			}
 		})
 	}
+
+	// An action chosen in the browser is executed by the dashboard, not by the
+	// browser: two calls, browse then the operation.
+	t.Run("a chosen action hands off to the dashboard", func(t *testing.T) {
+		fake := &fakeControlPlane{}
+		dashboard := &fakeRunDashboard{
+			interactive:   true,
+			browseStatus:  pipeline.RunStatus{RunID: "run-picked"},
+			browseCommand: "approve",
+		}
+		code, _, stderr := executeWithDashboardForTest(
+			t,
+			fake,
+			dashboard,
+			"repo-root",
+			"status",
+		)
+		if code != 0 || stderr != "" {
+			t.Fatalf("execute() code=%d stderr=%q", code, stderr)
+		}
+		if len(dashboard.calls) != 2 {
+			t.Fatalf("expected browse then the operation: %#v", dashboard.calls)
+		}
+		if dashboard.calls[1].command != "approve" ||
+			dashboard.calls[1].runID != "run-picked" {
+			t.Fatalf("hand-off call=%#v", dashboard.calls[1])
+		}
+	})
+
+	// Quitting the browser without choosing anything must not start an operation.
+	t.Run("quitting the browser starts nothing", func(t *testing.T) {
+		fake := &fakeControlPlane{}
+		dashboard := &fakeRunDashboard{
+			interactive:  true,
+			browseStatus: pipeline.RunStatus{RunID: "run-seen"},
+		}
+		code, _, stderr := executeWithDashboardForTest(
+			t,
+			fake,
+			dashboard,
+			"repo-root",
+			"status",
+			"run-seen",
+		)
+		if code != 0 || stderr != "" {
+			t.Fatalf("execute() code=%d stderr=%q", code, stderr)
+		}
+		if len(dashboard.calls) != 1 {
+			t.Fatalf("quitting started an operation: %#v", dashboard.calls)
+		}
+	})
 }
 
 func TestExecuteInteractiveControlErrorsAreNotIntercepted(t *testing.T) {

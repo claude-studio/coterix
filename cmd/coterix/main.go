@@ -68,6 +68,14 @@ type runDashboard interface {
 		command string,
 		response *string,
 	) (pipeline.RunStatus, error)
+	// Browse shows an existing run, or the list of them, read-only. It returns the
+	// control command the operator chose there — the browser mutates nothing itself,
+	// it hands off to Open (T16 W3).
+	Browse(
+		ctx context.Context,
+		repoRoot string,
+		runID string,
+	) (pipeline.RunStatus, string, error)
 	Interactive() bool
 }
 
@@ -78,6 +86,29 @@ type charmDashboard struct {
 	interactive bool
 	width       int
 	height      int
+}
+
+func (dashboard charmDashboard) Browse(
+	ctx context.Context,
+	repoRoot string,
+	runID string,
+) (pipeline.RunStatus, string, error) {
+	// Read-only browsing uses an observer-less controller on purpose: Status calls
+	// observeRun for every run it reads, and an observing controller would push N
+	// snapshots into a model built to show one (T16 W1/W2).
+	return ui.Browse(
+		ctx,
+		pipeline.NewController(dashboard.executor),
+		repoRoot,
+		runID,
+		ui.RunOptions{
+			Input:       dashboard.input,
+			Output:      dashboard.output,
+			Interactive: dashboard.interactive,
+			Width:       dashboard.width,
+			Height:      dashboard.height,
+		},
+	)
 }
 
 func (dashboard charmDashboard) Open(
@@ -232,10 +263,37 @@ func execute(
 			result, err = dashboards[0].Run(ctx, repoRoot, request)
 			interactive = dashboards[0].Interactive()
 		}
+	// On a TTY `status` browses instead of printing one snapshot: a picker when no run
+	// id was given, a detail when one was, and a/r/e hand off to the live dashboard
+	// (T16 W3). Headless it keeps the exact JSON it always had.
+	case len(dashboards) > 0 && len(args) > 0 && args[0] == "status" &&
+		dashboards[0].Interactive():
+		runID, parseErr := parseStatusArguments(args[1:])
+		if parseErr != nil {
+			err = parseErr
+			break
+		}
+		var chosen string
+		result, chosen, err = dashboards[0].Browse(ctx, repoRoot, runID)
+		interactive = true
+		if err == nil && chosen != "" {
+			// The browser is read-only; the action it chose runs in the dashboard.
+			status, statusOK := result.(pipeline.RunStatus)
+			if !statusOK {
+				err = fmt.Errorf("coterix: browser returned %T", result)
+				break
+			}
+			result, err = dashboards[0].Open(
+				ctx,
+				repoRoot,
+				status.RunID,
+				chosen,
+				nil,
+			)
+		}
 	// approve/reject/resume run for minutes and used to print nothing until they
 	// finished, then a single snapshot. On a TTY they now open the live dashboard
-	// (T15 W2). Headless they keep the exact JSON and exit codes they always had, and
-	// `status` keeps its one-shot snapshot either way.
+	// (T15 W2). Headless they keep the exact JSON and exit codes they always had.
 	case len(dashboards) > 0 && len(args) > 0 &&
 		dashboards[0].Interactive() && isInteractiveControlCommand(args[0]):
 		runID, response, parseErr := parseControlEntry(args)
