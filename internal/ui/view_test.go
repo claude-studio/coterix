@@ -2419,10 +2419,17 @@ func pressureFileBody(index, attempt, attempts int) string {
 //     unexported, so this check can fall behind it;
 //   - both gate logs exist as regular files at clean run-relative paths.
 //
-// Verified exhaustively rather than claimed: removing any one of the gate document's seven
-// fields, any one of the review document's six, or any one of the finding's five makes this
-// test fail — all 18 checked one at a time. That sweep is what b11 f1 showed was missing when
-// the same guarantee was only asserted in prose.
+// Verified by mutation rather than claimed, each one on its own, across four classes:
+// removing any single field of the gate document, the review document or the finding; adding
+// an unknown field to either document; giving a log an unsafe path shape ("../outside.log",
+// "./logs/x.log", "/abs/x.log", "..", "."); and breaking a value's shape (a location with no
+// colon, a severity outside critical|major|minor, a log path naming a directory). Every one
+// fails the test.
+//
+// The sweep exists because prose did not survive review: b11 f1 found that the assertions did
+// not cover what the deleted prose claimed, and b12 f1 found the log-path rule accepting an
+// escape production rejects. Both were caught by mutating, not by reading — so mutate when
+// extending this fixture.
 func writePressureEvidence(
 	t *testing.T,
 	currentRun *pipeline.Run,
