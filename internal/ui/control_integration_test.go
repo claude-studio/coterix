@@ -83,12 +83,15 @@ func TestModelActionsDrivePersistedPipelineControllerTransitions(t *testing.T) {
 		})
 		current := integrationModel(t, ctx, cancel, controller, root, currentRun.ID)
 
-		updated, command := current.Update(printableKey('a'))
+		// `a` arms the confirmation, `enter` commits it (T14 W5).
+		updated, _ := current.Update(printableKey('a'))
+		current = updated.(model)
+		updated, command := current.Update(specialKey(tea.KeyEnter))
 		current = updated.(model)
 		if command == nil || current.operation != operationApprove {
 			cancel()
 			executor.stop()
-			t.Fatal("approve key did not start the UI approve operation")
+			t.Fatal("approve confirmation did not start the UI approve operation")
 		}
 		done := runIntegrationCommand(command)
 		request := waitForIntegrationExecutor(t, executor)

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
@@ -403,109 +404,139 @@ func TestMainHeaderNamesActiveStepAndIdleState(t *testing.T) {
 	)
 }
 
-// The response the user types must render as text. `len(label)` counts bytes
-// while the truncation budget is measured in cells, so a label containing `·`
-// (3 bytes, 1 cell) plus a wide-rune response over-truncated the input to
-// nothing (live-smoke finding, 2026-07-25).
-func TestPromptRendersWideRuneResponse(t *testing.T) {
-	current := populatedViewModel(t)
-	current.prompt = promptResume
-	current.status.PendingAction = &state.PendingAction{
-		Kind:   state.PendingPlanQuestion,
-		Prompt: "질문",
-	}
-	current.promptValue = "한국어 답변입니다"
-
-	rendered := ansi.Strip(renderStatusBar(current, 120, 4))
-	if !strings.Contains(rendered, "한국어 답변입니다") {
-		t.Fatalf("prompt dropped the typed response:\n%s", rendered)
-	}
-
-	// An ASCII response is equally affected — the defect was never about runes.
-	current.promptValue = "retry please"
-	if rendered = ansi.Strip(
-		renderStatusBar(current, 120, 4),
-	); !strings.Contains(rendered, "retry please") {
-		t.Fatalf("prompt dropped an ASCII response:\n%s", rendered)
-	}
-
-	// Overflow keeps the tail (what is being typed) and marks the cut.
-	current.promptValue = strings.Repeat("a", 40) + "TAIL"
-	rendered = ansi.Strip(renderStatusBar(current, 40, 4))
-	if !strings.Contains(rendered, "TAIL") {
-		t.Fatalf("overflowing prompt lost its tail:\n%s", rendered)
-	}
-	if !strings.Contains(rendered, "…") {
-		t.Fatalf("overflowing prompt did not mark the cut:\n%s", rendered)
-	}
-}
-
-// The prompt shares one row with its label, the Input border and the cursor, and
-// the whole thing lives in a 4-row region. If any of that chrome is left out of
-// the width budget the Input box wraps and the `enter confirm` footer is pushed
-// out of the region (review T13a-1-followup f1).
-func TestPromptStaysWithinItsRegionAtWidthBoundaries(t *testing.T) {
-	const (
-		width  = 120
-		height = 4
-	)
-	innerWidth := width - 2
-	label := "Response · plan_question"
-	// StatusBar padding 2 + ": " 2 + Input border 2 + cursor 1.
-	budget := innerWidth - ansi.StringWidth(label) - 7
-
-	base := populatedViewModel(t)
-	base.prompt = promptResume
-	base.status.PendingAction = &state.PendingAction{
-		Kind:   state.PendingPlanQuestion,
-		Prompt: "질문",
-	}
-
+// The typed response must actually appear. The original defect was a misused
+// TruncateLeftWc that erased every response shorter than the budget; the editor
+// replaced that path, so the guard now runs through the real key/paste route
+// (live-smoke finding, 2026-07-25 · T14 W5).
+func TestPromptRendersTypedResponse(t *testing.T) {
 	for _, promptCase := range []struct {
 		name  string
 		value string
 	}{
-		{"exactly at budget", strings.Repeat("a", budget)},
-		{"one cell over budget", strings.Repeat("a", budget+1)},
-		{"wide runes over budget", strings.Repeat("가", budget/2+1)},
+		{"wide runes", "한국어 답변입니다"},
+		{"ascii", "retry please"},
+		{"long enough to scroll", strings.Repeat("a", 40) + "TAIL"},
 	} {
 		t.Run(promptCase.name, func(t *testing.T) {
-			candidate := base
-			candidate.promptValue = promptCase.value
-			plain := ansi.Strip(renderStatusBar(candidate, width, height))
+			current := populatedViewModel(t)
+			current.status.Phase = state.PhasePausedForInput
+			current.status.PendingAction = &state.PendingAction{
+				Kind:   state.PendingPlanQuestion,
+				Prompt: "질문",
+			}
+			updated, _ := current.Update(specialKey(tea.KeyEnter))
+			current = updated.(model)
+			if !current.usesTextarea() {
+				t.Fatal("a free-text response did not open the editor")
+			}
+			updated, _ = current.Update(tea.PasteMsg{Content: promptCase.value})
+			current = updated.(model)
 
-			if !strings.Contains(plain, "▌") {
-				t.Fatalf("cursor is missing:\n%s", plain)
+			if got := current.promptResponse(); got != promptCase.value {
+				t.Fatalf("editor holds %q, want %q", got, promptCase.value)
 			}
-			if !strings.Contains(plain, "enter confirm") {
-				t.Fatalf("footer was pushed out of the region:\n%s", plain)
+			plain := ansi.Strip(renderStatusBar(current, 120, promptRowsArea))
+			// The editor may scroll a long value, so assert on its tail — the part
+			// being typed — rather than the whole string.
+			tail := promptCase.value
+			if len(tail) > 12 {
+				tail = tail[len(tail)-4:]
 			}
-			lines := strings.Split(plain, "\n")
-			if len(lines) > height {
-				t.Fatalf(
-					"prompt used %d rows, region is %d:\n%s",
-					len(lines),
-					height,
-					plain,
+			if !strings.Contains(plain, tail) {
+				t.Fatalf("prompt dropped the typed response %q:\n%s", tail, plain)
+			}
+			if !strings.Contains(plain, "ctrl+j newline") {
+				t.Fatalf("the editor does not advertise its newline key:\n%s", plain)
+			}
+		})
+	}
+}
+
+// Every prompt kind has to fit inside the region it asks for: too much chrome and
+// the input wraps, pushing the footer out of view (review T13a-1-followup f1). The
+// editor asks for more rows than the pick does, so each kind is measured against
+// its own budget (T14 W5).
+func TestEveryPromptKindStaysWithinItsRegion(t *testing.T) {
+	base := populatedViewModel(t)
+	base.status.Phase = state.PhaseAwaitingApproval
+
+	textPrompt := base
+	textPrompt.status.Phase = state.PhasePausedForInput
+	textPrompt.status.PendingAction = &state.PendingAction{
+		Kind:   state.PendingPlanQuestion,
+		Prompt: "질문",
+	}
+	updated, _ := textPrompt.Update(specialKey(tea.KeyEnter))
+	textPrompt = updated.(model)
+	updated, _ = textPrompt.Update(tea.PasteMsg{
+		Content: strings.Repeat("긴 응답 ", 30),
+	})
+	textPrompt = updated.(model)
+
+	capPrompt := base
+	capPrompt.status.Phase = state.PhasePausedForInput
+	capPrompt.status.PendingAction = &state.PendingAction{
+		Kind:   state.PendingTaskCap,
+		Prompt: "cap reached",
+	}
+	updated, _ = capPrompt.Update(specialKey(tea.KeyEnter))
+	capPrompt = updated.(model)
+
+	confirmPrompt := base
+	updated, _ = confirmPrompt.Update(printableKey('a'))
+	confirmPrompt = updated.(model)
+
+	for _, promptCase := range []struct {
+		name   string
+		model  model
+		footer string
+	}{
+		{"editor", textPrompt, "ctrl+j newline"},
+		{"task_cap pick", capPrompt, "choose"},
+		{"approve confirm", confirmPrompt, "enter confirm"},
+	} {
+		t.Run(promptCase.name, func(t *testing.T) {
+			region := promptRegionRows(promptCase.model)
+			for _, width := range []int{40, 60, 80, 120} {
+				innerWidth := width - 2
+				plain := ansi.Strip(
+					renderStatusBar(promptCase.model, width, region),
 				)
-			}
-			for index, line := range lines {
-				if cells := ansi.StringWidth(line); cells > innerWidth {
+				if !strings.Contains(plain, promptCase.footer) {
 					t.Fatalf(
-						"row %d is %d cells wide, region is %d:\n%s",
-						index,
-						cells,
-						innerWidth,
+						"width=%d footer %q was pushed out of the region:\n%s",
+						width,
+						promptCase.footer,
 						plain,
 					)
+				}
+				lines := strings.Split(plain, "\n")
+				if len(lines) > region {
+					t.Fatalf(
+						"width=%d prompt used %d rows, region is %d:\n%s",
+						width,
+						len(lines),
+						region,
+						plain,
+					)
+				}
+				for index, line := range lines {
+					if cells := ansi.StringWidth(line); cells > innerWidth {
+						t.Fatalf(
+							"width=%d row %d is %d cells, region is %d:\n%s",
+							width,
+							index,
+							cells,
+							innerWidth,
+							plain,
+						)
+					}
 				}
 			}
 		})
 	}
 }
 
-// A long validation error and a very narrow width must not push the prompt past
-// its 4-row region (review round-3 f2).
 func TestPromptFooterStaysOnOneRow(t *testing.T) {
 	current := populatedViewModel(t)
 	current.prompt = promptResume

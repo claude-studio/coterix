@@ -6,9 +6,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
+	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"github.com/ridenow/coterix/internal/pipeline"
 	"github.com/ridenow/coterix/internal/runner"
@@ -72,6 +73,23 @@ const (
 	promptNone promptMode = iota
 	promptReject
 	promptResume
+	// promptApproveConfirm is a one-step confirmation in front of `a`, so approving
+	// a plan is never a single stray keypress (T14 W5). It carries no input.
+	promptApproveConfirm
+)
+
+// taskCapChoices are the only valid task_cap responses. W5 turns them from typed
+// text into a left/right pick, but the submitted value stays the same string the
+// validator has always checked (T14 W5).
+var taskCapChoices = [2]string{"retry", "abort"}
+
+// promptRows is the status-bar budget while a prompt is open: label, framed input,
+// footer. The multiline textarea needs three content rows instead of one, and the
+// main pane gives them up for the duration (T14 W5).
+const (
+	promptRowsSingle = 4
+	promptRowsArea   = 7
+	promptAreaRows   = 3
 )
 
 // logIcon is a deterministic event-kind hint for the feed icon column. It is
@@ -148,9 +166,13 @@ type model struct {
 	boxScroll [mainBoxCount]int
 	spinner   spinner.Model
 
-	prompt       promptMode
-	promptValue  string
-	promptError  string
+	prompt      promptMode
+	promptValue string
+	promptError string
+	// promptArea is the multiline editor for reject/resume text (T14 W5). task_cap
+	// and the approve confirmation do not use it — they have no free text.
+	promptArea textarea.Model
+
 	stopping     bool
 	operationErr error
 }
@@ -244,10 +266,14 @@ func (current model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		current.spinner, command = current.spinner.Update(message)
 		return current, command
 	case tea.PasteMsg:
-		if current.prompt != promptNone {
-			current.promptValue += message.Content
+		if current.usesTextarea() {
+			area, cmd := current.promptArea.Update(message)
+			current.promptArea = area
 			current.promptError = ""
+			return current, cmd
 		}
+		// task_cap is a pick and the approve confirmation takes no input, so a paste
+		// has nowhere to land (T14 W5).
 		return current, nil
 	case tea.KeyPressMsg:
 		return current.updateKey(message)
@@ -461,11 +487,15 @@ func (current model) updateKey(
 	case state.PhaseAwaitingApproval:
 		switch key.String() {
 		case "a":
-			return current.beginOperation(operationApprove, nil)
-		case "r":
-			current.prompt = promptReject
+			// One confirmation step in front of approval (T14 W5). This gate is on
+			// the *key* path only: T15's `coterix approve <id>` seeds the same
+			// operation through ui.Open and stays exempt, matching the non-TTY CLI
+			// (T15-R6 · design-plan W5).
+			current.prompt = promptApproveConfirm
 			current.promptValue = ""
 			current.promptError = ""
+		case "r":
+			current.beginTextPrompt(promptReject)
 		}
 	case state.PhasePausedForInput:
 		if key.String() != "enter" || current.status.PendingAction == nil {
@@ -474,12 +504,14 @@ func (current model) updateKey(
 		if current.status.PendingAction.Kind == state.PendingAuth {
 			return current.beginOperation(operationResume, nil)
 		}
-		current.prompt = promptResume
-		current.promptValue = ""
 		if current.status.PendingAction.Kind == state.PendingTaskCap {
-			current.promptValue = "retry"
+			// A pick, not free text — so no editor.
+			current.prompt = promptResume
+			current.promptValue = taskCapChoices[0]
+			current.promptError = ""
+			return current, nil
 		}
-		current.promptError = ""
+		current.beginTextPrompt(promptResume)
 	}
 	return current, nil
 }
@@ -494,15 +526,19 @@ func (current model) updatePromptKey(
 		current.clearPrompt()
 		return current, nil
 	case "enter":
-		response := strings.TrimSpace(current.promptValue)
+		// `enter` is taken here, ahead of the textarea, so it stays the submit key
+		// (T14 W5 — newlines are ctrl+j).
+		if current.prompt == promptApproveConfirm {
+			current.clearPrompt()
+			return current.beginOperation(operationApprove, nil)
+		}
+		response := strings.TrimSpace(current.promptResponse())
 		if response == "" {
 			current.promptError = "Response cannot be empty."
 			return current, nil
 		}
-		if current.prompt == promptResume &&
-			current.status.PendingAction != nil &&
-			current.status.PendingAction.Kind == state.PendingTaskCap &&
-			response != "retry" && response != "abort" {
+		if current.isTaskCapPrompt() &&
+			response != taskCapChoices[0] && response != taskCapChoices[1] {
 			current.promptError = "Task cap response must be retry or abort."
 			return current, nil
 		}
@@ -512,21 +548,40 @@ func (current model) updatePromptKey(
 			return current.beginOperation(operationReject, &response)
 		}
 		return current.beginOperation(operationResume, &response)
-	case "backspace":
-		if current.promptValue != "" {
-			_, size := utf8.DecodeLastRuneInString(current.promptValue)
-			current.promptValue = current.promptValue[:len(current.promptValue)-size]
+	}
+
+	if current.isTaskCapPrompt() {
+		// Pick, don't type: the validator still receives "retry"/"abort" (T14 W5).
+		switch key.String() {
+		case "left", "h", "right", "l", "tab":
+			current.promptValue = otherTaskCapChoice(current.promptValue)
+			current.promptError = ""
 		}
-		current.promptError = ""
+		return current, nil
+	}
+	if current.prompt == promptApproveConfirm {
 		return current, nil
 	}
 
-	text := key.Key().Text
-	if text != "" && !key.Key().Mod.Contains(tea.ModCtrl) {
-		current.promptValue += text
-		current.promptError = ""
+	area, cmd := current.promptArea.Update(key)
+	current.promptArea = area
+	current.promptError = ""
+	return current, cmd
+}
+
+// promptResponse is the text the open prompt would submit.
+func (current model) promptResponse() string {
+	if current.usesTextarea() {
+		return current.promptArea.Value()
 	}
-	return current, nil
+	return current.promptValue
+}
+
+func otherTaskCapChoice(value string) string {
+	if value == taskCapChoices[0] {
+		return taskCapChoices[1]
+	}
+	return taskCapChoices[0]
 }
 
 func (current model) beginOperation(
@@ -578,6 +633,58 @@ func (current *model) clearPrompt() {
 	current.prompt = promptNone
 	current.promptValue = ""
 	current.promptError = ""
+	current.promptArea = textarea.Model{}
+}
+
+// beginTextPrompt opens the multiline editor for a free-text response (T14 W5).
+//
+// Measured: the textarea's default keymap binds InsertNewline to `enter`, which is
+// the submit key here. Two independent pieces make R8's contract hold, and each was
+// mutation-checked separately: binding InsertNewline to `ctrl+j` is what makes
+// ctrl+j break a line, and taking `enter` in updatePromptKey before the textarea
+// sees it is what makes enter submit. (Whether `enter` also stays in the binding
+// turns out not to matter — the interception runs first.)
+func (current *model) beginTextPrompt(mode promptMode) {
+	area := textarea.New()
+	area.ShowLineNumbers = false
+	area.Prompt = ""
+	area.SetHeight(promptAreaRows)
+	area.KeyMap.InsertNewline = key.NewBinding(
+		key.WithKeys("ctrl+j", "alt+enter"),
+		key.WithHelp("ctrl+j", "newline"),
+	)
+	area.Focus()
+	current.prompt = mode
+	current.promptValue = ""
+	current.promptError = ""
+	current.promptArea = area
+}
+
+// usesTextarea reports whether the open prompt is the free-text editor. task_cap is
+// a left/right pick and the approve confirmation takes no input, so both keep the
+// single-row status bar (T14 W5).
+func (current model) usesTextarea() bool {
+	switch current.prompt {
+	case promptReject:
+		return true
+	case promptResume:
+		return !current.isTaskCapPrompt()
+	}
+	return false
+}
+
+func (current model) isTaskCapPrompt() bool {
+	return current.prompt == promptResume &&
+		current.status.PendingAction != nil &&
+		current.status.PendingAction.Kind == state.PendingTaskCap
+}
+
+// promptRegionRows is the status bar's height while a prompt is open.
+func promptRegionRows(current model) int {
+	if current.usesTextarea() {
+		return promptRowsArea
+	}
+	return promptRowsSingle
 }
 
 // selectArtifactTab switches which artifact the FEED box shows. The offset is

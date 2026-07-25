@@ -230,7 +230,10 @@ func TestExecuteExactRunDashboardDrivesSharedControllerAndWaitsForCleanup(
 			continue
 		default:
 		}
-		if _, err := keyboard.Write([]byte("a")); err != nil {
+		// Approving takes two keys: `a` arms the confirmation and `\r` commits it
+		// (T14 W5). Both are sent each round because the loop may start before the
+		// dashboard has reached awaiting_approval.
+		if _, err := keyboard.Write([]byte("a\r")); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(20 * time.Millisecond)

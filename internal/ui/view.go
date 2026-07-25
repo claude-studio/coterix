@@ -18,9 +18,6 @@ const (
 	topBarHeight    = 2
 	wordmarkText    = "C O T E R I X"
 	logTagCellWidth = 6
-	// promptEllipsis marks a left-trimmed response; its width counts against the
-	// input budget (review T13a-1-followup f1).
-	promptEllipsis = "…"
 )
 
 // THESIS: Make a synchronous multi-agent pipeline readable as one live
@@ -59,7 +56,7 @@ func renderDashboard(current model) string {
 	height := max(1, current.height)
 	statusHeight := 2
 	if current.prompt != promptNone {
-		statusHeight = min(4, height)
+		statusHeight = min(promptRegionRows(current), height)
 	}
 
 	if isWide(width, height) {
@@ -1289,11 +1286,29 @@ func renderCompactHeader(current model, width, height int) string {
 		Render(line + "\n" + second)
 }
 
+// renderTaskCapChoices draws the task_cap answer as a pick instead of something to
+// type (T14 W5). The chosen option carries `▸` and bold as well as the Primary
+// colour, so the choice survives a terminal that drops colour.
+func renderTaskCapChoices(current model, budget int) string {
+	parts := make([]string, 0, len(taskCapChoices))
+	for _, choice := range taskCapChoices {
+		if choice == current.promptValue {
+			parts = append(parts, current.theme.styles.TabActive.Render("▸ "+choice))
+			continue
+		}
+		parts = append(parts, current.theme.styles.Muted.Render("  "+choice))
+	}
+	return ansi.TruncateWc(strings.Join(parts, " "), max(1, budget), "…")
+}
+
 func renderStatusBar(current model, width, height int) string {
 	innerWidth := max(1, width-2)
 	if current.prompt != promptNone {
 		label := "Reject feedback"
-		if current.prompt == promptResume {
+		switch {
+		case current.prompt == promptApproveConfirm:
+			label = "Approve this plan?"
+		case current.prompt == promptResume:
 			kind := ""
 			if current.status.PendingAction != nil {
 				kind = string(current.status.PendingAction.Kind)
@@ -1303,33 +1318,38 @@ func renderStatusBar(current model, width, height int) string {
 		// At very narrow widths the label alone can exceed the row, which wraps
 		// and pushes the footer out of the region (review round-3 f2).
 		label = ansi.TruncateWc(label, max(1, innerWidth-8), "…")
-		// TruncateLeftWc removes the given number of cells from the left; it is
-		// not a "keep this many" budget. Passing the budget straight in erased
-		// every response shorter than the budget — which is every realistic
-		// response, so the input always rendered empty (live-smoke finding,
-		// 2026-07-25). Only trim when the value actually overflows, and measure
-		// the label in cells: len() counts bytes and the label contains `·`.
-		//
 		// The chrome that shares the row must all come out of the budget, or the
-		// Input box wraps and pushes the footer out of the 4-row prompt region
-		// (review T13a-1-followup f1): StatusBar padding, the `label: ` suffix,
-		// the Input border, and the cursor cell.
+		// input wraps and pushes the footer out of the prompt region (review
+		// T13a-1-followup f1): StatusBar padding, the `label: ` suffix, and the
+		// frame. Measure the label in cells — len() counts bytes and it holds `·`.
 		const promptChrome = 2 + // StatusBar Padding(0, 1)
 			2 + // ": " after the label
-			2 + // Input border, both sides
-			1 // the cursor cell appended below
+			2 + // input frame, both sides
+			1 // trailing cell
 		budget := max(1, innerWidth-ansi.StringWidth(label)-promptChrome)
-		value := current.promptValue
-		if ansi.StringWidth(value) > budget {
-			// The marker is prepended by TruncateLeftWc, so its own width has to
-			// be part of the cut — otherwise the result stays a cell over budget.
-			cut := ansi.StringWidth(value) - budget + ansi.StringWidth(promptEllipsis)
-			value = ansi.TruncateLeftWc(value, cut, promptEllipsis)
+		heading := current.theme.styles.Label.Render(label + ": ")
+		var input string
+		switch {
+		case current.usesTextarea():
+			// The editor owns its own rows, so it goes on the line below the label
+			// instead of sharing one (T14 W5).
+			area := current.promptArea
+			area.SetWidth(max(4, innerWidth-2))
+			input = area.View()
+			heading = current.theme.styles.Label.Render(label) + "\n"
+		case current.prompt == promptApproveConfirm:
+			// Nothing to type — the footer names the two keys.
+			input = current.theme.styles.Muted.Render("(no response needed)")
+		default: // task_cap — the only remaining single-row input.
+			input = renderTaskCapChoices(current, budget)
 		}
-		input := current.theme.styles.Input.Render(
-			value + current.theme.styles.InputCursor.Render("▌"),
-		)
 		footerText := "enter confirm · esc cancel"
+		switch {
+		case current.usesTextarea():
+			footerText = "enter submit · ctrl+j newline · esc cancel"
+		case current.isTaskCapPrompt():
+			footerText = "←/→ choose · enter submit · esc cancel"
+		}
 		footerStyle := current.theme.styles.Hint
 		if current.promptError != "" {
 			footerText = "× " + current.promptError
@@ -1345,10 +1365,7 @@ func renderStatusBar(current model, width, height int) string {
 			Width(innerWidth).
 			Height(max(1, height)).
 			Padding(0, 1).
-			Render(
-				current.theme.styles.Label.Render(label+": ") +
-					input + "\n" + footer,
-			)
+			Render(heading + input + "\n" + footer)
 	}
 
 	primary := statusSignal(current)

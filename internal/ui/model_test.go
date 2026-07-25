@@ -1451,10 +1451,16 @@ func TestModelApprovalRejectAndPendingActionsUseControlPlane(t *testing.T) {
 			Phase: state.PhaseAwaitingApproval,
 		}
 
+		// `a` now only arms the confirmation; `enter` commits it (T14 W5).
 		updated, command := current.Update(printableKey('a'))
 		current = updated.(model)
+		if command != nil || current.prompt != promptApproveConfirm {
+			t.Fatal("approve key did not arm the confirmation step")
+		}
+		updated, command = current.Update(specialKey(tea.KeyEnter))
+		current = updated.(model)
 		if command == nil || current.operation != operationApprove {
-			t.Fatal("approve key did not start a control operation")
+			t.Fatal("approve confirmation did not start a control operation")
 		}
 		done := operationDoneFromCommand(t, command)
 		if done.status.Phase != state.PhaseImplementing {
@@ -1845,4 +1851,149 @@ func TestCursorSurvivesEvictionAndLetsGoWhenItsRowIsDropped(t *testing.T) {
 	if current.hasSelection {
 		t.Fatal("the cursor kept pointing at an evicted row")
 	}
+}
+
+// task_cap becomes a pick instead of something to type, but the value handed to the
+// validator is unchanged (T14 W5).
+func TestTaskCapPromptIsAPickNotTyping(t *testing.T) {
+	fake := &fakeUIControl{}
+	current := testModel(t, fake)
+	current.hasStatus = true
+	current.status = pipeline.RunStatus{
+		RunID: "run-cap",
+		Phase: state.PhasePausedForInput,
+		PendingAction: &state.PendingAction{
+			Kind:        state.PendingTaskCap,
+			ResumePhase: state.PhaseImplementing,
+			Prompt:      "attempt cap reached",
+		},
+	}
+
+	updated, _ := current.Update(specialKey(tea.KeyEnter))
+	current = updated.(model)
+	if current.promptValue != "retry" {
+		t.Fatalf("the pick did not default to retry, got %q", current.promptValue)
+	}
+	if current.usesTextarea() {
+		t.Fatal("task_cap opened a free-text editor")
+	}
+
+	// Typing must not reach the value — that is the whole point of the pick.
+	updated, _ = current.Update(printableKey('z'))
+	current = updated.(model)
+	updated, _ = current.Update(tea.PasteMsg{Content: "garbage"})
+	current = updated.(model)
+	if current.promptValue != "retry" {
+		t.Fatalf("typing leaked into the pick: %q", current.promptValue)
+	}
+
+	updated, _ = current.Update(specialKey(tea.KeyRight))
+	current = updated.(model)
+	if current.promptValue != "abort" {
+		t.Fatalf("→ did not move the pick, got %q", current.promptValue)
+	}
+	plain := ansi.Strip(renderStatusBar(current, 100, promptRowsSingle))
+	if !strings.Contains(plain, "▸ abort") {
+		t.Fatalf("the chosen option carries no non-color marker:\n%s", plain)
+	}
+	if strings.Contains(plain, "▸ retry") {
+		t.Fatalf("two options are marked as chosen:\n%s", plain)
+	}
+
+	updated, command := current.Update(specialKey(tea.KeyEnter))
+	current = updated.(model)
+	if command == nil {
+		t.Fatal("enter did not submit the pick")
+	}
+	_ = operationDoneFromCommand(t, command)
+	response := "abort"
+	assertUICall(t, fake, operationResume, "run-cap", &response)
+}
+
+// Measured: the textarea binds InsertNewline to `enter` by default, which is the
+// submit key here. So `enter` submits and `ctrl+j` inserts the newline (T14 W5).
+func TestEditorSubmitsOnEnterAndBreaksLinesOnCtrlJ(t *testing.T) {
+	fake := &fakeUIControl{}
+	current := testModel(t, fake)
+	current.hasStatus = true
+	current.status = pipeline.RunStatus{
+		RunID: "run-r",
+		Phase: state.PhaseAwaitingApproval,
+	}
+
+	updated, _ := current.Update(printableKey('r'))
+	current = updated.(model)
+	if !current.usesTextarea() {
+		t.Fatal("reject did not open the editor")
+	}
+
+	updated, _ = current.Update(tea.PasteMsg{Content: "first"})
+	current = updated.(model)
+	// ctrl+j carries no text — a terminal sends it as a control code, and passing
+	// Text would make the editor insert a literal "j".
+	updated, _ = current.Update(tea.KeyPressMsg(tea.Key{
+		Code: 'j',
+		Mod:  tea.ModCtrl,
+	}))
+	current = updated.(model)
+	updated, _ = current.Update(tea.PasteMsg{Content: "second"})
+	current = updated.(model)
+
+	if got := current.promptResponse(); got != "first\nsecond" {
+		t.Fatalf("ctrl+j did not insert a newline: %q", got)
+	}
+	if current.prompt == promptNone {
+		t.Fatal("ctrl+j submitted instead of inserting a newline")
+	}
+
+	// tab must not move box focus while the editor has it.
+	before := current.focus
+	updated, _ = current.Update(specialKey(tea.KeyTab))
+	current = updated.(model)
+	if current.focus != before {
+		t.Fatalf("tab moved focus out from under the editor: %d -> %d",
+			before, current.focus)
+	}
+
+	updated, command := current.Update(specialKey(tea.KeyEnter))
+	current = updated.(model)
+	if command == nil || current.prompt != promptNone {
+		t.Fatal("enter did not submit the editor")
+	}
+	_ = operationDoneFromCommand(t, command)
+	response := "first\nsecond"
+	assertUICall(t, fake, operationReject, "run-r", &response)
+}
+
+// Approval takes two keys now, and `esc` on the confirmation must not approve
+// (T14 W5). The T15 CLI entry stays exempt by seeding the operation directly.
+func TestApproveNeedsConfirmationAndEscapeCancels(t *testing.T) {
+	fake := &fakeUIControl{}
+	current := testModel(t, fake)
+	current.hasStatus = true
+	current.status = pipeline.RunStatus{
+		RunID: "run-a",
+		Phase: state.PhaseAwaitingApproval,
+	}
+
+	updated, command := current.Update(printableKey('a'))
+	current = updated.(model)
+	if command != nil || current.prompt != promptApproveConfirm {
+		t.Fatal("`a` approved without confirmation")
+	}
+	updated, command = current.Update(specialKey(tea.KeyEscape))
+	current = updated.(model)
+	if command != nil || current.prompt != promptNone || len(fake.calls) != 0 {
+		t.Fatalf("esc did not cancel the confirmation: calls=%d", len(fake.calls))
+	}
+
+	updated, _ = current.Update(printableKey('a'))
+	current = updated.(model)
+	updated, command = current.Update(specialKey(tea.KeyEnter))
+	current = updated.(model)
+	if command == nil || current.operation != operationApprove {
+		t.Fatal("the confirmation did not approve")
+	}
+	_ = operationDoneFromCommand(t, command)
+	assertUICall(t, fake, operationApprove, "run-a", nil)
 }
