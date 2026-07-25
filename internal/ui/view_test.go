@@ -1944,7 +1944,7 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 	// task-scoped auth pause is reachable under pressure too — handleReviewFailure calls
 	// PauseForAuth with the current task ID after the implementation review, by which point
 	// a candidate exists and loadArtifactData will load its changed files
-	// (task_evidence.go:449-480, artifacts.go:103-125) — so it renders a PENDING chip
+	// (task_evidence.go:449-480, artifacts.go:103-128) — so it renders a PENDING chip
 	// alongside the list exactly as task_cap does (review T13b b7 f1). It is not repeated
 	// here because it spends the same single chip row task_cap already covers: measured,
 	// `◇ PENDING · auth` is 16 cells and `▶ PENDING · task_cap` is 20, both one row at the
@@ -2395,14 +2395,19 @@ func pressureFileBody(index, attempt, attempts int) string {
 // leaves behind, in the schema production actually requires — not the abbreviated one the
 // UI decoder happens to accept (review T13b b4 f1).
 //
-//   - gate.json needs all seven fields; readGateEvidence rejects a missing one
-//     (task_evidence.go:1030-1043), and the two log paths must name real regular files
-//     inside the run directory (runRelativeRegularFile, task_evidence.go:1104-1125).
+//   - gate.json needs all seven fields present; readGateEvidence rejects a missing one and
+//     also rejects unknown ones (task_evidence.go:1016-1043). It does **not** check that the
+//     two log paths exist — that constraint belongs to the writer, which derives them with
+//     runRelativeRegularFile (:1104-1125) — but real files are written here anyway so the
+//     fixture matches what a completed gate leaves on disk.
 //   - review.json needs schema_version, plan_hash, task_id, candidate_sha, clean and
 //     findings, and `clean` must be false **only** with at least one blocking finding —
 //     `clean != (blocking == 0)` is rejected (internal/cli/result.go:286-318, :426-437).
-//     A finding needs id, severity (critical|major|minor), a path:line location, issue and
-//     requested_change (result.go:340-401).
+//     A finding needs id, severity (critical|major|minor), issue and requested_change, and a
+//     `location` **field** whose value may be null or path:line — null is explicitly valid
+//     (decodeNullableString and validateFindingLocation, result.go:340-401). This fixture
+//     supplies a path:line because a real finding usually has one, not because null is
+//     rejected (review T13b b8 f1).
 //
 // Neither shape is re-decoded here, and that is a layering decision rather than a
 // limitation: gate decoding is private to internal/pipeline, but the review verdict *is*
