@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,6 +20,7 @@ import (
 	"charm.land/lipgloss/v2"
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/ridenow/coterix/internal/cli"
 	"github.com/ridenow/coterix/internal/pipeline"
 	"github.com/ridenow/coterix/internal/runner"
 	"github.com/ridenow/coterix/internal/state"
@@ -2396,29 +2399,25 @@ func pressureFileBody(index, attempt, attempts int) string {
 }
 
 // writePressureEvidence writes the gate and review artefacts a completed dirty attempt
-// leaves behind, in the schema production actually requires — not the abbreviated one the UI
+// leaves behind, in the schema production requires rather than the abbreviated one the UI
 // decoder happens to accept (review T13b b4 f1).
 //
-// The authorities are, and should be read rather than paraphrased here:
+// Seven review rounds went to prose here describing what those schemas require; every
+// description drifted from the code and nothing caught it, and the assertions that replaced
+// the prose turned out not to cover it either — a removed gate `command` and a removed finding
+// `id` both still passed (review T13b b11 f1). So the descriptions are gone. The authorities
+// are readGateEvidence and validateGateEvidence for the gate, and
+// decodeImplementationReview, validateImplementationReviewTargets and loadRepairEvidence for
+// the review; read them there.
 //
-//   - gate.json — readGateEvidence for the required and permitted fields, then
-//     validateGateEvidence for the cross-checks against the config snapshot, the task's
-//     candidate and both log paths (internal/pipeline/task_evidence.go). loadRepairEvidence
-//     runs them in that order, so those constraints hold on the **read** path, not only where
-//     the writer derives the log names.
-//   - review.json — cli.decodeImplementationReview for the required fields and the
-//     `clean == (blocking == 0)` rule, then validateImplementationReviewTargets for the
-//     schema/kind, plan_hash, task_id and candidate_sha checks, and loadRepairEvidence itself
-//     for the separate "a repairing task must not have a clean review" check
-//     (internal/cli/result.go, internal/pipeline/task_evidence.go).
+// What this function guarantees is only what it checks below:
 //
-// Enumerating each validator's conditions in prose here went wrong in six consecutive review
-// rounds — a paraphrase drifts from the code and nothing catches it. So the conditions this
-// fixture must satisfy are **asserted** at the end of this function instead, and the prose is
-// kept to naming where the truth lives. Neither schema is re-decoded here: that is a layering
-// decision, since gate decoding is private to internal/pipeline while the review verdict is
-// reachable through cli.NewOutputAdapter(...).NewAttempt().ValidateReviewResult, and a schema
-// round-trip belongs where the schema lives (review T13b b5 f5, b8 f1, b9 f1, b10 f1).
+//   - the review document is validated by production's own decoder, through the exported
+//     cli.ValidateReviewResult, plus the pipeline's target checks on the returned verdict;
+//   - the gate document is decoded strictly with every field required and no unknown ones
+//     permitted, which **mirrors** readGateEvidence rather than calling it — that function is
+//     unexported, so this check can fall behind it;
+//   - both gate logs exist as regular files at clean run-relative paths.
 func writePressureEvidence(
 	t *testing.T,
 	currentRun *pipeline.Run,
@@ -2490,51 +2489,70 @@ func writePressureEvidence(
 			t.Fatalf("gate log %q is not a clean run-relative path", relative)
 		}
 	}
-	// The review document is decoded back and checked against the rules production applies to
-	// it, so the fixture cannot drift out of schema unnoticed.
-	var decoded struct {
-		SchemaVersion int    `json:"schema_version"`
-		PlanHash      string `json:"plan_hash"`
-		TaskID        string `json:"task_id"`
-		CandidateSHA  string `json:"candidate_sha"`
-		Clean         bool   `json:"clean"`
-		Findings      []struct {
-			Severity string `json:"severity"`
-		} `json:"findings"`
-	}
-	if err := json.Unmarshal(review, &decoded); err != nil {
+	// The review document is validated by **production's own decoder**, not a paraphrase of
+	// it: cli.ValidateReviewResult runs decodeImplementationReview, which enforces every
+	// required field, the severity vocabulary, the location shape and the
+	// `clean == (blocking == 0)` rule. Consume only marks the path used within the attempt, so
+	// the file stays on disk for the fixture. A hand-rolled struct check stood here before and
+	// missed a removed finding `id` entirely (review T13b b11 f1).
+	adapter, err := cli.NewOutputAdapter(currentRun.RepoRoot, currentRun.ID)
+	if err != nil {
 		t.Fatal(err)
 	}
-	blocking := 0
-	for _, finding := range decoded.Findings {
-		switch finding.Severity {
-		case "critical", "major", "minor":
-		default:
-			t.Fatalf("finding severity %q is not one of critical|major|minor",
-				finding.Severity)
-		}
-		// Mirror production's positive form rather than inferring it: blocking is
-		// critical-or-major, not not-minor (validateReviewConsistency, cli/result.go:426-437).
-		// The two agree only because those are the sole valid severities today.
-		if finding.Severity == "critical" || finding.Severity == "major" {
-			blocking++
-		}
+	verdict, err := adapter.NewAttempt().ValidateReviewResult(
+		cli.RoleImplReviewer,
+		filepath.Join(currentRun.Dir, reviewPath),
+	)
+	if err != nil {
+		t.Fatalf("the review evidence is not valid production schema: %v", err)
 	}
+	// And the target checks the pipeline applies on top of the schema.
 	switch {
-	case decoded.SchemaVersion != 1:
-		t.Fatalf("review schema_version is %d, want 1", decoded.SchemaVersion)
-	case decoded.PlanHash != *currentRun.State.ApprovedPlanHash:
+	case verdict.Verdict.PlanHash != *currentRun.State.ApprovedPlanHash:
 		t.Fatalf("review plan_hash %q is not the approved %q",
-			decoded.PlanHash, *currentRun.State.ApprovedPlanHash)
-	case decoded.TaskID != taskID:
-		t.Fatalf("review task_id %q is not %q", decoded.TaskID, taskID)
-	case decoded.CandidateSHA != candidateSHA:
-		t.Fatalf("review candidate_sha %q is not %q", decoded.CandidateSHA, candidateSHA)
-	case decoded.Clean != (blocking == 0):
-		t.Fatalf("review clean=%v with %d blocking findings", decoded.Clean, blocking)
-	case decoded.Clean:
+			verdict.Verdict.PlanHash, *currentRun.State.ApprovedPlanHash)
+	case verdict.Verdict.TaskID != taskID:
+		t.Fatalf("review task_id %q is not %q", verdict.Verdict.TaskID, taskID)
+	case verdict.Verdict.CandidateSHA != candidateSHA:
+		t.Fatalf("review candidate_sha %q is not %q",
+			verdict.Verdict.CandidateSHA, candidateSHA)
+	case verdict.Verdict.Clean:
 		t.Fatal("a repairing task must not carry a clean review")
 	}
+
+	// The gate document has no exported decoder, so its rule is mirrored here rather than
+	// borrowed: every one of the seven fields must be present and nothing else may be, which
+	// is what readGateEvidence enforces. Being a mirror, it can fall behind that function —
+	// what it cannot do is silently stop checking the fields this fixture writes.
+	gateDecoder := json.NewDecoder(bytes.NewReader(gate))
+	gateDecoder.DisallowUnknownFields()
+	var gateWire struct {
+		Command      *[]string `json:"command"`
+		CWD          *string   `json:"cwd"`
+		CandidateSHA *string   `json:"candidate_sha"`
+		Exit         *int      `json:"exit"`
+		TimedOut     *bool     `json:"timed_out"`
+		StdoutLog    *string   `json:"stdout_log"`
+		StderrLog    *string   `json:"stderr_log"`
+	}
+	if err := gateDecoder.Decode(&gateWire); err != nil {
+		t.Fatalf("gate evidence does not decode strictly: %v", err)
+	}
+	switch {
+	case gateWire.Command == nil || gateWire.CWD == nil || gateWire.CandidateSHA == nil ||
+		gateWire.Exit == nil || gateWire.TimedOut == nil ||
+		gateWire.StdoutLog == nil || gateWire.StderrLog == nil:
+		t.Fatalf("gate evidence is missing a required field: %s", gate)
+	case !slices.Equal(*gateWire.Command, currentRun.Config.GateCommand):
+		t.Fatalf("gate command %v is not the configured %v",
+			*gateWire.Command, currentRun.Config.GateCommand)
+	case *gateWire.CWD != currentRun.Config.GateCWD:
+		t.Fatalf("gate cwd %q is not the configured %q",
+			*gateWire.CWD, currentRun.Config.GateCWD)
+	case *gateWire.CandidateSHA != candidateSHA:
+		t.Fatalf("gate candidate_sha %q is not %q", *gateWire.CandidateSHA, candidateSHA)
+	}
+
 	switch stored := currentRun.State.Tasks[taskID].CandidateSHA; {
 	case stored == nil:
 		t.Fatalf("the evidence cites %s but the task has no candidate", candidateSHA)
