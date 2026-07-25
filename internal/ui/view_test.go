@@ -2513,7 +2513,10 @@ func writePressureEvidence(
 			t.Fatalf("finding severity %q is not one of critical|major|minor",
 				finding.Severity)
 		}
-		if finding.Severity != "minor" {
+		// Mirror production's positive form rather than inferring it: blocking is
+		// critical-or-major, not not-minor (validateReviewConsistency, cli/result.go:426-437).
+		// The two agree only because those are the sole valid severities today.
+		if finding.Severity == "critical" || finding.Severity == "major" {
 			blocking++
 		}
 	}
