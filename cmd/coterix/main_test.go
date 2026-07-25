@@ -1467,14 +1467,19 @@ func TestCharmDashboardBrowseReturnsTheChosenCommand(t *testing.T) {
 		err     error
 	}
 	done := make(chan outcome, 1)
+	// `finished` closes when the goroutine returns, whoever read the outcome. Waiting on
+	// `done` alone made the *success* path burn the full timeout, because the test body
+	// had already drained it (review T16 r4 minor).
+	finished := make(chan struct{})
 	go func() {
+		defer close(finished)
 		status, command, err := dashboard.Browse(context.Background(), root, "")
 		done <- outcome{status: status, command: command, err: err}
 	}()
 	t.Cleanup(func() {
 		_ = keyboard.Close()
 		select {
-		case <-done:
+		case <-finished:
 		case <-time.After(5 * time.Second):
 		}
 	})
