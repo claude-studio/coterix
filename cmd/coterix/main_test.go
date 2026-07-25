@@ -10,7 +10,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/ridenow/coterix/internal/cli"
 	"github.com/ridenow/coterix/internal/pipeline"
@@ -1424,6 +1428,116 @@ func TestCharmDashboardBrowseUsesTheReadOnlyController(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The bare multi-run path through the *real* adapter, with keys injected over a pipe
+// rather than a pty: the production Browse must move the cursor, open the detail, and
+// hand back the chosen command. `execute` wiring that command into Open is covered by
+// TestExecuteStatusEntersTheBrowserOnATTY; together they close the round-2 gap
+// (review T16 f2).
+func TestCharmDashboardBrowseReturnsTheChosenCommand(t *testing.T) {
+	root := seedBrowseRepository(t)
+	seedBrowseRun(t, root, "browse-first")
+	seedBrowseRun(t, root, "browse-second")
+	// The second run is the one an action is legal on.
+	approvable := openBrowseRun(t, root, "browse-second")
+	approvable.State.TaskOrder = []string{"T1"}
+	approvable.State.Tasks = map[string]*state.TaskState{"T1": {Status: state.TaskOpen}}
+	if err := approvable.State.TransitionPhase(state.PhaseAwaitingApproval); err != nil {
+		t.Fatal(err)
+	}
+	if err := approvable.SaveState(); err != nil {
+		t.Fatal(err)
+	}
+
+	input, keyboard := io.Pipe()
+	frames := &browseFrames{}
+	dashboard := charmDashboard{
+		executor:    &countingBrowseExecutor{},
+		input:       input,
+		output:      frames,
+		interactive: true,
+		width:       140,
+		height:      40,
+	}
+
+	type outcome struct {
+		status  pipeline.RunStatus
+		command string
+		err     error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		status, command, err := dashboard.Browse(context.Background(), root, "")
+		done <- outcome{status: status, command: command, err: err}
+	}()
+	t.Cleanup(func() {
+		_ = keyboard.Close()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+	})
+
+	// Wait for the first paint before typing: writing into a program that has not
+	// started yet loses the keys, and there is nothing to synchronise on otherwise.
+	deadline := time.Now().Add(10 * time.Second)
+	for !strings.Contains(frames.String(), "browse-first") &&
+		time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Runs are listed by directory order, so walk to the approvable one, open it and
+	// approve. `a` is only accepted in the detail view, so the returned command proves
+	// every step landed. The trailing `q` is a safety valve: without it a step that does
+	// not land would hang instead of failing.
+	for _, key := range []string{"j", "\r", "a", "q"} {
+		if _, err := keyboard.Write([]byte(key)); err != nil {
+			break
+		}
+		time.Sleep(120 * time.Millisecond)
+	}
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if got.command != "approve" || got.status.RunID != "browse-second" {
+			t.Fatalf("the production Browse returned %q for %q, want approve for browse-second",
+				got.command, got.status.RunID)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("the production Browse never returned:\n%s", frames.String())
+	}
+}
+
+// browseFrames collects the program's output so the test can wait for the first paint.
+type browseFrames struct {
+	mu   sync.Mutex
+	data []byte
+}
+
+func (frames *browseFrames) Write(chunk []byte) (int, error) {
+	frames.mu.Lock()
+	defer frames.mu.Unlock()
+	frames.data = append(frames.data, chunk...)
+	return len(chunk), nil
+}
+
+func (frames *browseFrames) String() string {
+	frames.mu.Lock()
+	defer frames.mu.Unlock()
+	return ansi.Strip(string(frames.data))
+}
+
+func openBrowseRun(t *testing.T, root string, runID string) *pipeline.Run {
+	t.Helper()
+	opened, err := pipeline.OpenRun(root, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return opened
 }
 
 type countingBrowseExecutor struct{}
