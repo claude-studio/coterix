@@ -2119,13 +2119,27 @@ func pressureModelFromRealRun(
 	// allows, and open -> candidate -> repairing the only route to a repairing task
 	// (state/transition.go). Driving both through the real API is what makes this state
 	// reachable rather than merely well-formed.
-	for _, phase := range []state.Phase{
+	if err := currentRun.State.TransitionPhase(
 		state.PhaseAwaitingApproval,
-		state.PhaseImplementing,
-	} {
-		if err := currentRun.State.TransitionPhase(phase); err != nil {
-			t.Fatal(err)
-		}
+	); err != nil {
+		t.Fatal(err)
+	}
+	// implementing is reached only through controller.Approve, which freezes plan.md,
+	// copies PlanHash into ApprovedPlanHash and re-verifies it before transitioning
+	// (control.go:145-170). Skipping that left `implementing` with no approved plan hash
+	// and a writable plan — a state the pipeline cannot produce. The exported
+	// VerifyApprovedPlan is called here to prove the seeded run satisfies the real
+	// invariant rather than merely looking plausible.
+	approved := *currentRun.State.PlanHash
+	currentRun.State.ApprovedPlanHash = &approved
+	if err := os.Chmod(filepath.Join(currentRun.Dir, "plan.md"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := pipeline.VerifyApprovedPlan(currentRun); err != nil {
+		t.Fatal(err)
+	}
+	if err := currentRun.State.TransitionPhase(state.PhaseImplementing); err != nil {
+		t.Fatal(err)
 	}
 	active := taskID
 	currentRun.State.CurrentTaskID = &active
