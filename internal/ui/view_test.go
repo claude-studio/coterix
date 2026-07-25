@@ -2477,21 +2477,24 @@ func writePressureEvidence(
 	task.GateResult = &gatePath
 	task.ReviewResult = &reviewPath
 
-	// The claims above are asserted, not just described. validateGateEvidence and
-	// validateImplementationReviewTargets are private to internal/pipeline, so their
-	// conditions are checked here directly — six review rounds were spent on comments that
-	// asserted things about this fixture, and an assertion cannot go stale the way a comment
-	// can.
+	// Each log path is held to the same rule validateRunRelativePath applies and then
+	// confirmed to be a real regular file inside the run directory. The earlier version of
+	// this check accepted "../outside.log", which production rejects, so the rule is spelled
+	// out in full here rather than approximated (review T13b b12 f1).
 	for _, relative := range []string{stdoutLog, stderrLog} {
+		cleaned := filepath.Clean(relative)
+		switch {
+		case relative == "" || filepath.IsAbs(relative) || cleaned != relative,
+			cleaned == "." || cleaned == "..",
+			strings.HasPrefix(cleaned, ".."+string(filepath.Separator)):
+			t.Fatalf("gate log %q is not a clean run-relative path", relative)
+		}
 		info, err := os.Lstat(filepath.Join(currentRun.Dir, relative))
 		if err != nil {
 			t.Fatalf("gate log %q is not readable: %v", relative, err)
 		}
 		if !info.Mode().IsRegular() {
 			t.Fatalf("gate log %q is not a regular file", relative)
-		}
-		if filepath.Clean(relative) != relative || filepath.IsAbs(relative) {
-			t.Fatalf("gate log %q is not a clean run-relative path", relative)
 		}
 	}
 	// The review document is validated by **production's own decoder**, not a paraphrase of
