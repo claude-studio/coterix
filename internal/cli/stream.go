@@ -151,13 +151,3 @@ func firstLine(text string) string {
 	}
 	return text
 }
-
-// StreamArgs are the flags that make a CLI report progress line by line. Without
-// them a multi-minute step prints nothing until it finishes, which is what made the
-// dashboard look frozen (live-smoke finding, 2026-07-25).
-func StreamArgs(cliName string) []string {
-	if strings.ToLower(strings.TrimSpace(cliName)) == "claude" {
-		return []string{"--output-format", "stream-json", "--verbose"}
-	}
-	return nil
-}

@@ -165,15 +165,3 @@ func TestDecodeStreamLineKeepsRowsToOneRow(t *testing.T) {
 			len(decoded.Text), decoded.Text)
 	}
 }
-
-// Streaming is claude-only: codex already prints progress, and passing the flags to
-// it would be a wrong-CLI argument.
-func TestStreamArgsOnlyTargetClaude(t *testing.T) {
-	if got := StreamArgs("claude"); strings.Join(got, " ") !=
-		"--output-format stream-json --verbose" {
-		t.Fatalf("claude stream args = %v", got)
-	}
-	if got := StreamArgs("CODEX"); got != nil {
-		t.Fatalf("codex must not get claude flags, got %v", got)
-	}
-}
