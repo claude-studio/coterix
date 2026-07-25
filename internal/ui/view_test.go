@@ -2396,38 +2396,29 @@ func pressureFileBody(index, attempt, attempts int) string {
 }
 
 // writePressureEvidence writes the gate and review artefacts a completed dirty attempt
-// leaves behind, in the schema production actually requires — not the abbreviated one the
-// UI decoder happens to accept (review T13b b4 f1).
+// leaves behind, in the schema production actually requires — not the abbreviated one the UI
+// decoder happens to accept (review T13b b4 f1).
 //
-//   - gate.json needs all seven fields present; readGateEvidence rejects a missing one and
-//     also rejects unknown ones (task_evidence.go:1016-1043). Reading is only half of it:
-//     validateGateEvidence runs right after (loadRepairEvidence, :725-736) and cross-checks
-//     command and cwd against the config snapshot, candidate_sha against the task, and both
-//     log paths with validateRunRelativePath + runRelativeRegularFile — so the logs must be
-//     real regular files inside the run directory on the **read** path too, not just when the
-//     writer derives them (:204-217, :1058-1091; review T13b b9 f1). This fixture writes real
-//     logs and takes command/cwd from the run's own config, so it satisfies that validator
-//     rather than merely decoding.
-//   - The review side is validated on read the same way: loadRepairEvidence runs the real
-//     ValidateReviewResult and then validateImplementationReviewTargets, which requires
-//     plan_hash to equal ApprovedPlanHash, task_id and candidate_sha to match the task, and
-//     the verdict to be **not** clean for a repairing task (:747-775, :1135-1150). This
-//     fixture is built to satisfy all four.
-//   - review.json needs schema_version, plan_hash, task_id, candidate_sha, clean and
-//     findings, and `clean` must be false **only** with at least one blocking finding —
-//     `clean != (blocking == 0)` is rejected (internal/cli/result.go:286-318, :426-437).
-//     A finding needs id, severity (critical|major|minor), issue and requested_change, and a
-//     `location` **field** whose value may be null or path:line — null is explicitly valid
-//     (decodeNullableString and validateFindingLocation, result.go:340-401). This fixture
-//     supplies a path:line because a real finding usually has one, not because null is
-//     rejected (review T13b b8 f1).
+// The authorities are, and should be read rather than paraphrased here:
 //
-// Neither shape is re-decoded here, and that is a layering decision rather than a
-// limitation: gate decoding is private to internal/pipeline, but the review verdict *is*
-// reachable through the exported cli.NewOutputAdapter(...).NewAttempt().ValidateReviewResult
-// path (review T13b b5 f5). A schema round-trip belongs in internal/cli or
-// internal/pipeline, where the schema lives; here the shapes are pinned by construction
-// against the references above so that this test stays about rendering.
+//   - gate.json — readGateEvidence for the required and permitted fields, then
+//     validateGateEvidence for the cross-checks against the config snapshot, the task's
+//     candidate and both log paths (internal/pipeline/task_evidence.go). loadRepairEvidence
+//     runs them in that order, so those constraints hold on the **read** path, not only where
+//     the writer derives the log names.
+//   - review.json — cli.decodeImplementationReview for the required fields and the
+//     `clean == (blocking == 0)` rule, then validateImplementationReviewTargets for the
+//     schema/kind, plan_hash, task_id and candidate_sha checks, and loadRepairEvidence itself
+//     for the separate "a repairing task must not have a clean review" check
+//     (internal/cli/result.go, internal/pipeline/task_evidence.go).
+//
+// Enumerating each validator's conditions in prose here went wrong in six consecutive review
+// rounds — a paraphrase drifts from the code and nothing catches it. So the conditions this
+// fixture must satisfy are **asserted** at the end of this function instead, and the prose is
+// kept to naming where the truth lives. Neither schema is re-decoded here: that is a layering
+// decision, since gate decoding is private to internal/pipeline while the review verdict is
+// reachable through cli.NewOutputAdapter(...).NewAttempt().ValidateReviewResult, and a schema
+// round-trip belongs where the schema lives (review T13b b5 f5, b8 f1, b9 f1, b10 f1).
 func writePressureEvidence(
 	t *testing.T,
 	currentRun *pipeline.Run,
@@ -2499,8 +2490,47 @@ func writePressureEvidence(
 			t.Fatalf("gate log %q is not a clean run-relative path", relative)
 		}
 	}
-	if *currentRun.State.ApprovedPlanHash == "" {
-		t.Fatal("the review verdict cites an empty approved plan hash")
+	// The review document is decoded back and checked against the rules production applies to
+	// it, so the fixture cannot drift out of schema unnoticed.
+	var decoded struct {
+		SchemaVersion int    `json:"schema_version"`
+		PlanHash      string `json:"plan_hash"`
+		TaskID        string `json:"task_id"`
+		CandidateSHA  string `json:"candidate_sha"`
+		Clean         bool   `json:"clean"`
+		Findings      []struct {
+			Severity string `json:"severity"`
+		} `json:"findings"`
+	}
+	if err := json.Unmarshal(review, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	blocking := 0
+	for _, finding := range decoded.Findings {
+		switch finding.Severity {
+		case "critical", "major", "minor":
+		default:
+			t.Fatalf("finding severity %q is not one of critical|major|minor",
+				finding.Severity)
+		}
+		if finding.Severity != "minor" {
+			blocking++
+		}
+	}
+	switch {
+	case decoded.SchemaVersion != 1:
+		t.Fatalf("review schema_version is %d, want 1", decoded.SchemaVersion)
+	case decoded.PlanHash != *currentRun.State.ApprovedPlanHash:
+		t.Fatalf("review plan_hash %q is not the approved %q",
+			decoded.PlanHash, *currentRun.State.ApprovedPlanHash)
+	case decoded.TaskID != taskID:
+		t.Fatalf("review task_id %q is not %q", decoded.TaskID, taskID)
+	case decoded.CandidateSHA != candidateSHA:
+		t.Fatalf("review candidate_sha %q is not %q", decoded.CandidateSHA, candidateSHA)
+	case decoded.Clean != (blocking == 0):
+		t.Fatalf("review clean=%v with %d blocking findings", decoded.Clean, blocking)
+	case decoded.Clean:
+		t.Fatal("a repairing task must not carry a clean review")
 	}
 	switch stored := currentRun.State.Tasks[taskID].CandidateSHA; {
 	case stored == nil:
