@@ -1949,6 +1949,9 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 		attempts int
 		seed     func(*testing.T, *pipeline.Run, string)
 		signals  []string
+		// yields is the other half of the R2 contract: when the signals leave fewer than
+		// three rows, the section is dropped entirely rather than pushing a signal off.
+		yields bool
 	}{
 		{
 			name:     "task_cap pause",
@@ -2002,6 +2005,26 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 			},
 			signals: []string{"gate failed on the second attempt"},
 		},
+		{
+			// Measured: a real pipeline failure message is far longer than a hand-written
+			// one — this is the shape cycle.fail produces, wrapping to enough rows that
+			// fewer than three are left. The section must then disappear completely, which
+			// until now was only ever checked by calling renderChangedFiles directly.
+			name:     "failure long enough to drop the section",
+			attempts: 1,
+			seed: func(t *testing.T, currentRun *pipeline.Run, _ string) {
+				t.Helper()
+				if err := currentRun.State.Fail(
+					"pipeline: implementation gate failed: runner: command exited with " +
+						"code 1 on attempt 3: go vet ./...: internal/ui/view.go:12: " +
+						"undefined identifier",
+				); err != nil {
+					t.Fatal(err)
+				}
+			},
+			signals: []string{"pipeline: implementation gate failed"},
+			yields:  true,
+		},
 	} {
 		// Witness note (measured, not assumed): only the **failed** case is the budget
 		// witness. Its error hardwraps to two rows, which is exactly the row that the
@@ -2031,6 +2054,19 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 						t.Fatalf("%s: the file list displaced %q:\n%s",
 							surface.name, signal, surface.rendered)
 					}
+				}
+				if pressure.yields {
+					// The signal took the rows, so the section is gone entirely — not
+					// half-rendered, and not pushing the signal off the card.
+					if strings.Contains(surface.rendered, "CHANGED") {
+						t.Fatalf("%s: the section should have yielded to the signal:\n%s",
+							surface.name, surface.rendered)
+					}
+					if !strings.Contains(surface.rendered, "╰") {
+						t.Fatalf("%s: the STATUS card does not close:\n%s",
+							surface.name, surface.rendered)
+					}
+					continue
 				}
 				// And the section itself is present — otherwise this proves nothing about
 				// yielding.

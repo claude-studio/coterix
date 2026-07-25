@@ -1319,6 +1319,12 @@ func renderChangedFiles(
 	budget int,
 ) string {
 	// One row for the heading, one for the total: below that the section says nothing.
+	//
+	// This is also the only thing keeping the slice below in range. renderSidebar computes
+	// the budget by subtracting what the cards already spend, and under a long failure
+	// message that really does go **negative** — measured: removing this guard panics with
+	// `slice bounds out of range [:-5]` on the production render path, not merely dropping
+	// a row.
 	if len(files) == 0 || budget < 3 {
 		return ""
 	}
