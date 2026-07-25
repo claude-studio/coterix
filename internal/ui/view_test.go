@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"image/color"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -2484,26 +2485,6 @@ func writePressureEvidence(
 	task.GateResult = &gatePath
 	task.ReviewResult = &reviewPath
 
-	// Each log path is held to the same rule validateRunRelativePath applies and then
-	// confirmed to be a real regular file inside the run directory. The earlier version of
-	// this check accepted "../outside.log", which production rejects, so the rule is spelled
-	// out in full here rather than approximated (review T13b b12 f1).
-	for _, relative := range []string{stdoutLog, stderrLog} {
-		cleaned := filepath.Clean(relative)
-		switch {
-		case relative == "" || filepath.IsAbs(relative) || cleaned != relative,
-			cleaned == "." || cleaned == "..",
-			strings.HasPrefix(cleaned, ".."+string(filepath.Separator)):
-			t.Fatalf("gate log %q is not a clean run-relative path", relative)
-		}
-		info, err := os.Lstat(filepath.Join(currentRun.Dir, relative))
-		if err != nil {
-			t.Fatalf("gate log %q is not readable: %v", relative, err)
-		}
-		if !info.Mode().IsRegular() {
-			t.Fatalf("gate log %q is not a regular file", relative)
-		}
-	}
 	// The review document is validated by **production's own decoder**, not a paraphrase of
 	// it: cli.ValidateReviewResult runs decodeImplementationReview, which enforces every
 	// required field, the severity vocabulary, the location shape and the
@@ -2553,6 +2534,12 @@ func writePressureEvidence(
 	if err := gateDecoder.Decode(&gateWire); err != nil {
 		t.Fatalf("gate evidence does not decode strictly: %v", err)
 	}
+	// readGateEvidence follows its Decode with requireJSONEOF, so a trailing second JSON value
+	// is rejected there. Without this the mirror accepted it (review T13b b13 f2).
+	var trailing any
+	if err := gateDecoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		t.Fatalf("gate evidence carries more than one JSON value (err=%v)", err)
+	}
 	switch {
 	case gateWire.Command == nil || gateWire.CWD == nil || gateWire.CandidateSHA == nil ||
 		gateWire.Exit == nil || gateWire.TimedOut == nil ||
@@ -2566,6 +2553,32 @@ func writePressureEvidence(
 			*gateWire.CWD, currentRun.Config.GateCWD)
 	case *gateWire.CandidateSHA != candidateSHA:
 		t.Fatalf("gate candidate_sha %q is not %q", *gateWire.CandidateSHA, candidateSHA)
+	}
+
+	// The log paths are checked **as the document carries them**, not as the local variables
+	// that happened to produce it: validateGateEvidence reads evidence.StdoutLog and
+	// evidence.StderrLog, so checking the variables left a value written straight into the map
+	// unexamined — and my own mutation of the variable moved both sides at once and proved
+	// nothing (review T13b b13 f1). Each is held to validateRunRelativePath's six conditions
+	// and then to being a real regular file inside the run directory.
+	for name, relative := range map[string]string{
+		"stdout_log": *gateWire.StdoutLog,
+		"stderr_log": *gateWire.StderrLog,
+	} {
+		cleaned := filepath.Clean(relative)
+		switch {
+		case relative == "" || filepath.IsAbs(relative) || cleaned != relative,
+			cleaned == "." || cleaned == "..",
+			strings.HasPrefix(cleaned, ".."+string(filepath.Separator)):
+			t.Fatalf("gate %s %q is not a clean run-relative path", name, relative)
+		}
+		info, err := os.Lstat(filepath.Join(currentRun.Dir, relative))
+		if err != nil {
+			t.Fatalf("gate %s %q is not readable: %v", name, relative, err)
+		}
+		if !info.Mode().IsRegular() {
+			t.Fatalf("gate %s %q is not a regular file", name, relative)
+		}
 	}
 
 	switch stored := currentRun.State.Tasks[taskID].CandidateSHA; {
