@@ -198,7 +198,7 @@ func renderMain(current model, width, height int) string {
 	wants := make([]int, len(order))
 	for index, box := range order {
 		bodies[index] = mainBoxBody(current, box, innerWidth, max(1, total/2-2))
-		wants[index] = mainBoxWantRows(current, box, bodies[index])
+		wants[index] = mainBoxWantRows(current, box, bodies[index], total)
 	}
 	heights := distributeMainBoxHeights(order, wants, total, 2)
 
@@ -265,7 +265,7 @@ func renderMainCompact(current model, width, height int) string {
 			bodyWidth,
 			max(1, innerHeight/2-1),
 		)
-		wants[index] = mainBoxWantRows(current, box, bodies[index])
+		wants[index] = mainBoxWantRows(current, box, bodies[index], innerHeight)
 	}
 	// One row of chrome per section (its title). Sharing one budget is what keeps
 	// the bottom section from being clipped without a marker at 80x24, where a
@@ -331,6 +331,11 @@ func artifactBody(current model) string {
 // that row's timestamp out of line with its neighbours (T14 W4).
 const selectionGutter = 2
 
+// maxExpandedTextRows bounds an expanded entry so the whole block — marker, columns
+// and text — fits the rows LIVE OUTPUT can be given (review T14c f3). One header row
+// plus this plus the withheld marker has to stay inside the box's half-pane cap.
+const maxExpandedTextRows = 6
+
 func lifecycleBody(current model, innerWidth int) string {
 	if len(current.logs) == 0 {
 		return current.theme.styles.Muted.Render(
@@ -380,13 +385,27 @@ func expandedEntryLines(
 		),
 	}
 	indent := strings.Repeat(" ", selectionGutter+2)
-	wrapped := ansi.HardwrapWc(
+	wrapped := strings.Split(ansi.HardwrapWc(
 		remapANSI16(line.Text, current.theme.tokens.ANSI),
 		max(1, textWidth-2),
 		false,
-	)
-	for _, row := range strings.Split(wrapped, "\n") {
+	), "\n")
+	// The block has to fit the rows the box can actually give it, or its head — the
+	// marker and the columns — is scrolled off with no key to bring it back
+	// (review T14c f3). What is withheld is named, and the untruncated text is in
+	// the run's logs/ files (spec: 원문 보존).
+	withheld := 0
+	if len(wrapped) > maxExpandedTextRows {
+		withheld = len(wrapped) - maxExpandedTextRows
+		wrapped = wrapped[:maxExpandedTextRows]
+	}
+	for _, row := range wrapped {
 		rows = append(rows, indent+current.theme.styles.Value.Render(row))
+	}
+	if withheld > 0 {
+		rows = append(rows, indent+current.theme.styles.Muted.Render(
+			fmt.Sprintf("… %d more rows in logs/", withheld),
+		))
 	}
 	return rows
 }
@@ -493,10 +512,22 @@ func activityRenderLimit(current model) int {
 // for a paused ACTIVITY, which renders its whole retained buffer: letting that
 // body set the height would grow the box (and shrink FEED) the moment the reader
 // scrolled back (review T14a-r2 f1).
-func mainBoxWantRows(current model, box mainBox, body string) int {
+func mainBoxWantRows(current model, box mainBox, body string, total int) int {
 	rows := countRows(body)
-	if box == boxActivity {
+	switch box {
+	case boxActivity:
 		rows = min(rows, activityTailLimit(current))
+	case boxPending:
+		rows = min(rows, max(1, total/2))
+	case boxLiveOutput:
+		// Normally a third of the pane. An expanded entry is a deliberate request to
+		// read one entry in full, so the box may take half — otherwise the block is
+		// clipped and its head is unreachable (review T14c f3).
+		share := total / 3
+		if current.hasSelection && current.entryExpanded {
+			share = total / 2
+		}
+		rows = min(rows, max(1, share))
 	}
 	return rows
 }
@@ -582,13 +613,9 @@ func distributeMainBoxHeights(
 		if index < 0 || !survivors[box] {
 			continue
 		}
-		want := wants[index] + chrome
-		switch box {
-		case boxPending:
-			want = min(want, max(minRows, total/2))
-		case boxLiveOutput:
-			want = min(want, max(minRows, total/3))
-		}
+		// The per-box share is applied by mainBoxWantRows, which knows whether the
+		// cursor is expanded; this loop only distributes what was asked for.
+		want := max(minRows, wants[index]+chrome)
 		grow := min(remaining, max(0, want-heights[index]))
 		heights[index] += grow
 		remaining -= grow

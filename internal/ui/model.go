@@ -252,6 +252,7 @@ func (current model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 					runner.StreamStderr,
 					logIconFail,
 					"",
+					"",
 					fmt.Sprintf("artifact refresh: %v", message.err),
 				)
 			} else {
@@ -327,6 +328,7 @@ func (current model) updatePipelineEvent(
 		current.appendSystemLog(
 			runner.StreamStdout,
 			logIconStart,
+			event.Step,
 			displayStep(event),
 			event.CLI+" started",
 		)
@@ -385,6 +387,7 @@ func (current model) finishOperation(
 			runner.StreamStderr,
 			logIconFail,
 			"",
+			"",
 			result.err.Error(),
 		)
 	}
@@ -407,6 +410,20 @@ func (current model) updateKey(
 	}
 	if current.prompt != promptNone {
 		return current.updatePromptKey(key)
+	}
+	// The overlay is modal: while it is up it swallows everything except its own
+	// close keys and a safe stop. Letting `a`/`r`/`enter` through opened a prompt
+	// *behind* the overlay, after which `?` was consumed by the prompt and the first
+	// `esc` only cancelled it — two surfaces at once, which the single-overlay
+	// contract forbids (review T14c f4).
+	if current.helpOpen {
+		switch key.String() {
+		case "ctrl+c", "q":
+			return current.requestStop()
+		case "?", "esc":
+			current.helpOpen = false
+		}
+		return current, nil
 	}
 
 	switch key.String() {
@@ -433,15 +450,10 @@ func (current model) updateKey(
 			}
 		}
 	case "?":
-		current.helpOpen = !current.helpOpen
+		current.helpOpen = true
 	case "esc":
-		if current.helpOpen {
-			// The overlay is the only thing esc closes while it is up — there is no
-			// dialog stack to unwind (T14 W6).
-			current.helpOpen = false
-			break
-		}
-		// Drop the cursor and follow again (T14 W4).
+		// Drop the cursor and follow again (T14 W4). The overlay is handled by the
+		// modal branch above, so it cannot be open here.
 		current.clearSelection()
 	case "home":
 		for _, target := range current.scrollTargets() {
@@ -765,6 +777,23 @@ func (current *model) appendLog(entry logEntry) {
 			}
 		}
 	}
+	// A cursor on the newest entry sits at offset 0, which preserveReading reads as
+	// "following the live edge" and leaves alone — so the viewport followed the new
+	// line while the cursor stayed behind, and the marker drifted off the window
+	// (review T14c f2). Deriving the offset from the cursor makes offset 0 an anchor
+	// like any other.
+	current.syncCursorViewport()
+}
+
+// syncCursorViewport puts the cursor's entry back on the window's last row. The
+// offset counts the rows below it, and every entry below the cursor is one row, so
+// expanding the cursor's own entry does not change it.
+func (current *model) syncCursorViewport() {
+	if !current.hasSelection || len(current.logs) == 0 {
+		return
+	}
+	current.selectedEntry = min(max(current.selectedEntry, 0), len(current.logs)-1)
+	current.boxScroll[boxLiveOutput] = len(current.logs) - 1 - current.selectedEntry
 }
 
 // appendActivity feeds the pinned activity tail instead of the lifecycle feed:
@@ -899,9 +928,7 @@ func (current *model) moveSelection(delta int) {
 	}
 	current.selectedEntry = next
 	current.hasSelection = true
-	// Expanding the cursor's entry adds rows *at* the cursor, so the count of rows
-	// below it — which is what the offset measures — does not change.
-	current.boxScroll[boxLiveOutput] = len(current.logs) - 1 - next
+	current.syncCursorViewport()
 }
 
 // evidenceTab maps a pipeline step to the artifact it produces (T14 W4). Steps with
@@ -953,9 +980,14 @@ func eventFailed(event pipeline.Event) bool {
 // role names whose step the entry is about. It used to be the constant "control",
 // which made the meta column repeat `control ·` on every row while the text
 // carried the real role — the same information twice (T14 W11).
+// appendSystemLog records one harness lifecycle entry. `step` is the *pipeline*
+// step the event belongs to, kept separate from the display role: the entry's Step
+// is what `enter` uses to open that step's artifact, and hardcoding it to "coterix"
+// silently disabled the whole W4 evidence link (review T14c f1).
 func (current *model) appendSystemLog(
 	stream runner.Stream,
 	icon logIcon,
+	step string,
 	role string,
 	text string,
 ) {
@@ -963,7 +995,7 @@ func (current *model) appendSystemLog(
 		role = "coterix"
 	}
 	current.appendLog(logEntry{
-		Step:   "coterix",
+		Step:   step,
 		Role:   role,
 		CLI:    "coterix",
 		Stream: stream,
@@ -993,7 +1025,7 @@ func (current *model) appendAttempt(event pipeline.Event) {
 		stream = runner.StreamStderr
 		icon = logIconFail
 	}
-	current.appendSystemLog(stream, icon, displayStep(event), message)
+	current.appendSystemLog(stream, icon, event.Step, displayStep(event), message)
 }
 
 func (current *model) appendStepFinished(event pipeline.Event) {
@@ -1005,7 +1037,7 @@ func (current *model) appendStepFinished(event pipeline.Event) {
 		stream = runner.StreamStderr
 		icon = logIconFail
 	}
-	current.appendSystemLog(stream, icon, displayStep(event), message)
+	current.appendSystemLog(stream, icon, event.Step, displayStep(event), message)
 }
 
 func displayStep(event pipeline.Event) string {

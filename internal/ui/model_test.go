@@ -912,6 +912,7 @@ func wantRowsFor(current model, order []mainBox, innerWidth int) []int {
 			current,
 			box,
 			mainBoxBody(current, box, innerWidth, 10),
+			30,
 		)
 	}
 	return wants
@@ -1996,4 +1997,166 @@ func TestApproveNeedsConfirmationAndEscapeCancels(t *testing.T) {
 	}
 	_ = operationDoneFromCommand(t, command)
 	assertUICall(t, fake, operationApprove, "run-a", nil)
+}
+
+// f1: the artifact link has to work on the entries the *pipeline* produces, not only
+// on hand-built ones. appendSystemLog used to stamp every entry's Step as "coterix",
+// which disabled the link while the test suite still passed (review T14c f1).
+func TestExpandingARealPipelineEntryOpensItsArtifact(t *testing.T) {
+	for _, test := range []struct {
+		step string
+		want artifactTab
+		same bool
+	}{
+		{step: pipeline.StepPlan, want: tabPlan},
+		{step: pipeline.StepImplementation, want: tabDiff},
+		{step: pipeline.StepPlanReview, want: tabVerdict},
+		{step: pipeline.StepImplementationReview, want: tabVerdict},
+		// Steps with no artifact of their own must leave the tab alone.
+		{step: pipeline.StepGate, want: tabDiff, same: true},
+		{step: pipeline.StepFix, want: tabDiff, same: true},
+	} {
+		t.Run(test.step, func(t *testing.T) {
+			current := populatedViewModel(t)
+			current.focus = boxLiveOutput
+			current.artifactTab = tabDiff
+			// The real path: a pipeline event, not a hand-built logEntry.
+			updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
+				Kind: pipeline.EventStepStarted,
+				Step: test.step,
+				Role: "some_role",
+				CLI:  "claude",
+			}})
+			current = updated.(model)
+			if got := current.logs[len(current.logs)-1].Step; got != test.step {
+				t.Fatalf("the lifecycle entry lost its pipeline step: %q", got)
+			}
+
+			updated, _ = current.Update(printableKey('k'))
+			current = updated.(model)
+			updated, _ = current.Update(specialKey(tea.KeyEnter))
+			current = updated.(model)
+			if !current.entryExpanded {
+				t.Fatal("enter did not expand the entry")
+			}
+			if current.artifactTab != test.want {
+				t.Fatalf("tab=%d want=%d", current.artifactTab, test.want)
+			}
+			if test.same && current.artifactTab != tabDiff {
+				t.Fatalf("a step with no artifact moved the tab to %d", current.artifactTab)
+			}
+		})
+	}
+}
+
+// f2: a cursor on the newest entry is still a cursor. Its offset is 0, which the
+// drift correction reads as "following", so the viewport used to run ahead and leave
+// the marker behind (review T14c f2).
+func TestCursorOnNewestEntryStaysAnchoredAsLogsArrive(t *testing.T) {
+	current := populatedViewModel(t)
+	for index := 0; index < 6; index++ {
+		current.appendLog(logEntry{Role: fmt.Sprintf("role-%02d", index), Text: "x"})
+	}
+	current.focus = boxLiveOutput
+
+	updated, _ := current.Update(printableKey('k'))
+	current = updated.(model)
+	anchored := current.logs[current.selectedEntry].Role
+
+	for index := 6; index < 12; index++ {
+		current.appendLog(logEntry{Role: fmt.Sprintf("role-%02d", index), Text: "x"})
+		if got := current.logs[current.selectedEntry].Role; got != anchored {
+			t.Fatalf("the cursor drifted to %q after %d new rows, want %q",
+				got, index-5, anchored)
+		}
+		if want := len(current.logs) - 1 - current.selectedEntry; current.boxScroll[boxLiveOutput] != want {
+			t.Fatalf("offset=%d want=%d — the cursor must drag the viewport",
+				current.boxScroll[boxLiveOutput], want)
+		}
+	}
+
+	// The marker is still the last row of the window the box actually renders.
+	rows := strings.Split(ansi.Strip(visibleLines(
+		lifecycleBody(current, 100),
+		4,
+		current.boxScroll[boxLiveOutput],
+	)), "\n")
+	if !strings.HasPrefix(rows[len(rows)-1], "▌▸") {
+		t.Fatalf("the cursor left the window:\n%s", strings.Join(rows, "\n"))
+	}
+}
+
+// f3: an entry longer than the box must still be readable — head, marker and all —
+// inside the height LIVE OUTPUT is actually given (review T14c f3).
+func TestExpandedEntryFitsTheHeightItIsGiven(t *testing.T) {
+	current := populatedViewModel(t)
+	current.width = wideBreakpointWidth
+	current.height = wideBreakpointHeight
+	for index := 0; index < 8; index++ {
+		current.appendLog(logEntry{Role: fmt.Sprintf("role-%02d", index), Text: "short"})
+	}
+	current.appendLog(logEntry{
+		Step: pipeline.StepGate,
+		Role: "gate",
+		Text: strings.Repeat("a very long gate failure explanation ", 30),
+	})
+	current.focus = boxLiveOutput
+
+	updated, _ := current.Update(printableKey('k'))
+	current = updated.(model)
+	updated, _ = current.Update(specialKey(tea.KeyEnter))
+	current = updated.(model)
+
+	frame := ansi.Strip(renderMain(current, wideBreakpointWidth-sidebarWidth, 26))
+	if !strings.Contains(frame, "▌▸") {
+		t.Fatalf("the expanded entry's marker was clipped out of the box:\n%s", frame)
+	}
+	if !strings.Contains(frame, "gate") {
+		t.Fatalf("the expanded entry's columns were clipped:\n%s", frame)
+	}
+	// Everything withheld is named rather than silently dropped.
+	if !strings.Contains(frame, "more rows in logs/") {
+		t.Fatalf("the truncated tail is not accounted for:\n%s", frame)
+	}
+}
+
+// f4: the overlay is modal. Nothing may open behind it (review T14c f4).
+func TestHelpOverlaySwallowsActionKeys(t *testing.T) {
+	base := populatedViewModel(t)
+	base.status.Phase = state.PhaseAwaitingApproval
+
+	for _, key := range []rune{'a', 'r', 'j', 'k', '1', '?'} {
+		current := base
+		updated, _ := current.Update(printableKey('?'))
+		current = updated.(model)
+		if !current.helpOpen {
+			t.Fatal("`?` did not open the overlay")
+		}
+		updated, command := current.Update(printableKey(key))
+		current = updated.(model)
+
+		if key == '?' {
+			if current.helpOpen {
+				t.Fatal("`?` did not close the overlay")
+			}
+			continue
+		}
+		if command != nil {
+			t.Fatalf("key %q started an operation from behind the overlay", key)
+		}
+		if current.prompt != promptNone {
+			t.Fatalf("key %q opened a prompt behind the overlay", key)
+		}
+		if !current.helpOpen {
+			t.Fatalf("key %q closed the overlay", key)
+		}
+		if current.hasSelection || current.artifactTab != base.artifactTab {
+			t.Fatalf("key %q changed state behind the overlay", key)
+		}
+		// esc still closes it, on the first press.
+		updated, _ = current.Update(specialKey(tea.KeyEscape))
+		if updated.(model).helpOpen {
+			t.Fatalf("esc did not close the overlay after %q", key)
+		}
+	}
 }
