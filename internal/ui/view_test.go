@@ -1720,3 +1720,183 @@ func TestPathsRenderAsZeroWidthHyperlinks(t *testing.T) {
 		)
 	})
 }
+
+// T13 W6: the terminal tab is often the only place a long run is visible.
+func TestWindowTitleNamesTheRunAndPhase(t *testing.T) {
+	current := populatedViewModel(t)
+	if got := windowTitle(current); !strings.Contains(got, "run-9") ||
+		!strings.Contains(got, string(state.PhaseAwaitingApproval)) {
+		t.Fatalf("window title = %q, want the run id and phase", got)
+	}
+	// The real View() must carry it, not just the helper.
+	if got := current.View().WindowTitle; got != windowTitle(current) {
+		t.Fatalf("View() title = %q, helper = %q", got, windowTitle(current))
+	}
+	// Before a run is loaded there is nothing to name.
+	bare := testModel(t, &fakeUIControl{})
+	if got := windowTitle(bare); got != "coterix" {
+		t.Fatalf("title before a run = %q", got)
+	}
+}
+
+// T13 W7: the WORKING text shimmers by sliding its gradient one cell per spinner tick.
+// The spinner already animates its own frames, so this must add no second timer and no
+// extra render cost — the blend is computed once and the window slides.
+func TestWorkingTextShimmerAdvancesWithTheSpinner(t *testing.T) {
+	current := populatedViewModel(t)
+	current.activeRole = "impl_writer"
+	current.activeStep = pipeline.StepImplementation
+
+	first := statusSignal(current)
+	advanced := current
+	advanced.shimmerPhase++
+	second := statusSignal(advanced)
+
+	if first == second {
+		t.Fatal("the shimmer did not move between phases")
+	}
+	// Only the colours move: the text is identical.
+	if ansi.Strip(first) != ansi.Strip(second) {
+		t.Fatalf("the shimmer changed the text:\n%q\n%q",
+			ansi.Strip(first), ansi.Strip(second))
+	}
+	// A full cycle returns to the start, so the animation is stable rather than drifting.
+	width := ansi.StringWidth(ansi.Strip(" " + strings.ToUpper("impl_writer") + " WORKING"))
+	cycled := current
+	cycled.shimmerPhase += width
+	if statusSignal(cycled) != first {
+		t.Fatal("a full cycle did not return to the starting frame")
+	}
+
+	// The tick has to be wired: a spinner tick *while working* advances the phase.
+	// Bumping shimmerPhase by hand above proves the render reacts, not that anything
+	// drives it (self-correction: the wiring mutation passed until this was added).
+	working := populatedViewModel(t)
+	working.activeRole = "impl_writer"
+	working.activeStep = pipeline.StepImplementation
+	ticked, _ := working.Update(working.spinner.Tick())
+	if ticked.(model).shimmerPhase != working.shimmerPhase+1 {
+		t.Fatalf("a spinner tick did not advance the shimmer: %d -> %d",
+			working.shimmerPhase, ticked.(model).shimmerPhase)
+	}
+
+	// The tick is the spinner's, and it only advances while working.
+	idle := populatedViewModel(t)
+	idle.activeRole = ""
+	idle.activeStep = ""
+	idle.operation = ""
+	updated, _ := idle.Update(idle.spinner.Tick())
+	if updated.(model).shimmerPhase != idle.shimmerPhase {
+		t.Fatal("the shimmer advanced while idle")
+	}
+}
+
+// T13 W5: the changed-files list is last in the rail and only uses rows the signals did
+// not need. The budget contract (R2) is that intervention signals are never pushed off.
+func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
+	files := make([]changedFile, 0, 9)
+	for index := 0; index < 9; index++ {
+		files = append(files, changedFile{
+			Path:      fmt.Sprintf("internal/ui/file-%02d.go", index),
+			Additions: index + 1,
+			Deletions: index,
+		})
+	}
+	current := populatedViewModel(t)
+	current.artifacts.ChangedFiles = files
+	data := deriveSidebar(current)
+
+	t.Run("it renders with room and reports the total", func(t *testing.T) {
+		body := ansi.Strip(renderChangedFiles(current.theme, files, 26, 12))
+		if !strings.Contains(body, "CHANGED") {
+			t.Fatalf("no section heading:\n%s", body)
+		}
+		if !strings.Contains(body, "9 files") {
+			t.Fatalf("no total:\n%s", body)
+		}
+		// Capped at five, and the hidden count is stated rather than dropped silently.
+		if !strings.Contains(body, "hidden") {
+			t.Fatalf("hidden files not accounted for:\n%s", body)
+		}
+		if got := countRows(body); got > 7 {
+			t.Fatalf("the section took %d rows:\n%s", got, body)
+		}
+	})
+
+	t.Run("it disappears when there is no room", func(t *testing.T) {
+		for _, budget := range []int{-3, 0, 1, 2} {
+			if body := renderChangedFiles(current.theme, files, 26, budget); body != "" {
+				t.Fatalf("budget %d still rendered:\n%s", budget, body)
+			}
+		}
+	})
+
+	// Approval and pending_action are mutually exclusive by design — approval is a
+	// phase, not a pending_action (spec) — so each pressure case is checked on its own.
+	for _, pressure := range []struct {
+		name    string
+		mutate  func(sidebarData) sidebarData
+		signals []string
+	}{
+		{
+			name: "approval needed plus an error",
+			mutate: func(in sidebarData) sidebarData {
+				in.AwaitingApproval = true
+				in.LastError = "gate failed on the second attempt"
+				return in
+			},
+			signals: []string{
+				"APPROVAL NEEDED",
+				"gate failed on the second attempt",
+			},
+		},
+		{
+			name: "pending question plus an error",
+			mutate: func(in sidebarData) sidebarData {
+				// Approval wins over pending in the render, so this case has to clear it
+				// — the two are mutually exclusive states, not stacked ones.
+				in.AwaitingApproval = false
+				in.PendingKind = state.PendingTaskCap
+				in.PendingPrompt = "attempt cap reached"
+				in.LastError = "gate failed on the second attempt"
+				return in
+			},
+			signals: []string{
+				"attempt cap reached",
+				"gate failed on the second attempt",
+			},
+		},
+	} {
+		t.Run("signals survive: "+pressure.name, func(t *testing.T) {
+			body := ansi.Strip(renderSidebarBody(
+				current.theme,
+				pressure.mutate(data),
+				26,
+				true,
+				true,
+			))
+			rows := strings.Split(strings.TrimRight(body, "\n"), "\n")
+			if len(rows) > sidebarRowBudget {
+				t.Fatalf("the rail overflowed to %d rows:\n%s", len(rows), body)
+			}
+			// Signals are hardwrapped to the rail width, and a wrap can fall *inside* a
+			// word ("secon" / "d attempt"). Joining on spaces would not rejoin that, so
+			// compare with the whitespace removed entirely.
+			squeeze := func(text string) string {
+				return strings.Join(strings.Fields(text), "")
+			}
+			flat := squeeze(body)
+			for _, signal := range pressure.signals {
+				if !strings.Contains(flat, squeeze(signal)) {
+					t.Fatalf("the file list displaced %q:\n%s", signal, body)
+				}
+			}
+			// And the section itself is present — otherwise this proves nothing about
+			// yielding.
+			if !strings.Contains(body, "CHANGED") {
+				t.Fatalf("the file list is absent, so the budget was not exercised:\n%s",
+					body)
+			}
+		})
+	}
+}

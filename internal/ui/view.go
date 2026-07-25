@@ -20,6 +20,10 @@ const (
 	topBarHeight    = 2
 	wordmarkText    = "C O T E R I X"
 	logTagCellWidth = 6
+	// sidebarRowBudget is the canonical rail height the cards share (spec: 26행 예산).
+	sidebarRowBudget = 26
+	// maxChangedFilesShown caps the T13 W5 list before the budget does.
+	maxChangedFilesShown = 5
 )
 
 // THESIS: Make a synchronous multi-agent pipeline readable as one live
@@ -51,6 +55,9 @@ type sidebarData struct {
 	PendingKind      state.PendingKind
 	PendingPrompt    string
 	LastError        string
+	// ChangedFiles is the candidate's touched files. It renders **last** and only into
+	// rows the intervention signals and fixed fields did not need (T13 W5 · R2).
+	ChangedFiles []changedFile
 }
 
 // Measured 2026-07-25 (x/ansi v0.11.7): `ansi.StringWidth` counts an OSC8 escape as
@@ -1281,20 +1288,84 @@ func renderSidebarBody(
 		content.WriteString("\n")
 	}
 
+	// The file list is last on purpose: the rail is a fixed 26-row budget and
+	// renderSidebar silently truncates the overflow, so anything appended here must only
+	// use rows the intervention signals and the fixed fields did not need. `budget <= 0`
+	// drops the section entirely rather than pushing a signal off the card (T13 W5 · R2).
+	if body := renderChangedFiles(
+		currentTheme,
+		data.ChangedFiles,
+		innerWidth,
+		sidebarRowBudget-countRows(strings.TrimSuffix(content.String(), "\n")),
+	); body != "" {
+		content.WriteString(body)
+		content.WriteString("\n")
+	}
+
 	return content.String()
+}
+
+// renderChangedFiles shows up to five files plus a total, shrinking to fit `budget`
+// rows and disappearing when there are none to spare (T13 W5).
+func renderChangedFiles(
+	currentTheme theme,
+	files []changedFile,
+	innerWidth int,
+	budget int,
+) string {
+	// One row for the heading, one for the total: below that the section says nothing.
+	if len(files) == 0 || budget < 3 {
+		return ""
+	}
+	rows := []string{renderSidebarSectionTitle(currentTheme, "CHANGED", innerWidth)}
+	shown := min(len(files), min(maxChangedFilesShown, budget-2))
+	additions, deletions := 0, 0
+	for _, file := range files {
+		additions += file.Additions
+		deletions += file.Deletions
+	}
+	for _, file := range files[:shown] {
+		counts := currentTheme.styles.Muted.Render(fmt.Sprintf(
+			" +%d/-%d",
+			file.Additions,
+			file.Deletions,
+		))
+		path := ansi.TruncateLeftWc(
+			file.Path,
+			max(0, ansi.StringWidth(file.Path)-
+				max(1, innerWidth-ansi.StringWidth(ansi.Strip(counts)))),
+			"…",
+		)
+		rows = append(rows, currentTheme.styles.Value.Render(path)+counts)
+	}
+	total := fmt.Sprintf("%d files · +%d/-%d", len(files), additions, deletions)
+	if shown < len(files) {
+		total = fmt.Sprintf(
+			"%d files (%d hidden) · +%d/-%d",
+			len(files),
+			len(files)-shown,
+			additions,
+			deletions,
+		)
+	}
+	rows = append(rows, currentTheme.styles.Label.Render(
+		ansi.TruncateWc(total, innerWidth, "…"),
+	))
+	return strings.Join(rows, "\n")
 }
 
 func deriveSidebar(current model) sidebarData {
 	data := sidebarData{
-		RunID:       "starting…",
-		Phase:       state.PhasePlanning,
-		Role:        "—",
-		CLI:         "—",
-		TaskID:      "—",
-		TaskStatus:  state.TaskOpen,
-		Gate:        current.artifacts.GateOutcome,
-		Review:      current.artifacts.ReviewOutcome,
-		PendingKind: "",
+		RunID:        "starting…",
+		Phase:        state.PhasePlanning,
+		Role:         "—",
+		CLI:          "—",
+		TaskID:       "—",
+		TaskStatus:   state.TaskOpen,
+		Gate:         current.artifacts.GateOutcome,
+		Review:       current.artifacts.ReviewOutcome,
+		PendingKind:  "",
+		ChangedFiles: current.artifacts.ChangedFiles,
 	}
 	if current.activeRole != "" || current.activeStep != "" {
 		data.Role = current.activeRole
@@ -1308,6 +1379,9 @@ func deriveSidebar(current model) sidebarData {
 	}
 
 	statusData := deriveStatusFields(current.status)
+	// deriveStatusFields builds a fresh value from the status alone, so anything sourced
+	// from the model has to be re-applied here or it is silently dropped.
+	statusData.ChangedFiles = current.artifacts.ChangedFiles
 	statusGate := statusData.Gate
 	statusReview := statusData.Review
 	statusData.Gate = current.artifacts.GateOutcome
@@ -1667,6 +1741,7 @@ func statusSignal(current model) string {
 			current.spinner.View()+workingGradientText(
 				current.theme,
 				" "+strings.ToUpper(step)+" WORKING",
+				current.shimmerPhase,
 			),
 		)
 	}
@@ -1926,7 +2001,7 @@ func gradientText(currentTheme theme, text string) string {
 	return output.String()
 }
 
-func workingGradientText(currentTheme theme, text string) string {
+func workingGradientText(currentTheme theme, text string, phase int) string {
 	runes := []rune(text)
 	if len(runes) == 0 {
 		return ""
@@ -1939,10 +2014,19 @@ func workingGradientText(currentTheme theme, text string) string {
 	for _, token := range currentTheme.tokens.Gradient.BrandLeftToRight {
 		stops = append(stops, lipgloss.Color(token))
 	}
-	colors := lipgloss.Blend1D(len(runes), stops...)
-	if len(colors) != len(runes) {
+	// Blend across twice the width and slide the window by the shimmer phase: the
+	// gradient appears to travel along the text without recomputing anything per frame
+	// (T13 W7 — the spinner already animates; this is the *text* shimmer, and the spec
+	// asks for the minimum).
+	colors := lipgloss.Blend1D(len(runes)*2, stops...)
+	if len(colors) != len(runes)*2 {
 		return currentTheme.styles.Busy.Render(text)
 	}
+	offset := 0
+	if len(runes) > 0 {
+		offset = ((phase % len(runes)) + len(runes)) % len(runes)
+	}
+	colors = colors[offset : offset+len(runes)]
 	background := lipgloss.Color(currentTheme.tokens.Status.Busy.BG)
 	var output strings.Builder
 	for index, character := range runes {

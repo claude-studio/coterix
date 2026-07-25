@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,11 +39,22 @@ type namedVerdict struct {
 }
 
 type artifactData struct {
-	PlanMarkdown  string
-	DiffContent   *string
+	PlanMarkdown string
+	DiffContent  *string
+	// ChangedFiles is `base..candidate` name + ±counts for the STATUS card (T13 W5).
+	// Derived from the same git call shape as DiffContent, so its timeout, byte cap and
+	// object-id validation are shared.
+	ChangedFiles  []changedFile
 	Verdicts      []namedVerdict
 	GateOutcome   evidenceOutcome
 	ReviewOutcome evidenceOutcome
+}
+
+// changedFile is one row of `git diff --numstat`.
+type changedFile struct {
+	Path      string
+	Additions int
+	Deletions int
 }
 
 func loadArtifactData(
@@ -104,6 +116,15 @@ func loadArtifactData(
 	)
 	if err != nil {
 		return artifactData{}, fmt.Errorf("ui: load candidate diff: %w", err)
+	}
+	data.ChangedFiles, err = loadChangedFiles(
+		ctx,
+		root,
+		task.BaseSHA,
+		task.CandidateSHA,
+	)
+	if err != nil {
+		return artifactData{}, fmt.Errorf("ui: load changed files: %w", err)
 	}
 
 	if task.GateResult != nil {
@@ -318,6 +339,82 @@ func decodeReviewOutcome(content []byte) (evidenceOutcome, error) {
 		return evidencePass, nil
 	}
 	return evidenceFail, nil
+}
+
+// loadChangedFiles lists the candidate's touched files with ± counts. It mirrors
+// loadCandidateDiff's guards — object-id validation, timeout, capped output — because it
+// is the same untrusted git surface (T13 W5).
+func loadChangedFiles(
+	ctx context.Context,
+	repoRoot string,
+	baseSHA *string,
+	candidateSHA *string,
+) ([]changedFile, error) {
+	if baseSHA == nil || candidateSHA == nil {
+		return nil, nil
+	}
+	if err := validateGitObjectID(*baseSHA); err != nil {
+		return nil, fmt.Errorf("invalid base_sha: %w", err)
+	}
+	if err := validateGitObjectID(*candidateSHA); err != nil {
+		return nil, fmt.Errorf("invalid candidate_sha: %w", err)
+	}
+	if *baseSHA == *candidateSHA {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	statContext, cancel := context.WithTimeout(ctx, diffTimeout)
+	defer cancel()
+
+	command := exec.CommandContext(
+		statContext,
+		"git",
+		"diff",
+		"--no-color",
+		"--no-ext-diff",
+		"--numstat",
+		*baseSHA,
+		*candidateSHA,
+		"--",
+	)
+	command.Dir = repoRoot
+	stdout := newCappedBuffer(maxArtifactDiffBytes)
+	stderr := newCappedBuffer(maxDiffStderrBytes)
+	command.Stdout = stdout
+	command.Stderr = stderr
+
+	runErr := command.Run()
+	switch {
+	case stdout.exceeded:
+		return nil, fmt.Errorf("git diff --numstat exceeds %d bytes", maxArtifactDiffBytes)
+	case statContext.Err() != nil:
+		return nil, fmt.Errorf("git diff --numstat did not complete: %w", statContext.Err())
+	case runErr != nil:
+		message := strings.TrimSpace(stderr.String())
+		if message == "" {
+			message = runErr.Error()
+		}
+		return nil, fmt.Errorf("git diff --numstat failed: %s", message)
+	}
+
+	files := make([]changedFile, 0, 8)
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		fields := strings.Split(strings.TrimSpace(line), "\t")
+		if len(fields) < 3 || fields[2] == "" {
+			continue
+		}
+		// Binary files report "-" for both counts; keep the row, drop the numbers.
+		additions, _ := strconv.Atoi(fields[0])
+		deletions, _ := strconv.Atoi(fields[1])
+		files = append(files, changedFile{
+			Path:      fields[2],
+			Additions: additions,
+			Deletions: deletions,
+		})
+	}
+	return files, nil
 }
 
 func loadCandidateDiff(

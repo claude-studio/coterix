@@ -192,6 +192,9 @@ type model struct {
 	// wrapTail hard-wraps the activity tail instead of truncating it (T13 W9). Off by
 	// default: one row per line is what keeps the tail readable at a glance.
 	wrapTail bool
+	// shimmerPhase slides the WORKING text gradient one cell per spinner tick (T13 W7).
+	// The spinner already animates its own frames; this is the text shimmer only.
+	shimmerPhase int
 	// toast is a transient acknowledgement in the status bar (T14 W8). It says a
 	// keypress was *accepted*, which is otherwise invisible while the operation runs.
 	toast      string
@@ -455,6 +458,9 @@ func (current model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if !current.isWorking() {
 			return current, nil
 		}
+		// The shimmer advances with the spinner rather than on its own timer, so there is
+		// no extra tick source (spec: "과하지 않게 최소만").
+		current.shimmerPhase++
 		var command tea.Cmd
 		current.spinner, command = current.spinner.Update(message)
 		return current, command
@@ -477,8 +483,23 @@ func (current model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 func (current model) View() tea.View {
 	view := tea.NewView(renderDashboard(current))
 	view.AltScreen = !current.autoQuit
-	view.WindowTitle = "Coterix"
+	// The terminal tab is often the only place a long run is visible, so it names the
+	// run and phase instead of a constant (T13 W6).
+	view.WindowTitle = windowTitle(current)
 	return view
+}
+
+// windowTitle is `coterix · <run_id> · <phase>` once a run is loaded, and the bare
+// product name before that (spec/ui.md T13 표시 계약).
+func windowTitle(current model) string {
+	if !current.hasStatus || current.status.RunID == "" {
+		return "coterix"
+	}
+	title := "coterix · " + current.status.RunID
+	if current.status.Phase != "" {
+		title += " · " + string(current.status.Phase)
+	}
+	return title
 }
 
 func (current model) updatePipelineEvent(
