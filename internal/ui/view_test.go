@@ -1939,9 +1939,14 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 	//     repairing task (state.validatePendingAction) — the old candidate-task fixture
 	//     would have been rejected outright.
 	//
-	// So the two states that can actually put the file list under pressure are a task_cap
-	// pause and a failure, and each is produced here through the state API that validates
-	// it.
+	// The cases below are therefore a task_cap pause and a failure, each produced through the
+	// state API that validates it. They are **representative, not exhaustive**: a
+	// task-scoped auth pause is reachable under pressure too — handleReviewFailure calls
+	// PauseForAuth with the current task ID after the implementation review, by which point
+	// a candidate exists and loadArtifactData will load its changed files
+	// (task_evidence.go:449-480, artifacts.go:103-125) — so it renders a PENDING chip
+	// alongside the list exactly as task_cap does (review T13b b7 f1). It is not repeated
+	// here because it spends the same single chip row task_cap already covers.
 	for _, pressure := range []struct {
 		name string
 		// attempts is how many full dirty-review attempts run before seed applies the
