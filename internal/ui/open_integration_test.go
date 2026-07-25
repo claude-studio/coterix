@@ -301,12 +301,15 @@ func TestOpenPromptPathsRunThroughTheRealProgram(t *testing.T) {
 		input, keyboard := io.Pipe()
 		output := &syncBuffer{}
 		ctx, cancel := context.WithCancel(context.Background())
+
+		done := make(chan error, 1)
+		// Cleanup joins the goroutine: cancelling without waiting let a failing path
+		// outlive the temp directory it writes into (review T15-r3 f3).
 		t.Cleanup(func() {
 			cancel()
 			_ = keyboard.Close()
+			<-done
 		})
-
-		done := make(chan error, 1)
 		go func() {
 			_, err := Open(ctx, executor, root, currentRun.ID, "reject", nil,
 				RunOptions{
@@ -343,8 +346,6 @@ func TestOpenPromptPathsRunThroughTheRealProgram(t *testing.T) {
 		if executor.mutating() != 0 {
 			t.Fatal("a reject dispatched a mutating request")
 		}
-		cancel()
-		<-done
 	})
 
 	t.Run("auth resume dispatches without asking", func(t *testing.T) {
@@ -361,12 +362,13 @@ func TestOpenPromptPathsRunThroughTheRealProgram(t *testing.T) {
 		input, keyboard := io.Pipe()
 		output := &syncBuffer{}
 		ctx, cancel := context.WithCancel(context.Background())
+
+		done := make(chan error, 1)
 		t.Cleanup(func() {
 			cancel()
 			_ = keyboard.Close()
+			<-done
 		})
-
-		done := make(chan error, 1)
 		go func() {
 			_, err := Open(ctx, executor, repoRoot, currentRun.ID, "resume", nil,
 				RunOptions{
@@ -390,8 +392,6 @@ func TestOpenPromptPathsRunThroughTheRealProgram(t *testing.T) {
 		if frame := output.String(); strings.Contains(frame, "Response · auth") {
 			t.Fatalf("auth resume asked for an answer it must not need:\n%s", frame)
 		}
-		cancel()
-		<-done
 	})
 
 	t.Run("task_cap resume asks which way and prefills retry", func(t *testing.T) {
@@ -403,6 +403,7 @@ func TestOpenPromptPathsRunThroughTheRealProgram(t *testing.T) {
 		}
 		taskID := "T1"
 		currentRun.State.CurrentTaskID = &taskID
+		currentRun.State.ApprovedPlanHash = currentRun.State.PlanHash
 		// task_cap only exists while implementing, so the run has to get there first.
 		for _, phase := range []state.Phase{
 			state.PhaseAwaitingApproval,
@@ -423,12 +424,13 @@ func TestOpenPromptPathsRunThroughTheRealProgram(t *testing.T) {
 		input, keyboard := io.Pipe()
 		output := &syncBuffer{}
 		ctx, cancel := context.WithCancel(context.Background())
+
+		done := make(chan error, 1)
 		t.Cleanup(func() {
 			cancel()
 			_ = keyboard.Close()
+			<-done
 		})
-
-		done := make(chan error, 1)
 		go func() {
 			_, err := Open(ctx, executor, repoRoot, currentRun.ID, "resume", nil,
 				RunOptions{
@@ -449,8 +451,20 @@ func TestOpenPromptPathsRunThroughTheRealProgram(t *testing.T) {
 		if executor.count() != 0 {
 			t.Fatalf("task_cap resume dispatched before the choice: %d", executor.count())
 		}
-		cancel()
-		<-done
+
+		// Submitting the pick has to actually dispatch the resume — checking only that
+		// the prompt opened left the second half of the contract unverified
+		// (review T15-r3 f2a).
+		//
+		// The witness is the acknowledgement, which is raised by beginOperation itself.
+		// Not the executor: a task_cap pause only exists after a real approve, which also
+		// *freezes* the plan, and a hand-seeded state fails that check inside the core
+		// ("approved plan.md is not frozen"). The core rejecting the seeded run is
+		// expected here — what this test pins is that the submit reached it at all.
+		if _, err := keyboard.Write([]byte("\r")); err != nil {
+			t.Fatal(err)
+		}
+		waitForFrame(t, output, "response sent")
 	})
 }
 
@@ -460,19 +474,32 @@ func TestOpenPromptPathsRunThroughTheRealProgram(t *testing.T) {
 // the witness. A counting executor (not the dropping one) records every request
 // (review T15-r2 f2).
 func TestOpenDispatchesExactlyOnceDespiteResnapshots(t *testing.T) {
+	// The observer re-emits snapshots while the operation runs. This pins the *effect*
+	// of exactly-once through the production path: a single reject bumps the persisted
+	// plan_round exactly once, and no second-dispatch error appears in the feed.
+	//
+	// Measured limitation, stated rather than papered over: none of the externally
+	// visible signals can distinguish "dispatched once" from "dispatched twice where the
+	// second was refused". A second reject fails the controller's phase check *before*
+	// any subprocess, so the executor count is unchanged; plan_round is unchanged for the
+	// same reason; and Open already returns an error from the fake executor either way.
+	// The airtight guard is `TestOpenSeedsThroughTheSnapshotAndDispatchesOnce`, which
+	// feeds a second snapshot and asserts no redispatch — removing the guard's
+	// `pendingOperation = nil` fails it (mutation-verified). This test covers the
+	// production wiring around that guard (review T15-r3 f2b).
 	root, currentRun := seedAwaitingIntegrationRun(t, "open-once")
+	before := currentRun.State.PlanRound
+
 	executor := &countingPlanExecutor{}
 	input, keyboard := io.Pipe()
 	output := &syncBuffer{}
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(func() {
-		cancel()
-		_ = keyboard.Close()
-	})
 
-	done := make(chan error, 1)
+	response := "one dispatch only"
+	done := make(chan struct{})
 	go func() {
-		_, err := Open(ctx, executor, root, currentRun.ID, "approve", nil,
+		defer close(done)
+		_, _ = Open(ctx, executor, root, currentRun.ID, "reject", &response,
 			RunOptions{
 				Interactive: true,
 				Input:       input,
@@ -480,29 +507,31 @@ func TestOpenDispatchesExactlyOnceDespiteResnapshots(t *testing.T) {
 				Width:       140,
 				Height:      40,
 			})
-		done <- err
 	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = keyboard.Close()
+		<-done
+	})
 
-	// Wait for the approve to reach the core.
+	// Wait for the reject to reach the core, then give the observer time to re-emit.
 	deadline := time.Now().Add(10 * time.Second)
-	for executor.mutating() == 0 && time.Now().Before(deadline) {
+	for executor.count() == 0 && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if executor.mutating() == 0 {
-		t.Fatalf("approve never dispatched:\n%s", output.String())
+	if executor.count() == 0 {
+		t.Fatalf("reject never dispatched:\n%s", output.String())
 	}
-	// Give the observer time to re-emit its snapshots; a rearmed guard would approve
-	// again and the second call would fail the phase check.
-	time.Sleep(300 * time.Millisecond)
-	frame := output.String()
-	for _, doubled := range []string{
-		"requires awaiting_approval",
-		"approve requires",
-	} {
-		if strings.Contains(frame, doubled) {
-			t.Fatalf("the seed dispatched twice (%q):\n%s", doubled, frame)
-		}
-	}
+	time.Sleep(500 * time.Millisecond)
 	cancel()
 	<-done
+
+	persisted := openIntegrationRun(t, root, currentRun.ID)
+	if got := persisted.State.PlanRound; got != before+1 {
+		t.Fatalf("plan_round went %d -> %d; a single reject must bump it exactly once",
+			before, got)
+	}
+	if frame := output.String(); strings.Contains(frame, "requires awaiting_approval") {
+		t.Fatalf("a second dispatch was refused by the controller:\n%s", frame)
+	}
 }
