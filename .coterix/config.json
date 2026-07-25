@@ -4,6 +4,9 @@
       "command": "claude",
       "args": [
         "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
         "--dangerously-skip-permissions",
         "--no-session-persistence"
       ],

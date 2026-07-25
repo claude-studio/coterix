@@ -540,9 +540,17 @@ func (current model) updatePipelineEvent(
 			// `system/*` or `rate_limit_event` (measured, T13a-2). The decoder drops
 			// those and summarises the rest to one row; a non-JSON line passes through
 			// untouched, so codex and plain-text mode are unaffected.
-			decoded, ok := cli.DecodeStreamLine(event.Line.Text)
-			if !ok {
-				break
+			// Only claude's stdout is a JSON stream. codex writes plain progress lines
+			// (on stderr), and claude in plain-text mode does too — decoding those would
+			// silently drop any line that happens to be a JSON object, which breaks the
+			// "codex는 원문 진행 라인" contract (review T13a-2 f2).
+			decoded := cli.StreamLine{Text: event.Line.Text}
+			if isStreamJSONSource(event.CLI, event.Line.Stream) {
+				candidate, ok := cli.DecodeStreamLine(event.Line.Text)
+				if !ok {
+					break
+				}
+				decoded = candidate
 			}
 			entry := logEntry{
 				Step:    event.Step,
@@ -1175,6 +1183,13 @@ func (current *model) resetActivity() {
 	// A fresh attempt starts a fresh viewport — a stale offset would point past
 	// the (now empty) buffer.
 	current.boxScroll[boxActivity] = 0
+}
+
+// isStreamJSONSource reports whether a line can be a stream-json event. Only claude
+// emits them, and only on stdout (T13 W1 condition).
+func isStreamJSONSource(cliName string, stream runner.Stream) bool {
+	return strings.EqualFold(strings.TrimSpace(cliName), "claude") &&
+		stream == runner.StreamStdout
 }
 
 // hasPendingPrompt reports whether the run is blocked on a question that has

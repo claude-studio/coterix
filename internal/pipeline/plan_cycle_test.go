@@ -312,7 +312,15 @@ func TestPlanCycleConsumesPlanCapOverrideOnSameState(t *testing.T) {
 }
 
 func TestPlanCyclePlanningAuthFailurePausesResponseFree(t *testing.T) {
-	for _, scenario := range []string{"writer-auth", "reviewer-auth"} {
+	// "writer-auth-stdout" is the stream-json shape: the marker is in stdout and stderr
+	// is empty. Before T13a-2 the classifier only read stderr, so this ran out its
+	// retries instead of pausing — and a unit test on ClassifyFailure alone could not
+	// prove that plan_cycle actually passes the stdout log (review T13a-2 f6).
+	for _, scenario := range []string{
+		"writer-auth",
+		"writer-auth-stdout",
+		"reviewer-auth",
+	} {
 		t.Run(scenario, func(t *testing.T) {
 			run, counters := newPlanCycleTestRun(t, scenario, 0, 5)
 			runPlanCycle(t, run)
@@ -328,7 +336,7 @@ func TestPlanCyclePlanningAuthFailurePausesResponseFree(t *testing.T) {
 				action.Response != nil {
 				t.Fatalf("auth pending action = %#v", action)
 			}
-			if scenario == "writer-auth" {
+			if strings.HasPrefix(scenario, "writer-auth") {
 				assertHelperCount(t, counters, "writer", 1)
 				if run.State.PlanHash != nil {
 					t.Fatal("writer auth failure unexpectedly adopted a plan")
@@ -394,6 +402,16 @@ func runPlanWriterHelper(runDir, counterDir, scenario string, rendered ...string
 	switch scenario {
 	case "writer-auth":
 		_, _ = fmt.Fprintln(os.Stderr, "Not logged in")
+		os.Exit(17)
+	case "writer-auth-stdout":
+		// stream-json puts the auth marker in stdout and leaves stderr empty — the
+		// shape the real CLI produces under `--output-format stream-json`
+		// (measured 2026-07-25, T13a-2). stderr is deliberately untouched here.
+		_, _ = fmt.Fprintln(os.Stdout,
+			`{"type":"system","subtype":"init","session_id":"s1"}`)
+		_, _ = fmt.Fprintln(os.Stdout,
+			`{"type":"result","subtype":"success","is_error":true,`+
+				`"error":"authentication_failed"}`)
 		os.Exit(17)
 	case "questions":
 		helperWriteFile(

@@ -497,23 +497,46 @@ func activityBody(current model, innerWidth, limit int) string {
 const maxWrappedTailRows = 3
 
 func wrapTailLine(current model, line logEntry, innerWidth int) []string {
-	head := line
-	head.Text = ""
-	rows := []string{strings.TrimRight(
-		renderLogLine(current.theme, head, innerWidth, true),
-		" ",
-	)}
-	indent := "  "
-	wrapped := strings.Split(ansi.HardwrapWc(
-		remapANSI16(line.Text, current.theme.tokens.ANSI),
-		max(1, innerWidth-len(indent)),
-		false,
-	), "\n")
-	if len(wrapped) > maxWrappedTailRows-1 {
-		wrapped = wrapped[:maxWrappedTailRows-1]
+	// The columns stay on the first row *with the first fragment of the message* — an
+	// empty head row would spend one of the three allowed rows saying nothing — and the
+	// continuation lines up under the message column rather than at cell 2
+	// (review T13a-2 f4).
+	prefixWidth := ansi.StringWidth(ansi.Strip(
+		renderLogLine(current.theme, logEntry{
+			Step:    line.Step,
+			Role:    line.Role,
+			CLI:     line.CLI,
+			Attempt: line.Attempt,
+			At:      line.At,
+			Stream:  line.Stream,
+			Icon:    line.Icon,
+		}, innerWidth, true),
+	))
+	messageWidth := max(1, innerWidth-prefixWidth)
+	text := remapANSI16(line.Text, current.theme.tokens.ANSI)
+	fragments := strings.Split(
+		ansi.HardwrapWc(text, messageWidth, false),
+		"\n",
+	)
+	if len(fragments) > maxWrappedTailRows {
+		fragments = fragments[:maxWrappedTailRows]
 	}
-	for _, row := range wrapped {
-		rows = append(rows, indent+current.theme.styles.Value.Render(row))
+
+	head := line
+	head.Text = fragments[0]
+	headRow := renderLogLine(current.theme, head, innerWidth, true)
+	// Take the column from the row that was actually rendered rather than from a
+	// second measurement: the two can disagree by a cell or two, and then the
+	// continuations sit just off the message column.
+	column := prefixWidth
+	if at := strings.Index(ansi.Strip(headRow), fragments[0]); at >= 0 {
+		column = at
+	}
+
+	rows := []string{headRow}
+	indent := strings.Repeat(" ", column)
+	for _, fragment := range fragments[1:] {
+		rows = append(rows, indent+current.theme.styles.Value.Render(fragment))
 	}
 	return rows
 }
@@ -617,7 +640,14 @@ func mainBoxWantRows(
 	share := func(limit int) int { return max(1, limit-chrome) }
 	switch box {
 	case boxActivity:
-		rows = min(rows, activityTailLimit(current))
+		limit := activityTailLimit(current)
+		if current.wrapTail {
+			// `w` deliberately trades rows for text, so the cap is on *physical* rows:
+			// capping the wrapped body at the logical line count clipped the wrap back
+			// out of existence (review T13a-2 f3).
+			limit *= maxWrappedTailRows
+		}
+		rows = min(rows, limit)
 	case boxPending:
 		rows = min(rows, share(total/2))
 	case boxLiveOutput:

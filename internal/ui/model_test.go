@@ -2848,3 +2848,165 @@ func TestWrapToggleShowsMoreOfALongTailLineWithinACap(t *testing.T) {
 		t.Fatal("`w` did not toggle back")
 	}
 }
+
+// review T13a-2 f2: only claude's stdout is a JSON stream. Decoding everything meant a
+// codex progress line that happens to be a JSON object was silently dropped, which
+// breaks the "codex writes raw progress lines" contract. This goes through the real
+// event path for all four CLI/stream combinations.
+func TestOnlyClaudeStdoutIsDecoded(t *testing.T) {
+	const jsonLine = `{"status":"working","detail":"applying patch"}`
+
+	for _, test := range []struct {
+		name    string
+		cli     string
+		stream  runner.Stream
+		dropped bool
+	}{
+		{name: "claude stdout is decoded", cli: "claude", stream: runner.StreamStdout, dropped: true},
+		{name: "claude stderr is raw", cli: "claude", stream: runner.StreamStderr},
+		{name: "codex stdout is raw", cli: "codex", stream: runner.StreamStdout},
+		{name: "codex stderr is raw", cli: "codex", stream: runner.StreamStderr},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			current := populatedViewModel(t)
+			line := runner.Line{Attempt: 1, Stream: test.stream, Text: jsonLine}
+			updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
+				Kind:  pipeline.EventStepLog,
+				RunID: "run-1",
+				Step:  pipeline.StepImplementation,
+				Role:  "impl_writer",
+				CLI:   test.cli,
+				Line:  &line,
+			}})
+			current = updated.(model)
+
+			if test.dropped {
+				// An unknown envelope on claude stdout is bookkeeping: dropped.
+				if len(current.activity) != 0 {
+					t.Fatalf("an unknown claude envelope reached the tail: %#v",
+						current.activity)
+				}
+				return
+			}
+			if len(current.activity) != 1 {
+				t.Fatalf("a raw progress line was dropped: %#v", current.activity)
+			}
+			if got := current.activity[0].Text; got != jsonLine {
+				t.Fatalf("the raw line was rewritten to %q", got)
+			}
+		})
+	}
+}
+
+// review T13a-2 f3/f4: `w` has to survive the height allocation, and its rows have to
+// line up. The earlier test rendered activityBody directly, so it never went through
+// mainBoxWantRows/distributeMainBoxHeights/visibleLines — the wrap was being clipped
+// back out of existence in the real dashboard.
+func TestWrappedTailSurvivesTheRealLayout(t *testing.T) {
+	for _, layout := range []struct {
+		name          string
+		width, height int
+	}{
+		{name: "wide", width: wideBreakpointWidth, height: wideBreakpointHeight},
+		{name: "compact", width: 80, height: 24},
+	} {
+		t.Run(layout.name, func(t *testing.T) {
+			current := populatedViewModel(t)
+			current.width, current.height = layout.width, layout.height
+			current.status.PendingAction = nil
+			// Two long lines with distinct markers at their ends, so clipping is visible.
+			// The N×3 cap drops the *end* of a very long line by design, so the marker
+			// that proves a logical line survived goes at its head.
+			for _, marker := range []string{"FIRST-LINE-HEAD", "SECOND-LINE-HEAD"} {
+				line := runner.Line{
+					Attempt: 1,
+					Stream:  runner.StreamStdout,
+					Text: marker + " " +
+						strings.Repeat("a long streamed progress sentence ", 4),
+				}
+				updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
+					Kind:  pipeline.EventStepLog,
+					RunID: "run-1",
+					Step:  pipeline.StepImplementation,
+					Role:  "impl_writer",
+					CLI:   "codex",
+					Line:  &line,
+				}})
+				current = updated.(model)
+			}
+
+			truncated := ansi.Strip(renderDashboard(current))
+			updated, _ := current.Update(printableKey('w'))
+			wrapped := updated.(model)
+			frame := ansi.Strip(renderDashboard(wrapped))
+
+			// Wrapping must reveal more of the text than truncation did.
+			if len(strings.Join(strings.Fields(frame), "")) <=
+				len(strings.Join(strings.Fields(truncated), "")) {
+				t.Fatalf("wrapping revealed nothing in the real dashboard:\n%s", frame)
+			}
+			// Both logical lines must still be present — the wrap must not clip the
+			// older one away.
+			for _, marker := range []string{"FIRST-LINE-HEAD", "SECOND-LINE-HEAD"} {
+				if !strings.Contains(frame, marker) {
+					t.Fatalf("%s lost %q:\n%s", layout.name, marker, frame)
+				}
+			}
+			// And the frame still fits its terminal.
+			for index, row := range strings.Split(frame, "\n") {
+				if cells := ansi.StringWidth(row); cells > layout.width {
+					t.Fatalf("row %d is %d cells wide (limit %d)",
+						index, cells, layout.width)
+				}
+			}
+			if rows := strings.Count(frame, "\n") + 1; rows > layout.height {
+				t.Fatalf("the frame grew to %d rows (limit %d)", rows, layout.height)
+			}
+		})
+	}
+}
+
+// f4: the columns stay on the first row *with* the first fragment, and continuations
+// start at the message column — not at cell 2, and not after an empty head row.
+func TestWrappedTailKeepsItsColumns(t *testing.T) {
+	current := populatedViewModel(t)
+	line := runner.Line{
+		Attempt: 1,
+		Stream:  runner.StreamStdout,
+		Text:    strings.Repeat("wrapped progress text ", 10),
+	}
+	updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
+		Kind:  pipeline.EventStepLog,
+		RunID: "run-1",
+		Step:  pipeline.StepImplementation,
+		Role:  "impl_writer",
+		CLI:   "codex",
+		Line:  &line,
+	}})
+	current = updated.(model)
+	current.wrapTail = true
+
+	rows := strings.Split(ansi.Strip(activityBody(current, 80, 5)), "\n")
+	if len(rows) < 2 {
+		t.Fatalf("the line did not wrap:\n%s", strings.Join(rows, "\n"))
+	}
+	// The head row carries both the columns and text.
+	if !strings.Contains(rows[0], "impl_writer") {
+		t.Fatalf("the head row lost its columns: %q", rows[0])
+	}
+	if !strings.Contains(rows[0], "wrapped progress text") {
+		t.Fatalf("the head row has no message — a row was spent on nothing: %q", rows[0])
+	}
+	// Continuations start under the message column, which is where the head row's own
+	// text starts.
+	messageColumn := strings.Index(rows[0], "wrapped")
+	if messageColumn <= 2 {
+		t.Fatalf("the message column looks wrong (%d): %q", messageColumn, rows[0])
+	}
+	for _, row := range rows[1:] {
+		if got := len(row) - len(strings.TrimLeft(row, " ")); got != messageColumn {
+			t.Fatalf("continuation starts at column %d, want %d: %q",
+				got, messageColumn, row)
+		}
+	}
+}
