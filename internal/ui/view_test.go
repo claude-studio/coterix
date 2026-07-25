@@ -2118,13 +2118,19 @@ const pressureChangedFileCount = 9
 // actually observes rather than trusting this number.
 const pressureAttemptsToCap = 3
 
-// pressureModelFromRealRun builds the model the way production does and nothing else:
-// a real repository with a real candidate commit, a task driven to repairing through the
-// state API, `seed` applying the state transition under test, a real
-// controller.Status, and then the real EventStateSnapshot → loadArtifactsCommand →
-// artifactsLoadedMsg chain. Nothing is assigned into the model by hand, so a state the
-// pipeline cannot reach cannot be tested by accident (review T13b/W5 f1). What it does
-// **not** do is re-run TaskCycle — see the scope note in the attempt loop.
+// pressureModelFromRealRun hand-builds a run state, validates it through the state API, and
+// then loads it into the model along the **production** status → artifact → render path: a
+// real repository with real commits, phase and task transitions driven through the
+// transition API, `seed` applying the transition under test, a real controller.Status, and
+// the real EventStateSnapshot → loadArtifactsCommand → artifactsLoadedMsg chain with its Cmd
+// executed.
+//
+// Be precise about what that does and does not buy (review T13b b6 f1). It does **not**
+// re-run TaskCycle — see the scope note in the attempt loop — and several fields the cycle
+// owns (ApprovedPlanHash, CurrentTaskID, BaseSHA, CandidateSHA, the evidence pointers) are
+// constructed here directly. So this is a *seeded* state that the state API accepts and the
+// production render path consumes, not proof that the pipeline would have produced it; the
+// individual reachability facts it reproduces are cited at each step instead.
 func pressureModelFromRealRun(
 	t *testing.T,
 	attempts int,
@@ -2222,9 +2228,10 @@ func pressureModelFromRealRun(
 		// Each repair produces a **different** commit: the fixer postcondition requires
 		// HEAD to differ from the previous candidate, so reusing one SHA for every attempt
 		// described a repair that changed nothing (review T13b b4 f1). The per-file
-		// transformation converts one slice of files per round, so the **cumulative**
-		// base..candidate diff stays the nine files at +9/-4 the rail total asserts, with
-		// BaseSHA left at the first attempt's base as production leaves it.
+		// transformation converts one slice of files per round, so the cumulative
+		// base..candidate diff **reaches** the nine files at +9/-4 the rail total asserts on
+		// the last round — earlier rounds are smaller and are never rendered — with BaseSHA
+		// left at the first attempt's base as production leaves it.
 		for index := 0; index < pressureChangedFileCount; index++ {
 			writePressureFile(t, root, index, pressureFileBody(index, attempt, attempts))
 		}
@@ -2295,16 +2302,16 @@ func pressureModelFromRealRun(
 			len(ready.artifacts.ChangedFiles), pressureChangedFileCount,
 			ready.artifacts.ChangedFiles)
 	}
-	// The attempt count the cycle produced has to survive all the way into the rendered
+	// The attempt count the fixture seeded has to survive all the way into the rendered
 	// status, otherwise the fixture proves nothing about the state it claims to be in
-	// (review T13b b3 f1). It is `attempts` because BeginTaskAttempt ran once per attempt
-	// and the capped call does not increment.
+	// (review T13b b3 f1). It is `attempts` because BeginTaskAttempt ran once per seeded
+	// round and the capped call does not increment.
 	rendered, exists := ready.status.Tasks[taskID]
 	if !exists {
 		t.Fatalf("the rendered status lost task %s: %#v", taskID, ready.status.Tasks)
 	}
 	if rendered.Attempt != attempts {
-		t.Fatalf("the rendered task is on attempt %d, want the %d the cycle ran",
+		t.Fatalf("the rendered task is on attempt %d, want the %d the fixture seeded",
 			rendered.Attempt, attempts)
 	}
 	// The task's final status is the *case's* business — abort legitimately ends on
@@ -2350,7 +2357,12 @@ func observePressureCap(
 // pressureFileBody is the content of one pressure file after `attempt` commits, out of
 // `attempts` in total. Each commit converts the next slice of files from their base content
 // to their final content, so every commit differs from the one before it while the
-// **cumulative** base..candidate diff is always the same nine files at +9/-4.
+// cumulative base..candidate diff **at the last commit** is the same nine files at +9/-4
+// whatever the attempt count is.
+//
+// The intermediate commits are deliberately *not* that value — at attempts=3 they are
+// 3 files +3/-1 and 6 files +6/-3 (review T13b b6 f2). Only the final state is rendered, so
+// only the final arithmetic is what the rail total asserts.
 //
 // Accumulating a change in every file on every commit instead would make the cumulative
 // diff grow with the attempt count (+19/-4 at three attempts), which is what the fixture
