@@ -401,13 +401,16 @@ func loadChangedFiles(
 
 	files := make([]changedFile, 0, 8)
 	for _, line := range strings.Split(stdout.String(), "\n") {
-		fields := strings.Split(strings.TrimSpace(line), "\t")
+		// Only the line terminator and the count fields are trimmed. A path may legally
+		// end in a space, and trimming the whole line silently renamed it (review T13b f3).
+		// SplitN keeps a tab inside the path in one piece for the same reason.
+		fields := strings.SplitN(strings.TrimRight(line, "\r"), "\t", 3)
 		if len(fields) < 3 || fields[2] == "" {
 			continue
 		}
 		// Binary files report "-" for both counts; keep the row, drop the numbers.
-		additions, _ := strconv.Atoi(fields[0])
-		deletions, _ := strconv.Atoi(fields[1])
+		additions, _ := strconv.Atoi(strings.TrimSpace(fields[0]))
+		deletions, _ := strconv.Atoi(strings.TrimSpace(fields[1]))
 		files = append(files, changedFile{
 			Path:      fields[2],
 			Additions: additions,

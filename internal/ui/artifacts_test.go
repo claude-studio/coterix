@@ -386,6 +386,9 @@ func TestLoadChangedFilesParsesBinaryAndRenameShapes(t *testing.T) {
 		filepath.Join(repoRoot, "blob.bin"),
 		[]byte{0, 1, 2, 3, 4, 5, 6, 7},
 	)
+	// Measured (2026-07-25): git writes a trailing-space path **unquoted**, as
+	// `1\t0\ttrail.txt \n`, so trimming the whole line renames the file (review T13b f3).
+	writeArtifactTestFile(t, filepath.Join(repoRoot, "trail.txt "), []byte("one\n"))
 	git("add", ".")
 	git("commit", "--quiet", "-m", "base")
 	baseSHA := git("rev-parse", "HEAD")
@@ -402,6 +405,7 @@ func TestLoadChangedFilesParsesBinaryAndRenameShapes(t *testing.T) {
 		filepath.Join(repoRoot, "blob.bin"),
 		[]byte{7, 6, 5, 4, 3, 2, 1, 0},
 	)
+	writeArtifactTestFile(t, filepath.Join(repoRoot, "trail.txt "), []byte("one\ntwo\n"))
 	git("add", "-A")
 	git("commit", "--quiet", "-m", "candidate")
 	candidateSHA := git("rev-parse", "HEAD")
@@ -415,8 +419,8 @@ func TestLoadChangedFilesParsesBinaryAndRenameShapes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) != 3 {
-		t.Fatalf("changed files = %#v, want three entries", files)
+	if len(files) != 4 {
+		t.Fatalf("changed files = %#v, want four entries", files)
 	}
 	byPath := make(map[string]changedFile, len(files))
 	for _, file := range files {
@@ -431,6 +435,10 @@ func TestLoadChangedFilesParsesBinaryAndRenameShapes(t *testing.T) {
 	// Binary counts are "-": the row survives with zero counts rather than being dropped.
 	if got, ok := byPath["blob.bin"]; !ok || got.Additions != 0 || got.Deletions != 0 {
 		t.Fatalf("binary change = %#v", byPath)
+	}
+	// The path is what git said it was, byte for byte — the trailing space included.
+	if got, ok := byPath["trail.txt "]; !ok || got.Additions != 1 {
+		t.Fatalf("trailing-space path = %#v", byPath)
 	}
 	// The rename keeps git's own `old => new` rendering, which is what the operator wants
 	// to read; it must not be split into two bogus entries.
