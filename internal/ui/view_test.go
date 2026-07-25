@@ -1,9 +1,11 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"image/color"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -1921,56 +1923,62 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 		}
 	})
 
-	// Approval and pending_action are mutually exclusive by design — approval is a
-	// phase, not a pending_action (spec) — so each pressure case is checked on its own.
+	// The pressure cases are built by **real state transitions against a real git repo**,
+	// not by hand-assembling a model. The previous version rendered through renderSidebar
+	// and renderDashboard yet still proved nothing, because the states it rendered cannot
+	// occur (review T13b/W5 f1, verified in the source):
 	//
-	// Both cases go through the production render at the minimum wide size, never
-	// renderSidebarBody: the budget the list has to respect is the *rail's* — the
-	// PIPELINE card and both cards' borders spend the same 26 rows, and renderSidebar
-	// is what truncates the overflow. Measuring the body alone handed the list a budget
-	// it did not have, and the total row it appended fell off the card unseen
-	// (review T13b/W5 f1).
+	//   - `awaiting_approval` forces CurrentTaskID=nil and every task to open
+	//     (plan_cycle.go), and loadArtifactData skips changed files when CurrentTaskID is
+	//     nil (artifacts.go) — so approval **never** has a file list to displace.
+	//   - `LastError` is written only ever together with PhaseFailed (state/transition.go,
+	//     both writers) — so no pending or approval state carries an error.
+	//   - task_cap requires ResumePhase=implementing, TaskID==CurrentTaskID and an open or
+	//     repairing task (state.validatePendingAction) — the old candidate-task fixture
+	//     would have been rejected outright.
+	//
+	// So the two states that can actually put the file list under pressure are a task_cap
+	// pause and a failure, and each is produced here through the state API that validates
+	// it.
 	for _, pressure := range []struct {
 		name    string
-		mutate  func(model) model
+		seed    func(*testing.T, *pipeline.Run, string)
 		signals []string
 	}{
 		{
-			name: "approval needed plus an error",
-			mutate: func(in model) model {
-				in.status.Phase = state.PhaseAwaitingApproval
-				in.status.LastError = pointerTo("gate failed on the second attempt")
-				return in
+			name: "task_cap pause",
+			seed: func(t *testing.T, currentRun *pipeline.Run, taskID string) {
+				t.Helper()
+				if err := currentRun.State.PauseForTaskCap(
+					taskID,
+					"attempt cap reached",
+				); err != nil {
+					t.Fatal(err)
+				}
 			},
-			signals: []string{
-				"APPROVAL NEEDED",
-				"a approve · r reject",
-				"gate failed on the second attempt",
-			},
+			signals: []string{"PENDING · task_cap"},
 		},
 		{
-			name: "pending question plus an error",
-			mutate: func(in model) model {
-				// Approval wins over pending in the render, so this case has to leave the
-				// approval phase — the two are mutually exclusive states, not stacked.
-				in.status.Phase = state.PhasePausedForInput
-				in.status.PendingAction = &state.PendingAction{
-					Kind:   state.PendingTaskCap,
-					Prompt: "attempt cap reached",
+			name: "failed with an error",
+			seed: func(t *testing.T, currentRun *pipeline.Run, _ string) {
+				t.Helper()
+				if err := currentRun.State.Fail(
+					"gate failed on the second attempt",
+				); err != nil {
+					t.Fatal(err)
 				}
-				in.status.LastError = pointerTo("gate failed on the second attempt")
-				return in
 			},
-			signals: []string{
-				"PENDING · task_cap",
-				"gate failed on the second attempt",
-			},
+			signals: []string{"gate failed on the second attempt"},
 		},
 	} {
+		// Witness note (measured, not assumed): only the **failed** case is the budget
+		// witness. Its error hardwraps to two rows, which is exactly the row that the
+		// wrong budget spends — both budget mutations (body-only, and chrome-not-charged)
+		// fail there. The task_cap chip is one row, so the wrong budget still happens to
+		// fit and that case passes both mutations. It is kept because it witnesses
+		// something else the failed case cannot: that a *pending* signal is not displaced.
 		t.Run("signals survive: "+pressure.name, func(t *testing.T) {
-			candidate := pressure.mutate(populatedViewModel(t))
-			candidate.artifacts.ChangedFiles = files
-			candidate.width, candidate.height = wideBreakpointWidth, wideBreakpointHeight
+			candidate := pressureModelFromRealRun(t, pressure.seed)
 
 			rail := ansi.Strip(renderSidebar(
 				candidate,
@@ -1999,9 +2007,10 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 						"exercised:\n%s", surface.name, surface.rendered)
 				}
 				shown, hidden := changedFilesAccounting(t, surface.name, surface.rendered)
-				if shown < 1 || shown+hidden != len(files) {
+				if shown < 1 || shown+hidden != pressureChangedFileCount {
 					t.Fatalf("%s: %d shown + %d hidden does not account for %d files:\n%s",
-						surface.name, shown, hidden, len(files), surface.rendered)
+						surface.name, shown, hidden, pressureChangedFileCount,
+						surface.rendered)
 				}
 				// And the card still closes after the section. 26 rows is the whole rail,
 				// borders included, so a list that only fits by pushing the STATUS card's
@@ -2023,6 +2032,153 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 			}
 		})
 	}
+}
+
+// pressureChangedFileCount is how many files the pressure repository changes. Nine is
+// past maxChangedFilesShown, so the hidden count is always exercised, and one addition
+// plus alternating deletions keeps `9 files (M hidden) · +9/-4` inside the rail's 26
+// inner cells — a wider total would be truncated and could not be asserted whole.
+const pressureChangedFileCount = 9
+
+// pressureModelFromRealRun builds the model the way production does and nothing else:
+// a real repository with a real candidate commit, a task driven to repairing through the
+// state API, `seed` applying the state transition under test, a real
+// controller.Status, and then the real EventStateSnapshot → loadArtifactsCommand →
+// artifactsLoadedMsg chain. Nothing is assigned into the model by hand, so a state the
+// pipeline cannot reach cannot be tested by accident (review T13b/W5 f1).
+func pressureModelFromRealRun(
+	t *testing.T,
+	seed func(*testing.T, *pipeline.Run, string),
+) model {
+	t.Helper()
+	const runID = "run-pressure"
+	const taskID = "T1"
+
+	root, config := newIntegrationRepository(t)
+	// The files have to exist in the base commit: a brand-new file reports `1\t0`, and the
+	// totals need deletions too so a swapped additions/deletions pair cannot pass.
+	for index := 0; index < pressureChangedFileCount; index++ {
+		writePressureFile(t, root, index, "one\ntwo\n")
+	}
+	integrationGit(t, root, "add", "-A")
+	commitPressureTree(t, root, "test: pressure base")
+	baseSHA := integrationGit(t, root, "rev-parse", "HEAD")
+
+	for index := 0; index < pressureChangedFileCount; index++ {
+		// Every file gains a line; the odd ones also lose one, giving +9/-4 in total.
+		body := "one\ntwo\nthree\n"
+		if index%2 == 1 {
+			body = "one\nthree\n"
+		}
+		writePressureFile(t, root, index, body)
+	}
+	integrationGit(t, root, "add", "-A")
+	commitPressureTree(t, root, "test: pressure candidate")
+	candidateSHA := integrationGit(t, root, "rev-parse", "HEAD")
+
+	currentRun := createIntegrationRun(t, root, runID, config)
+	currentRun.State.TaskOrder = []string{taskID}
+	currentRun.State.Tasks = map[string]*state.TaskState{
+		taskID: {Status: state.TaskOpen},
+	}
+	// planning -> awaiting_approval -> implementing is the only route the phase table
+	// allows, and open -> candidate -> repairing the only route to a repairing task
+	// (state/transition.go). Driving both through the real API is what makes this state
+	// reachable rather than merely well-formed.
+	for _, phase := range []state.Phase{
+		state.PhaseAwaitingApproval,
+		state.PhaseImplementing,
+	} {
+		if err := currentRun.State.TransitionPhase(phase); err != nil {
+			t.Fatal(err)
+		}
+	}
+	active := taskID
+	currentRun.State.CurrentTaskID = &active
+	for _, status := range []state.TaskStatus{
+		state.TaskCandidate,
+		state.TaskRepairing,
+	} {
+		if err := currentRun.State.TransitionTask(taskID, status); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The task cycle owns these three fields directly, exactly as done here, and SaveState
+	// validates the result.
+	task := currentRun.State.Tasks[taskID]
+	task.Attempt = 2
+	task.BaseSHA = &baseSHA
+	task.CandidateSHA = &candidateSHA
+
+	seed(t, currentRun, taskID)
+	if err := currentRun.SaveState(); err != nil {
+		t.Fatal(err)
+	}
+
+	statuses, err := pipeline.NewController(newBlockingPlanExecutor()).Status(
+		context.Background(),
+		root,
+		runID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(statuses) != 1 {
+		t.Fatalf("controller returned %d statuses, want 1", len(statuses))
+	}
+
+	current := testModel(t, &fakeUIControl{})
+	current.width, current.height = wideBreakpointWidth, wideBreakpointHeight
+	current.repoRoot = root
+	updated, command := current.Update(pipelineEventMsg{Event: pipeline.Event{
+		Kind:     pipeline.EventStateSnapshot,
+		Status:   &statuses[0],
+		RepoRoot: root,
+	}})
+	if command == nil {
+		t.Fatal("the state snapshot did not ask for the artifacts")
+	}
+	loaded, ok := command().(artifactsLoadedMsg)
+	if !ok {
+		t.Fatalf("the artifact command returned %T", command())
+	}
+	if loaded.err != nil {
+		t.Fatal(loaded.err)
+	}
+	final, _ := updated.(model).Update(loaded)
+	ready := final.(model)
+	if len(ready.artifacts.ChangedFiles) != pressureChangedFileCount {
+		t.Fatalf("the real artifact load produced %d changed files, want %d: %#v",
+			len(ready.artifacts.ChangedFiles), pressureChangedFileCount,
+			ready.artifacts.ChangedFiles)
+	}
+	return ready
+}
+
+func writePressureFile(t *testing.T, root string, index int, body string) {
+	t.Helper()
+	if err := os.WriteFile(
+		filepath.Join(root, fmt.Sprintf("file-%02d.go", index)),
+		[]byte(body),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func commitPressureTree(t *testing.T, root, message string) {
+	t.Helper()
+	integrationGit(
+		t,
+		root,
+		"-c",
+		"user.name=Coterix UI Test",
+		"-c",
+		"user.email=ui@example.invalid",
+		"commit",
+		"-qm",
+		message,
+	)
 }
 
 // railColumn cuts the sidebar out of a composed frame. Without it the main pane's cells
@@ -2071,7 +2227,9 @@ func changedFilesAccounting(t *testing.T, surface, rendered string) (int, int) {
 			}
 			return shown, hidden
 		}
-		if strings.Contains(line, "ui/file-") {
+		// "file-" and not "file": the total row says "9 files", which must not be counted
+		// as a file row.
+		if strings.Contains(line, "file-") {
 			shown++
 		}
 	}
