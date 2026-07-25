@@ -2418,6 +2418,11 @@ func pressureFileBody(index, attempt, attempts int) string {
 //     permitted, which **mirrors** readGateEvidence rather than calling it — that function is
 //     unexported, so this check can fall behind it;
 //   - both gate logs exist as regular files at clean run-relative paths.
+//
+// Verified exhaustively rather than claimed: removing any one of the gate document's seven
+// fields, any one of the review document's six, or any one of the finding's five makes this
+// test fail — all 18 checked one at a time. That sweep is what b11 f1 showed was missing when
+// the same guarantee was only asserted in prose.
 func writePressureEvidence(
 	t *testing.T,
 	currentRun *pipeline.Run,
