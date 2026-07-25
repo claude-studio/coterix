@@ -479,9 +479,43 @@ func activityBody(current model, innerWidth, limit int) string {
 	for _, line := range lines {
 		// muteStream: tail lines are progress, not diagnostics (codex writes
 		// progress to stderr).
-		out = append(out, renderLogLine(current.theme, line, innerWidth, true))
+		rendered := renderLogLine(current.theme, line, innerWidth, true)
+		if !current.wrapTail {
+			out = append(out, rendered)
+			continue
+		}
+		// `w` trades rows for the rest of the line (T13 W9). The wrap is capped so one
+		// long line cannot take the whole tail: the columns stay on the first row and
+		// the remainder is indented under the message.
+		out = append(out, wrapTailLine(current, line, innerWidth)...)
 	}
 	return strings.Join(out, "\n")
+}
+
+// maxWrappedTailRows caps what one wrapped line may take, so a single long line
+// cannot push every other line out of the tail (T13 W9).
+const maxWrappedTailRows = 3
+
+func wrapTailLine(current model, line logEntry, innerWidth int) []string {
+	head := line
+	head.Text = ""
+	rows := []string{strings.TrimRight(
+		renderLogLine(current.theme, head, innerWidth, true),
+		" ",
+	)}
+	indent := "  "
+	wrapped := strings.Split(ansi.HardwrapWc(
+		remapANSI16(line.Text, current.theme.tokens.ANSI),
+		max(1, innerWidth-len(indent)),
+		false,
+	), "\n")
+	if len(wrapped) > maxWrappedTailRows-1 {
+		wrapped = wrapped[:maxWrappedTailRows-1]
+	}
+	for _, row := range wrapped {
+		rows = append(rows, indent+current.theme.styles.Value.Render(row))
+	}
+	return rows
 }
 
 func pendingBody(current model, innerWidth, maxRows int) string {

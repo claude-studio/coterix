@@ -189,6 +189,9 @@ type model struct {
 	// helpOpen shows the key overlay (T14 W6). It is the only overlay — there is no
 	// dialog stack, so a bool is the whole state.
 	helpOpen bool
+	// wrapTail hard-wraps the activity tail instead of truncating it (T13 W9). Off by
+	// default: one row per line is what keeps the tail readable at a glance.
+	wrapTail bool
 	// toast is a transient acknowledgement in the status bar (T14 W8). It says a
 	// keypress was *accepted*, which is otherwise invisible while the operation runs.
 	toast      string
@@ -666,6 +669,22 @@ func (current model) updateKey(
 				current.boxScroll[target]--
 			}
 		}
+	case "y":
+		// Measured: bubbletea v2 ships SetClipboard (clipboard.go, OSC52) so there is
+		// no need for a hand-rolled sequence or a new dependency (T13 W4).
+		if current.hasStatus && current.status.RunID != "" {
+			// OSC52 is fire-and-forget: tmux and some terminals drop it silently, so
+			// the acknowledgement says the copy was *sent*, not that it landed (R10).
+			current.showToast("⧉ run id copy sent")
+			return current, tea.Batch(
+				tea.SetClipboard(current.status.RunID),
+				toastExpiryCommand(),
+			)
+		}
+		return current, nil
+	case "w":
+		// Long tail lines are truncated by default; `w` wraps them instead (T13 W9).
+		current.wrapTail = !current.wrapTail
 	case "?":
 		current.helpOpen = true
 	case "esc":

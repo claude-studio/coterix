@@ -11,9 +11,10 @@ import (
 // status bar's hint line are two views of the same thing. Writing them separately
 // is how a key ends up documented but unbound, or bound but undocumented (T14 W6).
 //
-// Every entry below must correspond to a real case in updateKey/updatePromptKey.
-// `y` (copy run id) and `w` (wrap the tail) are specified for T13b and are *not*
-// listed: they are not dispatched yet.
+// Every entry below must correspond to a real case in updateKey/updatePromptKey — a
+// test reads model.go and fails if a documented key has no case. That guard earned its
+// place: `y` and `w` were listed here before they were dispatched, and it caught them
+// (T14 W6). They are dispatched now (T13 W4/W9), so they are listed.
 
 type keyHelpEntry struct {
 	keys string
@@ -62,6 +63,8 @@ func keyHelpGroups(current model) []keyHelpGroup {
 		groups = append(groups, keyHelpGroup{title: "THIS RUN", entries: actions})
 	}
 	return append(groups, keyHelpGroup{title: "GENERAL", entries: []keyHelpEntry{
+		{keys: "y", what: "copy the run id (sent via OSC52; some terminals drop it)"},
+		{keys: "w", what: "wrap long activity lines instead of truncating them"},
 		{keys: "?", what: "open or close this help"},
 		{keys: "q · ctrl+c", what: "stop the run safely", short: "q quit"},
 	}})

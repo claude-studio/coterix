@@ -2756,3 +2756,91 @@ func TestOperationKindForCommandRejectsAnythingElse(t *testing.T) {
 		}
 	}
 }
+
+// T13 W4: `y` copies the run id. Measured — bubbletea v2 ships SetClipboard (OSC52),
+// so there is no hand-rolled sequence and no new dependency. OSC52 is fire-and-forget:
+// the acknowledgement says the copy was *sent*, not that it landed (R10).
+func TestCopyRunIDSendsTheClipboardSequenceAndSaysSo(t *testing.T) {
+	clock := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	current := testModel(t, &fakeUIControl{})
+	current.now = func() time.Time { return clock }
+
+	// With no run there is nothing to copy and nothing to claim.
+	updated, command := current.Update(printableKey('y'))
+	if command != nil || updated.(model).toastLive() {
+		t.Fatal("`y` acted with no run loaded")
+	}
+
+	current.hasStatus = true
+	current.status = pipeline.RunStatus{RunID: "run-copy"}
+	updated, command = current.Update(printableKey('y'))
+	current = updated.(model)
+	if command == nil {
+		t.Fatal("`y` produced no clipboard command")
+	}
+	if !current.toastLive() {
+		t.Fatal("`y` did not acknowledge the attempt")
+	}
+	frame := ansi.Strip(renderStatusBar(current, 120, 2))
+	if !strings.Contains(frame, "copy sent") {
+		t.Fatalf("the acknowledgement does not say it was sent:\n%s", frame)
+	}
+	// The wording must not promise the clipboard was actually updated.
+	for _, overclaim := range []string{"copied to clipboard", "copied!"} {
+		if strings.Contains(frame, overclaim) {
+			t.Fatalf("the acknowledgement overclaims (%q):\n%s", overclaim, frame)
+		}
+	}
+}
+
+// T13 W9: `w` trades rows for the rest of a long line, capped so one line cannot take
+// the whole tail.
+func TestWrapToggleShowsMoreOfALongTailLineWithinACap(t *testing.T) {
+	current := populatedViewModel(t)
+	long := strings.Repeat("a long streamed progress sentence ", 8)
+	line := runner.Line{Attempt: 1, Stream: runner.StreamStdout, Text: long}
+	updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
+		Kind:  pipeline.EventStepLog,
+		RunID: "run-1",
+		Step:  pipeline.StepPlan,
+		Role:  "plan_writer",
+		CLI:   "claude",
+		Line:  &line,
+	}})
+	current = updated.(model)
+
+	truncated := ansi.Strip(activityBody(current, 60, 5))
+	if countRows(truncated) != 1 {
+		t.Fatalf("the default is one row per line, got %d:\n%s",
+			countRows(truncated), truncated)
+	}
+	if !strings.Contains(truncated, "…") {
+		t.Fatalf("the default did not truncate:\n%s", truncated)
+	}
+
+	updated, _ = current.Update(printableKey('w'))
+	wrapped := updated.(model)
+	if !wrapped.wrapTail {
+		t.Fatal("`w` did not toggle wrapping")
+	}
+	body := ansi.Strip(activityBody(wrapped, 60, 5))
+	rows := countRows(body)
+	if rows < 2 {
+		t.Fatalf("wrapping showed no extra rows:\n%s", body)
+	}
+	if rows > maxWrappedTailRows {
+		t.Fatalf("one line took %d rows, cap is %d:\n%s",
+			rows, maxWrappedTailRows, body)
+	}
+	// More of the line is visible than before.
+	if len(strings.Join(strings.Fields(body), "")) <=
+		len(strings.Join(strings.Fields(truncated), "")) {
+		t.Fatalf("wrapping did not reveal more text:\n%s", body)
+	}
+
+	// And it toggles back.
+	updated, _ = wrapped.Update(printableKey('w'))
+	if updated.(model).wrapTail {
+		t.Fatal("`w` did not toggle back")
+	}
+}
