@@ -2305,3 +2305,98 @@ func TestExpandedBlockIsWalkableUnderPendingPressure(t *testing.T) {
 			current.entryExpanded, current.expandScroll)
 	}
 }
+
+// r3-f2: a prompt takes the keyboard *and* shrinks LIVE OUTPUT, so an expanded block
+// would sit clipped with no key able to reach its head. Opening a prompt therefore
+// ends the reading mode but keeps the cursor (review T14c-r3 f2). This goes through
+// renderDashboard with the prompt actually open — setting PendingAction alone leaves
+// statusHeight at 2 and misses the whole path.
+func TestOpeningAPromptCollapsesTheExpandedBlock(t *testing.T) {
+	build := func(t *testing.T) model {
+		t.Helper()
+		current := populatedViewModel(t)
+		current.width = wideBreakpointWidth
+		current.height = wideBreakpointHeight
+		current.status.Phase = state.PhasePausedForInput
+		current.status.PendingAction = &state.PendingAction{
+			Kind: state.PendingPlanQuestion,
+			Prompt: strings.Repeat(
+				"which package should own the retry feedback loop ", 6),
+		}
+		for index := 0; index < 6; index++ {
+			current.appendLog(logEntry{
+				Role: fmt.Sprintf("role-%02d", index),
+				Text: "short",
+			})
+		}
+		current.appendLog(logEntry{
+			Step: pipeline.StepGate,
+			Role: "gate",
+			Text: strings.Repeat("a long gate failure explanation ", 40),
+		})
+		current.focus = boxLiveOutput
+
+		updated, _ := current.Update(printableKey('k'))
+		current = updated.(model)
+		updated, _ = current.Update(specialKey(tea.KeyEnter))
+		current = updated.(model)
+		if !current.entryExpanded {
+			t.Fatal("the entry did not expand before the prompt was opened")
+		}
+		// Walk into the block so the collapse has something to undo.
+		updated, _ = current.Update(printableKey('k'))
+		current = updated.(model)
+		if current.expandScroll == 0 {
+			t.Fatal("k did not walk inside the block")
+		}
+		return current
+	}
+
+	for _, promptCase := range []struct {
+		name string
+		open func(model) model
+	}{
+		{
+			name: "plan_question editor",
+			open: func(current model) model {
+				// The real path: focus another box, then enter opens the editor.
+				current.focus = boxPending
+				updated, _ := current.Update(specialKey(tea.KeyEnter))
+				return updated.(model)
+			},
+		},
+		{
+			name: "approve confirmation",
+			open: func(current model) model {
+				current.status.Phase = state.PhaseAwaitingApproval
+				current.status.PendingAction = nil
+				updated, _ := current.Update(printableKey('a'))
+				return updated.(model)
+			},
+		},
+	} {
+		t.Run(promptCase.name, func(t *testing.T) {
+			current := promptCase.open(build(t))
+			if current.prompt == promptNone {
+				t.Fatal("the prompt did not open")
+			}
+			if current.entryExpanded || current.expandScroll != 0 {
+				t.Fatalf("the block stayed expanded behind the prompt: expanded=%v scroll=%d",
+					current.entryExpanded, current.expandScroll)
+			}
+			if !current.hasSelection {
+				t.Fatal("the cursor was dropped — only the reading mode should end")
+			}
+
+			// With the prompt open the cursor's row is one row again, so the marker is
+			// on screen in the shrunken box and nothing is clipped unreachably.
+			frame := ansi.Strip(renderDashboard(current))
+			if !strings.Contains(frame, "▌▸") {
+				t.Fatalf("the cursor is not visible with the prompt open:\n%s", frame)
+			}
+			if strings.Contains(frame, "more rows in logs/") {
+				t.Fatalf("a truncated block is still drawn behind the prompt:\n%s", frame)
+			}
+		})
+	}
+}

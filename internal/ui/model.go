@@ -543,6 +543,7 @@ func (current model) updateKey(
 			// the *key* path only: T15's `coterix approve <id>` seeds the same
 			// operation through ui.Open and stays exempt, matching the non-TTY CLI
 			// (T15-R6 · design-plan W5).
+			current.collapseForPrompt()
 			current.prompt = promptApproveConfirm
 			current.promptValue = ""
 			current.promptError = ""
@@ -558,6 +559,7 @@ func (current model) updateKey(
 		}
 		if current.status.PendingAction.Kind == state.PendingTaskCap {
 			// A pick, not free text — so no editor.
+			current.collapseForPrompt()
 			current.prompt = promptResume
 			current.promptValue = taskCapChoices[0]
 			current.promptError = ""
@@ -696,6 +698,17 @@ func (current *model) clearPrompt() {
 // ctrl+j break a line, and taking `enter` in updatePromptKey before the textarea
 // sees it is what makes enter submit. (Whether `enter` also stays in the binding
 // turns out not to matter — the interception runs first.)
+// collapseForPrompt folds the cursor's expanded block when a prompt takes the
+// keyboard. While `prompt != promptNone` every key goes to the editor, so there is
+// no way to walk the block — and the prompt shrinks LIVE OUTPUT at the same time, so
+// the block would sit clipped with its head unreachable (review T14c-r3 f2). The
+// cursor itself survives: only the reading mode ends.
+func (current *model) collapseForPrompt() {
+	current.entryExpanded = false
+	current.expandScroll = 0
+	current.syncCursorViewport()
+}
+
 func (current *model) beginTextPrompt(mode promptMode) {
 	area := textarea.New()
 	area.ShowLineNumbers = false
@@ -706,6 +719,7 @@ func (current *model) beginTextPrompt(mode promptMode) {
 		key.WithHelp("ctrl+j", "newline"),
 	)
 	area.Focus()
+	current.collapseForPrompt()
 	current.prompt = mode
 	current.promptValue = ""
 	current.promptError = ""
