@@ -333,20 +333,23 @@ type dashboardStyles struct {
 	BorderFocus lipgloss.Style
 	// TabActive marks the selected artifact tab (T14 W3): Primary carries the
 	// colour, bold carries the same signal without it.
-	TabActive    lipgloss.Style
-	Label        lipgloss.Style
-	Value        lipgloss.Style
-	Muted        lipgloss.Style
-	Primary      lipgloss.Style
-	Secondary    lipgloss.Style
-	Claude       lipgloss.Style
-	Codex        lipgloss.Style
-	Success      lipgloss.Style
-	Warning      lipgloss.Style
-	Error        lipgloss.Style
-	Info         lipgloss.Style
-	Busy         lipgloss.Style
-	Hint         lipgloss.Style
+	TabActive lipgloss.Style
+	Label     lipgloss.Style
+	Value     lipgloss.Style
+	Muted     lipgloss.Style
+	Primary   lipgloss.Style
+	Secondary lipgloss.Style
+	Claude    lipgloss.Style
+	Codex     lipgloss.Style
+	Success   lipgloss.Style
+	Warning   lipgloss.Style
+	Error     lipgloss.Style
+	Info      lipgloss.Style
+	Busy      lipgloss.Style
+	Hint      lipgloss.Style
+	// Link styles OSC8 hyperlinks (T14 W9). `component.link` was a fully unconsumed
+	// token before this.
+	Link         lipgloss.Style
 	PhaseInfo    lipgloss.Style
 	PhaseWarning lipgloss.Style
 	PhaseSuccess lipgloss.Style
@@ -401,6 +404,9 @@ func newDashboardStyles(tokens colorTokens) dashboardStyles {
 		TabActive: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(theme.Primary)).
 			Bold(true),
+		Link: lipgloss.NewStyle().
+			Foreground(lipgloss.Color(component.Link)).
+			Underline(true),
 		Label: lipgloss.NewStyle().
 			Foreground(lipgloss.Color(theme.FGMoreSubtle)),
 		Value: lipgloss.NewStyle().

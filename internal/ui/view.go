@@ -3,6 +3,8 @@ package ui
 import (
 	"fmt"
 	"image/color"
+	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -49,6 +51,37 @@ type sidebarData struct {
 	PendingKind      state.PendingKind
 	PendingPrompt    string
 	LastError        string
+}
+
+// Measured 2026-07-25 (x/ansi v0.11.7): `ansi.StringWidth` counts an OSC8 escape as
+// zero cells, `TruncateWc` keeps the opening and closing sequences intact around the
+// cut, uv's compositor carries the sequence through `composeUV`, and `ansi.Strip`
+// removes it — so a link costs no layout budget and terminals that ignore OSC8 just
+// show the text (T14 W9).
+func renderLink(currentTheme theme, label, path string) string {
+	if path == "" {
+		return currentTheme.styles.Value.Render(label)
+	}
+	target := url.URL{Scheme: "file", Path: path}
+	return ansi.SetHyperlink(target.String()) +
+		currentTheme.styles.Link.Render(label) +
+		ansi.ResetHyperlink()
+}
+
+// runDirectory is where this run keeps its state, artifacts and logs. It is derived
+// rather than carried on RunStatus: repoRoot and the run id are already in the model
+// and pipeline owns the same layout (pipeline/run.go).
+func runDirectory(current model) string {
+	if current.repoRoot == "" || !current.hasStatus ||
+		current.status.RunID == "" {
+		return ""
+	}
+	return filepath.Join(
+		current.repoRoot,
+		".coterix",
+		"runs",
+		current.status.RunID,
+	)
 }
 
 func renderDashboard(current model) string {
@@ -409,8 +442,15 @@ func expandedEntryLines(
 		rows = append(rows, indent+current.theme.styles.Value.Render(row))
 	}
 	if withheld > 0 {
-		rows = append(rows, indent+current.theme.styles.Muted.Render(
+		// The marker names logs/, so it is also the way there (T14 W9).
+		logs := ""
+		if dir := runDirectory(current); dir != "" {
+			logs = filepath.Join(dir, "logs")
+		}
+		rows = append(rows, indent+renderLink(
+			current.theme,
 			fmt.Sprintf("… %d more rows in logs/", withheld),
+			logs,
 		))
 	}
 	return rows
@@ -1560,8 +1600,10 @@ func renderTopBar(current model, width, height int) string {
 		runID = current.status.RunID
 	}
 	identity := current.theme.styles.Label.Render("run: ") +
-		current.theme.styles.Value.Render(
+		renderLink(
+			current.theme,
 			ansi.TruncateWc(runID, max(1, contentWidth/3), "…"),
+			runDirectory(current),
 		)
 
 	first := alignTriple(wordmark, activity, identity, contentWidth)

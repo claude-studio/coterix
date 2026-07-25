@@ -1607,3 +1607,78 @@ func TestBoxSharesCapTheFinalHeightNotTheContent(t *testing.T) {
 		})
 	}
 }
+
+// W9: the run id and the withheld-rows marker are OSC8 links to the paths they name.
+// Measured (x/ansi v0.11.7): the escape is zero-width, survives the uv compositor,
+// truncates without losing its closing sequence, and ansi.Strip removes it — so the
+// link costs no layout budget and unsupporting terminals just show the text.
+func TestPathsRenderAsZeroWidthHyperlinks(t *testing.T) {
+	current := populatedViewModel(t)
+	current.repoRoot = "/repo root/coterix"
+	current.width = wideBreakpointWidth
+	current.height = wideBreakpointHeight
+
+	wantDir := "file:///repo%20root/coterix/.coterix/runs/run-9"
+
+	t.Run("the run id links to the run directory", func(t *testing.T) {
+		bar := renderTopBar(current, 120, topBarHeight)
+		if !strings.Contains(bar, wantDir) {
+			t.Fatalf("the run id is not linked:\n%q", bar)
+		}
+		// Zero-width: stripping the escapes must not change the laid-out row.
+		plain := ansi.Strip(bar)
+		if strings.Contains(plain, "file://") {
+			t.Fatalf("the escape leaked into the visible text:\n%s", plain)
+		}
+		for index, row := range strings.Split(plain, "\n") {
+			if cells := ansi.StringWidth(row); cells > 120 {
+				t.Fatalf("row %d is %d cells with a link in it", index, cells)
+			}
+		}
+		if !strings.Contains(plain, "run-9") {
+			t.Fatalf("the label was lost:\n%s", plain)
+		}
+	})
+
+	t.Run("the withheld marker links to logs", func(t *testing.T) {
+		linked := current
+		linked.appendLog(logEntry{
+			Step: pipeline.StepGate,
+			Role: "gate",
+			Text: strings.Repeat("a long gate failure explanation ", 40),
+		})
+		linked.focus = boxLiveOutput
+		updated, _ := linked.Update(printableKey('k'))
+		linked = updated.(model)
+		updated, _ = linked.Update(specialKey(tea.KeyEnter))
+		linked = updated.(model)
+
+		body := lifecycleBody(linked, 90)
+		if !strings.Contains(body, wantDir+"/logs") {
+			t.Fatalf("the withheld marker is not linked:\n%q", body)
+		}
+		if !strings.Contains(ansi.Strip(body), "more rows in logs/") {
+			t.Fatalf("the marker text was lost:\n%s", ansi.Strip(body))
+		}
+	})
+
+	t.Run("no run means no link, not a broken one", func(t *testing.T) {
+		bare := populatedViewModel(t)
+		bare.repoRoot = ""
+		bar := renderTopBar(bare, 120, topBarHeight)
+		// Check for the escape itself: an empty path would render as the bare scheme
+		// `file:`, which a "file://" check would happily miss.
+		if strings.Contains(bar, "\x1b]8;;") {
+			t.Fatalf("a link was emitted without a run directory:\n%q", bar)
+		}
+	})
+
+	t.Run("the link uses the previously unconsumed token", func(t *testing.T) {
+		cell := findStyledCell(t, renderTopBar(current, 120, topBarHeight), "9")
+		assertSameColor(
+			t,
+			cell.Style.Fg,
+			lipgloss.Color(current.theme.tokens.Component.Link),
+		)
+	})
+}
