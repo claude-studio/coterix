@@ -1438,3 +1438,112 @@ func TestDocumentedKeysAreActuallyDispatched(t *testing.T) {
 		t.Fatalf("phase actions are not reflected in the hint line: %q", hints)
 	}
 }
+
+// The progress bar lives inside the existing progress row: the sidebar's row budget
+// must not grow, the counts survive when the rail is narrow, and human-intervention
+// signals still come after it (T14 W7 · R2).
+func TestProgressBarRendersInsideItsRowAndYieldsBeforeTheCounts(t *testing.T) {
+	current := populatedViewModel(t)
+	data := deriveSidebar(current)
+	data.PlanRound = 3
+	data.Confirmed = 1
+	data.Total = 4
+
+	rowsFor := func(width int) []string {
+		body := ansi.Strip(renderSidebarBody(current.theme, data, width, true, false))
+		return strings.Split(strings.TrimRight(body, "\n"), "\n")
+	}
+	// Row count is identical with and without a bar: compare a width that fits one
+	// against a width that cannot.
+	// The rail is a fixed 32 cells, so both of these are real widths: 26 is the
+	// tightest the card gets, 30 is typical.
+	wide, narrow := rowsFor(30), rowsFor(26)
+	if len(wide) != len(narrow) {
+		t.Fatalf("the bar changed the row count: %d vs %d", len(wide), len(narrow))
+	}
+
+	wideRow := progressRow(t, wide)
+	if !strings.Contains(wideRow, "■") || !strings.Contains(wideRow, "□") {
+		t.Fatalf("no bar at width 30: %q", wideRow)
+	}
+	if !strings.Contains(wideRow, "1/4") || !strings.Contains(wideRow, "round 3") {
+		t.Fatalf("the bar displaced the counts: %q", wideRow)
+	}
+
+	// At the tightest real width the counts must still be intact and unclipped —
+	// the bar is what shrinks.
+	narrowRow := progressRow(t, narrow)
+	if !strings.Contains(narrowRow, "1/4") || strings.Contains(narrowRow, "…") {
+		t.Fatalf("the counts did not survive the tightest rail: %q", narrowRow)
+	}
+
+	// No row may exceed the rail.
+	for _, width := range []int{26, 28, 30, 40} {
+		for index, row := range rowsFor(width) {
+			if cells := ansi.StringWidth(row); cells > width {
+				t.Fatalf("width=%d row %d is %d cells: %q", width, index, cells, row)
+			}
+		}
+	}
+
+	// The approval signal is still present and still after the progress row.
+	rows := rowsFor(30)
+	signal, progress := -1, -1
+	for index, row := range rows {
+		if strings.Contains(row, "APPROVAL NEEDED") {
+			signal = index
+		}
+		if strings.Contains(row, "progress:") {
+			progress = index
+		}
+	}
+	if signal < 0 || progress < 0 || signal < progress {
+		t.Fatalf("intervention signal at %d, progress at %d:\n%s",
+			signal, progress, strings.Join(rows, "\n"))
+	}
+}
+
+// The bar is a proportion, so the ends must be exact: nothing filled at zero, every
+// cell filled when the plan is done.
+func TestProgressBarEndsAreExact(t *testing.T) {
+	current := populatedViewModel(t)
+	base := deriveSidebar(current)
+
+	for _, testCase := range []struct {
+		name             string
+		confirmed, total int
+		filled, empty    bool
+	}{
+		{name: "nothing done", confirmed: 0, total: 5, empty: true},
+		{name: "all done", confirmed: 5, total: 5, filled: true},
+		{name: "partway", confirmed: 3, total: 5, filled: true, empty: true},
+		// No plan yet means no proportion to draw — neither half of the bar.
+		{name: "no tasks yet", confirmed: 0, total: 0},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			data := base
+			data.Confirmed = testCase.confirmed
+			data.Total = testCase.total
+			row := ansi.Strip(renderProgressValue(current.theme, data, 40))
+			if got := strings.Contains(row, "■"); got != testCase.filled {
+				t.Fatalf("filled cells present=%v, want %v: %q",
+					got, testCase.filled, row)
+			}
+			if got := strings.Contains(row, "□"); got != testCase.empty {
+				t.Fatalf("empty cells present=%v, want %v: %q",
+					got, testCase.empty, row)
+			}
+		})
+	}
+}
+
+func progressRow(t *testing.T, rows []string) string {
+	t.Helper()
+	for _, row := range rows {
+		if strings.Contains(row, "progress:") {
+			return row
+		}
+	}
+	t.Fatalf("no progress row in:\n%s", strings.Join(rows, "\n"))
+	return ""
+}

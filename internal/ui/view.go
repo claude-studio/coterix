@@ -1044,16 +1044,11 @@ func renderSidebarBody(
 			outcomeIcon(currentTheme, data.Review),
 		innerWidth,
 	)
-	writeSidebarField(
+	writeSidebarStyledField(
 		&content,
 		currentTheme,
 		"progress",
-		fmt.Sprintf(
-			"round %d · %d/%d",
-			data.PlanRound,
-			data.Confirmed,
-			data.Total,
-		),
+		renderProgressValue(currentTheme, data, innerWidth),
 		innerWidth,
 	)
 
@@ -1207,6 +1202,40 @@ func deriveStatusFields(status pipeline.RunStatus) sidebarData {
 		data.CLI = "operator"
 	}
 	return data
+}
+
+// renderProgressValue draws the task progress as a block bar *inside* the existing
+// progress row — the sidebar's row budget does not grow (T14 W7 · R2). The counts
+// come first: when the rail is too narrow for a bar, the bar is what goes, because
+// `round 3 · 2/5` still answers the question and a clipped bar does not.
+func renderProgressValue(
+	currentTheme theme,
+	data sidebarData,
+	innerWidth int,
+) string {
+	// "▌ " + "progress: " is the row's chrome; whatever is left holds the counts and,
+	// only if there is still room, the bar.
+	const rowChrome = 2 + len("progress: ")
+	available := innerWidth - rowChrome
+	counts := fmt.Sprintf(
+		"round %d · %d/%d",
+		data.PlanRound,
+		data.Confirmed,
+		data.Total,
+	)
+	spare := available - ansi.StringWidth(counts) - 1
+	// No plan yet means no proportion to draw. The width guard is what keeps
+	// strings.Repeat from being handed a negative count; the sidebar rail is a fixed
+	// 32 cells, so it is a safety floor rather than a layout the user will meet.
+	if data.Total <= 0 || spare < 2 {
+		return currentTheme.styles.Value.Render(counts)
+	}
+	cells := min(spare, 10)
+	filled := data.Confirmed * cells / data.Total
+	filled = min(max(filled, 0), cells)
+	bar := currentTheme.styles.PhaseSuccess.Render(strings.Repeat("■", filled)) +
+		currentTheme.styles.Muted.Render(strings.Repeat("□", cells-filled))
+	return bar + " " + currentTheme.styles.Value.Render(counts)
 }
 
 func writeSidebarField(
