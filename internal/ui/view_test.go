@@ -2158,6 +2158,26 @@ func pressureModelFromRealRun(
 	task := currentRun.State.Tasks[taskID]
 	task.BaseSHA = &baseSHA
 	task.CandidateSHA = &candidateSHA
+	// A repairing task always carries its evidence: the cycle reaches repairing either
+	// after a failed gate (GateResult set) or after a dirty review (both set), and the
+	// only code that clears them resets the task for a fresh attempt
+	// (task_evidence.go:82, :116, :944). Leaving them nil described a task that had been
+	// sent back for repair without anything having judged it.
+	gatePath := filepath.Join("tasks", taskID, "gate.json")
+	reviewPath := filepath.Join("tasks", taskID, "review.json")
+	writeArtifactTestFile(
+		t,
+		filepath.Join(currentRun.Dir, gatePath),
+		[]byte(`{"exit":0,"timed_out":false}`),
+	)
+	writeArtifactTestFile(
+		t,
+		filepath.Join(currentRun.Dir, reviewPath),
+		[]byte(`{"schema_version":1,"task_id":"`+taskID+
+			`","candidate_sha":"`+candidateSHA+`","clean":false,"findings":[]}`),
+	)
+	task.GateResult = &gatePath
+	task.ReviewResult = &reviewPath
 
 	seed(t, currentRun, taskID)
 	if err := currentRun.SaveState(); err != nil {
