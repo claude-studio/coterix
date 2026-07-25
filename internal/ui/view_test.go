@@ -2520,7 +2520,14 @@ func writePressureEvidence(
 	// borrowed: every one of the seven fields must be present and nothing else may be, which
 	// is what readGateEvidence enforces. Being a mirror, it can fall behind that function —
 	// what it cannot do is silently stop checking the fields this fixture writes.
-	gateDecoder := json.NewDecoder(bytes.NewReader(gate))
+	// Decoded from the **file**, not from the in-memory bytes: production reads gate.json off
+	// disk, so checking the slice that produced it would leave the write itself unexamined —
+	// the same variable-versus-document gap as review T13b b13 f1, one level up.
+	written, err := os.ReadFile(filepath.Join(currentRun.Dir, gatePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateDecoder := json.NewDecoder(bytes.NewReader(written))
 	gateDecoder.DisallowUnknownFields()
 	var gateWire struct {
 		Command      *[]string `json:"command"`
@@ -2544,7 +2551,7 @@ func writePressureEvidence(
 	case gateWire.Command == nil || gateWire.CWD == nil || gateWire.CandidateSHA == nil ||
 		gateWire.Exit == nil || gateWire.TimedOut == nil ||
 		gateWire.StdoutLog == nil || gateWire.StderrLog == nil:
-		t.Fatalf("gate evidence is missing a required field: %s", gate)
+		t.Fatalf("gate evidence is missing a required field: %s", written)
 	case !slices.Equal(*gateWire.Command, currentRun.Config.GateCommand):
 		t.Fatalf("gate command %v is not the configured %v",
 			*gateWire.Command, currentRun.Config.GateCommand)
