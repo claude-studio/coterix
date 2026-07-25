@@ -489,10 +489,12 @@ func TestOpenPromptPathsRunThroughTheRealProgram(t *testing.T) {
 		if executor.mutating() == 0 {
 			t.Fatalf("retry did not start another attempt:\n%s", output.String())
 		}
-		persisted := openIntegrationRun(t, repoRoot, currentRun.ID)
-		if persisted.State.Phase == state.PhaseFailed {
-			t.Fatal("the run aborted — the submitted answer was not retry")
-		}
+		// No assertion on the persisted phase: this fixture's executor returns success
+		// without producing an artifact, so a *correct* retry also fails the
+		// implementation postcondition and lands in PhaseFailed. Asserting otherwise
+		// mistook a good retry for an abort depending on scheduling (review T15-r5 f2a).
+		// The mutating subprocess above is the witness — abort ends the run and never
+		// reaches the executor.
 	})
 }
 
