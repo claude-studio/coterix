@@ -171,6 +171,19 @@ func execute(
 		ctx = context.Background()
 	}
 
+	// A help request is not a usage error: it goes to stdout and exits 0, and it is
+	// intercepted before any parsing so `coterix --help` never reaches the "unknown
+	// command" branch (T15 W3). `help` is included as a bareword by decision — it
+	// prints the same usage and adds no command surface of its own. Bare `coterix`
+	// stays a usage error (exit 2): that is a mistake, not a question.
+	if len(args) > 0 {
+		switch args[0] {
+		case "--help", "-h", "help":
+			_, _ = io.WriteString(stdout, usageText)
+			return 0
+		}
+	}
+
 	var (
 		result      any
 		err         error

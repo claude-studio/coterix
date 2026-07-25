@@ -1139,3 +1139,76 @@ func equalStrings(left, right *string) bool {
 		return *left == *right
 	}
 }
+
+// A help request is a question, not a mistake: stdout and exit 0. Before T15 W3
+// `coterix --help` fell through to "unknown command" and left usage on stderr with
+// exit 2, which reads as a failure to a shell script.
+func TestExecuteTopLevelHelpGoesToStdoutWithExitZero(t *testing.T) {
+	for _, argument := range []string{"--help", "-h", "help"} {
+		t.Run(argument, func(t *testing.T) {
+			code, stdout, stderr := executeForTest(
+				t,
+				&fakeControlPlane{},
+				t.TempDir(),
+				argument,
+			)
+			if code != 0 {
+				t.Fatalf("exit=%d want 0 (stderr=%q)", code, stderr)
+			}
+			if stderr != "" {
+				t.Fatalf("help wrote to stderr: %q", stderr)
+			}
+			if !strings.Contains(stdout, "Usage:") {
+				t.Fatalf("usage did not reach stdout: %q", stdout)
+			}
+			for _, command := range []string{
+				"run",
+				"approve",
+				"reject",
+				"status",
+				"resume",
+			} {
+				if !strings.Contains(stdout, command) {
+					t.Fatalf("usage omits %q:\n%s", command, stdout)
+				}
+			}
+		})
+	}
+}
+
+// The neighbours of that decision, pinned so they cannot drift: bare `coterix` is a
+// usage error, and a subcommand's own `--help` keeps its current stderr/exit 2
+// behaviour (T15 W3 · R5 — unifying those would mean touching every flagset).
+func TestHelpDoesNotChangeBareInvocationOrSubcommandHelp(t *testing.T) {
+	t.Run("bare invocation stays a usage error", func(t *testing.T) {
+		code, stdout, stderr := executeForTest(t, &fakeControlPlane{}, t.TempDir())
+		if code != 2 {
+			t.Fatalf("exit=%d want 2", code)
+		}
+		if stdout != "" {
+			t.Fatalf("a usage error wrote to stdout: %q", stdout)
+		}
+		if !strings.Contains(stderr, "Usage:") {
+			t.Fatalf("usage did not reach stderr: %q", stderr)
+		}
+	})
+
+	t.Run("subcommand help stays on stderr", func(t *testing.T) {
+		code, stdout, stderr := executeForTest(
+			t,
+			&fakeControlPlane{},
+			t.TempDir(),
+			"run",
+			"--help",
+		)
+		if code != 2 {
+			t.Fatalf("exit=%d want 2 (unchanged)", code)
+		}
+		if stdout != "" {
+			t.Fatalf("subcommand help wrote to stdout: %q", stdout)
+		}
+		if !strings.Contains(stderr, "Usage:") {
+			t.Fatalf("subcommand help lost its usage text: %q", stderr)
+		}
+	})
+}
