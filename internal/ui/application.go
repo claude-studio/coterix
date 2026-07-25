@@ -43,6 +43,80 @@ func Run(
 	request string,
 	options RunOptions,
 ) (pipeline.RunStatus, error) {
+	return runDashboard(ctx, executor, repoRoot, options, nil, request)
+}
+
+// Open attaches the dashboard to an existing run and dispatches one operation on it
+// — the interactive form of `coterix approve|reject|resume <run_id>` (T15 W1).
+//
+// `Run` starts from a new request; `Open` starts from a run that already exists. Both
+// go through the same program and the same control plane; only the seeding differs.
+// `command` is the CLI command name — "approve", "reject" or "resume" — because that
+// is what the caller already has in hand; `response` is the parsed `--response` value
+// or nil when none was given.
+func Open(
+	ctx context.Context,
+	executor pipeline.PlanExecutor,
+	repoRoot string,
+	runID string,
+	command string,
+	response *string,
+	options RunOptions,
+) (pipeline.RunStatus, error) {
+	if runID == "" {
+		return pipeline.RunStatus{}, fmt.Errorf("ui: a run id is required")
+	}
+	kind, err := operationKindForCommand(command)
+	if err != nil {
+		return pipeline.RunStatus{}, err
+	}
+	return runDashboard(ctx, executor, repoRoot, options, &openSeed{
+		runID: runID,
+		initial: initialOperation{
+			Kind:     kind,
+			Response: copyResponse(response),
+		},
+	}, "")
+}
+
+// copyResponse defends the model from a caller that reuses its buffer.
+func copyResponse(response *string) *string {
+	if response == nil {
+		return nil
+	}
+	copied := *response
+	return &copied
+}
+
+func operationKindForCommand(command string) (operationKind, error) {
+	switch command {
+	case "approve":
+		return operationApprove, nil
+	case "reject":
+		return operationReject, nil
+	case "resume":
+		return operationResume, nil
+	}
+	return "", fmt.Errorf(
+		"ui: %q cannot open an existing run interactively",
+		command,
+	)
+}
+
+// openSeed carries what Open needs into the shared body.
+type openSeed struct {
+	runID   string
+	initial initialOperation
+}
+
+func runDashboard(
+	ctx context.Context,
+	executor pipeline.PlanExecutor,
+	repoRoot string,
+	options RunOptions,
+	seed *openSeed,
+	request string,
+) (pipeline.RunStatus, error) {
 	if executor == nil {
 		return pipeline.RunStatus{}, fmt.Errorf("ui: a pipeline executor is required")
 	}
@@ -82,16 +156,31 @@ func Run(
 		pipeline.WithObserver(observer),
 	)
 	tracker := &operationTracker{}
-	initial := newModel(
-		operationContext,
-		cancelOperations,
-		controller,
-		repoRoot,
-		request,
-		theme,
-		!options.Interactive,
-		tracker,
-	)
+	var initial model
+	if seed != nil {
+		initial = newOpenModel(
+			operationContext,
+			cancelOperations,
+			controller,
+			repoRoot,
+			seed.runID,
+			seed.initial,
+			theme,
+			!options.Interactive,
+			tracker,
+		)
+	} else {
+		initial = newModel(
+			operationContext,
+			cancelOperations,
+			controller,
+			repoRoot,
+			request,
+			theme,
+			!options.Interactive,
+			tracker,
+		)
+	}
 
 	programOptions := []tea.ProgramOption{
 		tea.WithContext(ctx),

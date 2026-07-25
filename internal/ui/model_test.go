@@ -2581,3 +2581,178 @@ func TestActivityTailMarksFailureFromThePayloadNotTheStream(t *testing.T) {
 		t.Fatalf("a non-JSON line was not passed through: %q", last.Text)
 	}
 }
+
+// T15 W1: Open seeds through the *event* path. The status load emits a snapshot, the
+// snapshot loads the artifacts, and only then does the operation dispatch — a reject
+// prompt with a blank artifact pane would be unanswerable.
+func TestOpenSeedsThroughTheSnapshotAndDispatchesOnce(t *testing.T) {
+	response := "please revise the gate"
+	for _, test := range []struct {
+		name      string
+		command   string
+		response  *string
+		pending   *state.PendingAction
+		phase     state.Phase
+		wantOp    operationKind
+		wantPromp promptMode
+	}{
+		{
+			name:    "approve dispatches immediately",
+			command: "approve",
+			phase:   state.PhaseAwaitingApproval,
+			wantOp:  operationApprove,
+		},
+		{
+			name:     "reject with a response dispatches immediately",
+			command:  "reject",
+			response: &response,
+			phase:    state.PhaseAwaitingApproval,
+			wantOp:   operationReject,
+		},
+		{
+			name:      "bare reject asks for feedback",
+			command:   "reject",
+			phase:     state.PhaseAwaitingApproval,
+			wantPromp: promptReject,
+		},
+		{
+			name:    "auth resume needs no answer",
+			command: "resume",
+			phase:   state.PhasePausedForInput,
+			pending: &state.PendingAction{Kind: state.PendingAuth},
+			wantOp:  operationResume,
+		},
+		{
+			name:      "task_cap resume asks which way",
+			command:   "resume",
+			phase:     state.PhasePausedForInput,
+			pending:   &state.PendingAction{Kind: state.PendingTaskCap, Prompt: "cap"},
+			wantPromp: promptResume,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fake := &fakeUIControl{}
+			kind, err := operationKindForCommand(test.command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current := testModel(t, fake)
+			current.openRunID = "run-open"
+			current.operation = ""
+			current.pendingOperation = &initialOperation{
+				Kind:     kind,
+				Response: test.response,
+			}
+
+			status := pipeline.RunStatus{
+				RunID:         "run-open",
+				Phase:         test.phase,
+				PendingAction: test.pending,
+			}
+			updated, command := current.Update(pipelineEventMsg{Event: pipeline.Event{
+				Kind:     pipeline.EventStateSnapshot,
+				RunID:    "run-open",
+				RepoRoot: t.TempDir(),
+				Status:   &status,
+			}})
+			current = updated.(model)
+
+			if !current.hasStatus {
+				t.Fatal("the snapshot did not seed the model")
+			}
+			if current.artifactLoadingKey == "" {
+				t.Fatal("the artifacts were not requested — a prompt would be blank")
+			}
+			if command == nil {
+				t.Fatal("the snapshot returned no command")
+			}
+			if current.pendingOperation != nil {
+				t.Fatal("the pending operation was not consumed")
+			}
+			if test.wantOp != "" && current.operation != test.wantOp {
+				t.Fatalf("operation=%q want %q", current.operation, test.wantOp)
+			}
+			if test.wantPromp != promptNone {
+				if current.prompt != test.wantPromp {
+					t.Fatalf("prompt=%d want %d", current.prompt, test.wantPromp)
+				}
+				if current.operation != "" {
+					t.Fatalf("an operation started before the answer: %q",
+						current.operation)
+				}
+			}
+
+			// A re-emitted snapshot must not dispatch a second time.
+			before := current.operation
+			updated, _ = current.Update(pipelineEventMsg{Event: pipeline.Event{
+				Kind:     pipeline.EventStateSnapshot,
+				RunID:    "run-open",
+				RepoRoot: current.repoRoot,
+				Status:   &status,
+			}})
+			again := updated.(model)
+			if again.pendingOperation != nil {
+				t.Fatal("the guard rearmed itself")
+			}
+			if again.operation != before {
+				t.Fatalf("a second snapshot redispatched: %q -> %q",
+					before, again.operation)
+			}
+			if len(fake.calls) > 1 {
+				t.Fatalf("the control plane was called %d times", len(fake.calls))
+			}
+		})
+	}
+}
+
+// T15-3R-1: a run that cannot be loaded must not leave a blank dashboard hanging on
+// exit 0 — that breaks parity with the non-TTY exit 1.
+func TestOpenQuitsAndReportsWhenTheRunCannotBeLoaded(t *testing.T) {
+	current := testModel(t, &fakeUIControl{})
+	current.openRunID = "missing"
+	current.operation = ""
+
+	failure := errors.New("pipeline: open run: no such run")
+	updated, command := current.Update(runLoadedMsg{err: failure})
+	current = updated.(model)
+
+	if command == nil {
+		t.Fatal("a failed load did not quit")
+	}
+	if !errors.Is(current.operationErr, failure) {
+		t.Fatalf("operationErr=%v — the error must reach ui.Open's return", current.operationErr)
+	}
+	if len(current.logs) == 0 ||
+		!strings.Contains(current.logs[len(current.logs)-1].Text, "no such run") {
+		t.Fatalf("the failure is not in the feed: %#v", current.logs)
+	}
+	// A successful load says nothing and waits for the snapshot.
+	clean := testModel(t, &fakeUIControl{})
+	clean.openRunID = "run-1"
+	updated, command = clean.Update(runLoadedMsg{})
+	if command != nil {
+		t.Fatal("a successful load should not quit")
+	}
+	if updated.(model).operationErr != nil {
+		t.Fatal("a successful load recorded an error")
+	}
+}
+
+// Only the three control commands can open an existing run.
+func TestOperationKindForCommandRejectsAnythingElse(t *testing.T) {
+	for command, want := range map[string]operationKind{
+		"approve": operationApprove,
+		"reject":  operationReject,
+		"resume":  operationResume,
+	} {
+		got, err := operationKindForCommand(command)
+		if err != nil || got != want {
+			t.Fatalf("%q -> %q, %v", command, got, err)
+		}
+	}
+	for _, command := range []string{"run", "status", "", "APPROVE"} {
+		if _, err := operationKindForCommand(command); err == nil {
+			t.Fatalf("%q was accepted as an interactive entry", command)
+		}
+	}
+}

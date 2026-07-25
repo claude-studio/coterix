@@ -120,6 +120,20 @@ type logEntry struct {
 	Icon    logIcon
 }
 
+// initialOperation is the single operation `ui.Open` dispatches on an existing run
+// (T15 W1). Response has to travel with the kind: `resume --response retry` and
+// `reject --response …` carry a parsed answer that the kind alone cannot express.
+type initialOperation struct {
+	Kind     operationKind
+	Response *string
+}
+
+// runLoadedMsg reports the outcome of the pre-flight status load that `ui.Open`
+// performs before dispatching (T15 W1).
+type runLoadedMsg struct {
+	err error
+}
+
 // toastExpiredMsg is the scheduled redraw that lets an expired acknowledgement
 // disappear (T14 W8).
 type toastExpiredMsg struct{}
@@ -187,6 +201,13 @@ type model struct {
 	boxScroll [mainBoxCount]int
 	spinner   spinner.Model
 
+	// openRunID and pendingOperation drive `ui.Open`: rather than starting a new
+	// request, the model loads an existing run and then dispatches one operation on
+	// it. The dispatch waits for the first state snapshot so the artifacts are on
+	// screen — a reject prompt without the plan in view is unanswerable (T15 W1).
+	openRunID        string
+	pendingOperation *initialOperation
+
 	prompt      promptMode
 	promptValue string
 	promptError string
@@ -232,7 +253,128 @@ func newModel(
 	}
 }
 
+// seedPendingOperation dispatches the `ui.Open` operation exactly once, on the first
+// snapshot that actually carries a run (T15 W1). It returns a nil command when there
+// is nothing pending so callers can keep their own.
+func (current model) seedPendingOperation() (model, tea.Cmd) {
+	if current.pendingOperation == nil || !current.hasStatus {
+		return current, nil
+	}
+	initial := *current.pendingOperation
+	current.pendingOperation = nil
+	updated, command := current.dispatchInitialOperation(initial)
+	seeded, ok := updated.(model)
+	if !ok {
+		return current, command
+	}
+	if command == nil {
+		// A prompt was opened rather than an operation started; the state change still
+		// has to be kept, so hand back a no-op command to signal "handled".
+		return seeded, func() tea.Msg { return nil }
+	}
+	return seeded, command
+}
+
+// loadRunCommand asks the control plane for the run's current state. The controller
+// emits a state snapshot through the observer as a side effect, so the model and its
+// artifacts are seeded by the normal event path — seeding the fields directly would
+// leave the artifact pane blank, because loadArtifactsCommand only fires from
+// EventStateSnapshot (T15 W1).
+func (current model) loadRunCommand() tea.Cmd {
+	return func() tea.Msg {
+		_, err := current.control.Status(
+			current.ctx,
+			current.repoRoot,
+			current.openRunID,
+		)
+		return runLoadedMsg{err: err}
+	}
+}
+
+// dispatchInitialOperation runs the operation `ui.Open` was asked for, once the run
+// is on screen. Whether it dispatches immediately or asks first is decided by the
+// same rule the keyboard uses: a response that was supplied goes straight through, a
+// missing one is prompted for (T15 W1).
+func (current model) dispatchInitialOperation(
+	initial initialOperation,
+) (tea.Model, tea.Cmd) {
+	switch initial.Kind {
+	case operationApprove:
+		// approve takes no response, and the CLI entry is exempt from T14 W5's
+		// confirmation step: `coterix approve <id>` already *is* the confirmation, and
+		// the non-TTY path approves immediately (T15-R6 · CLI parity).
+		return current.beginOperation(operationApprove, nil)
+	case operationReject:
+		if initial.Response != nil {
+			return current.beginOperation(operationReject, initial.Response)
+		}
+		current.beginTextPrompt(promptReject)
+		return current, nil
+	case operationResume:
+		if initial.Response != nil {
+			return current.beginOperation(operationResume, initial.Response)
+		}
+		return current.promptForPendingAction()
+	}
+	return current, nil
+}
+
+// promptForPendingAction opens whichever answer the pause is waiting for. auth needs
+// no answer — the operator logs in outside the dashboard and the run just resumes.
+func (current model) promptForPendingAction() (tea.Model, tea.Cmd) {
+	if current.status.PendingAction == nil {
+		return current, nil
+	}
+	if current.status.PendingAction.Kind == state.PendingAuth {
+		return current.beginOperation(operationResume, nil)
+	}
+	if current.status.PendingAction.Kind == state.PendingTaskCap {
+		current.collapseForPrompt()
+		current.prompt = promptResume
+		current.promptValue = taskCapChoices[0]
+		current.promptError = ""
+		return current, nil
+	}
+	current.beginTextPrompt(promptResume)
+	return current, nil
+}
+
+// newOpenModel starts from an existing run instead of a new request (T15 W1).
+func newOpenModel(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	controller controlPlane,
+	repoRoot string,
+	runID string,
+	initial initialOperation,
+	theme theme,
+	autoQuit bool,
+	tracker *operationTracker,
+) model {
+	current := newModel(
+		ctx,
+		cancel,
+		controller,
+		repoRoot,
+		"",
+		theme,
+		autoQuit,
+		tracker,
+	)
+	current.openRunID = runID
+	current.pendingOperation = &initial
+	// Nothing is running yet: Init loads the run first.
+	current.operation = ""
+	return current
+}
+
 func (current model) Init() tea.Cmd {
+	if current.openRunID != "" {
+		// Load the run first. controller.Status emits a state snapshot through the
+		// observer, which is what seeds the model and its artifacts; the message this
+		// command returns only exists to catch a *failed* load.
+		return tea.Batch(current.loadRunCommand(), current.spinnerTickCommand())
+	}
 	operation := runOperation(
 		current.ctx,
 		current.control,
@@ -278,6 +420,22 @@ func (current model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				current.artifactLoadedKey = message.key
 				current.refreshArtifactRender()
 			}
+		}
+		return current, nil
+	case runLoadedMsg:
+		if message.err != nil {
+			// A run that cannot be loaded is a dead dashboard: without this the model
+			// hangs with hasStatus=false and the interactive path exits 0, breaking
+			// parity with the non-TTY exit 1 (T15-3R-1).
+			current.appendSystemLog(
+				runner.StreamStderr,
+				logIconFail,
+				"",
+				"",
+				message.err.Error(),
+			)
+			current.operationErr = message.err
+			return current, tea.Quit
 		}
 		return current, nil
 	case toastExpiredMsg:
@@ -333,15 +491,24 @@ func (current model) updatePipelineEvent(
 		current.artifactKey = artifactStatusKey(current.status)
 		if current.artifactKey == current.artifactLoadedKey ||
 			current.artifactKey == current.artifactLoadingKey {
+			// approve re-emits the snapshot, so this path is reached too — the pending
+			// operation must not be stranded by the artifact dedup (T15 W1).
+			if seeded, command := current.seedPendingOperation(); command != nil {
+				return seeded, command
+			}
 			return current, nil
 		}
 		current.artifactLoadingKey = current.artifactKey
-		return current, loadArtifactsCommand(
+		artifacts := loadArtifactsCommand(
 			current.ctx,
 			current.repoRoot,
 			current.status,
 			current.artifactKey,
 		)
+		if seeded, command := current.seedPendingOperation(); command != nil {
+			return seeded, tea.Batch(artifacts, command)
+		}
+		return current, artifacts
 	case pipeline.EventStepStarted:
 		current.activeStep = event.Step
 		current.activeRole = event.Role
