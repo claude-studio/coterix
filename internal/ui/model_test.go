@@ -594,6 +594,79 @@ func TestMainPaneRendersOneBoxPerSection(t *testing.T) {
 	}
 }
 
+// Reading history must survive arriving content: the offset is measured from the
+// newest line, so it has to be nudged as lines land or the window slides one row
+// per line and the user loses their place. The box also has to say there is more
+// below, and `end` must bring it back to the live edge (review T14a f2).
+func TestPausedBoxKeepsItsLinesWhenContentArrives(t *testing.T) {
+	const windowHeight = 4
+	current := populatedViewModel(t)
+	appendSteps := func(from, count int) {
+		for index := from; index < from+count; index++ {
+			updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
+				Kind: pipeline.EventStepStarted,
+				Step: pipeline.StepPlan,
+				Role: fmt.Sprintf("role-%02d", index),
+				CLI:  "claude",
+			}})
+			current = updated.(model)
+		}
+	}
+	appendSteps(0, 12)
+	current.focus = boxLiveOutput
+
+	// Scroll back into history.
+	for index := 0; index < 3; index++ {
+		updated, _ := current.Update(printableKey('k'))
+		current = updated.(model)
+	}
+	offsetBefore := current.boxScroll[boxLiveOutput]
+	if offsetBefore == 0 {
+		t.Fatal("k did not move the lifecycle box off the live edge")
+	}
+	window := func() string {
+		return visibleLines(
+			lifecycleBody(current, 100),
+			windowHeight,
+			current.boxScroll[boxLiveOutput],
+		)
+	}
+	before := ansi.Strip(window())
+
+	// Two more entries land while the user is reading.
+	appendSteps(12, 2)
+	if after := ansi.Strip(window()); after != before {
+		t.Fatalf(
+			"paused view drifted when content arrived:\nbefore:\n%s\nafter:\n%s",
+			before,
+			after,
+		)
+	}
+	if current.boxScroll[boxLiveOutput] != offsetBefore+2 {
+		t.Fatalf(
+			"offset=%d want=%d — it must grow with the new rows",
+			current.boxScroll[boxLiveOutput],
+			offsetBefore+2,
+		)
+	}
+
+	// The box announces that there is more below.
+	frame := ansi.Strip(renderMain(current, 140, 40))
+	if !strings.Contains(frame, "↓ new") {
+		t.Fatalf("paused box does not announce new content:\n%s", frame)
+	}
+
+	// end returns to the live edge and clears the cue.
+	updated, _ := current.Update(specialKey(tea.KeyEnd))
+	current = updated.(model)
+	if current.boxScroll[boxLiveOutput] != 0 {
+		t.Fatalf("end left offset=%d", current.boxScroll[boxLiveOutput])
+	}
+	if frame = ansi.Strip(renderMain(current, 140, 40)); strings.Contains(frame, "↓ new") {
+		t.Fatalf("cue survived a return to the live edge:\n%s", frame)
+	}
+}
+
 // The focus contract: compact has no focus concept, focus never rests on a box
 // that is off screen, and the focused box carries a non-color cue as well as the
 // focused border color (review T14a f3).

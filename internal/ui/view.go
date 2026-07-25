@@ -206,9 +206,14 @@ func renderMain(current model, width, height int) string {
 			}
 			body = strings.Join(lines, "\n")
 		}
+		title := mainBoxTitle(current, box)
+		if pausedBelow(bodies[index], heights[index]-2, current.boxScroll[box]) {
+			// The box is parked in history: say so, and `end` brings it back.
+			title += " · ↓ new"
+		}
 		parts = append(parts, renderBoxCard(
 			current.theme,
-			mainBoxTitle(current, box),
+			title,
 			body,
 			boxWidth,
 			current.normalizedFocus() == box,
@@ -252,11 +257,13 @@ func renderMainCompact(current model, width, height int) string {
 		if heights[index] < 2 {
 			continue
 		}
+		title := "╱╱╱ " + mainBoxTitle(current, box)
+		if pausedBelow(bodies[index], heights[index]-1, current.boxScroll[box]) {
+			title += " · ↓ new"
+		}
 		parts = append(
 			parts,
-			current.theme.styles.SectionTitle.Render(
-				"╱╱╱ "+mainBoxTitle(current, box),
-			),
+			current.theme.styles.SectionTitle.Render(title),
 			visibleLines(
 				bodies[index],
 				heights[index]-1,
@@ -373,6 +380,20 @@ func mainBoxBody(current model, box mainBox, innerWidth, maxRows int) string {
 		return activityBody(current, innerWidth, activityTailLimit(current))
 	}
 	return ""
+}
+
+// pausedBelow reports whether a box is scrolled away from its newest line *and*
+// there is really content below the window. The `↓ new` cue must not appear when
+// the offset is clamped away by short content (T14 W1).
+func pausedBelow(body string, height, scroll int) bool {
+	if scroll <= 0 || height <= 0 {
+		return false
+	}
+	rows := countRows(body)
+	if rows <= height {
+		return false
+	}
+	return min(scroll, rows-height) > 0
 }
 
 func countRows(body string) int {

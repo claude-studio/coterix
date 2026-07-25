@@ -121,8 +121,12 @@ type model struct {
 	artifactRenderErr   error
 	artifactRenderWidth int
 	focus               mainBox
-	boxScroll           [mainBoxCount]int
-	spinner             spinner.Model
+	// boxScroll is each box's distance from its newest line. 0 means "follow the
+	// live edge". A paused box (>0) is nudged by preserveReading when content
+	// arrives, which keeps the same absolute lines on screen — without that the
+	// view drifted one row per new line (T14 W1 · review T14a f2).
+	boxScroll [mainBoxCount]int
+	spinner   spinner.Model
 
 	prompt       promptMode
 	promptValue  string
@@ -369,6 +373,7 @@ func (current model) updateKey(
 	case "home":
 		current.boxScroll[current.scrollTarget()] = maxScrollSentinel
 	case "end":
+		// Back to the live edge, which also clears the `↓ new` indicator.
 		current.boxScroll[current.scrollTarget()] = 0
 	case "tab":
 		// compact has no focus concept (T14 W2) — the whole column scrolls as one.
@@ -528,6 +533,7 @@ func (current *model) appendLog(entry logEntry) {
 		entry.At = current.now()
 	}
 	current.logs = append(current.logs, entry)
+	current.preserveReading(boxLiveOutput, 1)
 	if overflow := len(current.logs) - maxLogLines; overflow > 0 {
 		copy(current.logs, current.logs[overflow:])
 		current.logs = current.logs[:maxLogLines]
@@ -550,6 +556,7 @@ func (current *model) appendActivity(entry logEntry) {
 		current.resetActivity()
 	}
 	current.activity = append(current.activity, entry)
+	current.preserveReading(boxActivity, 1)
 	if overflow := len(current.activity) - maxActivityLines; overflow > 0 {
 		copy(current.activity, current.activity[overflow:])
 		current.activity = current.activity[:maxActivityLines]
@@ -562,6 +569,9 @@ func (current *model) appendActivity(entry logEntry) {
 func (current *model) resetActivity() {
 	current.activity = current.activity[:0]
 	current.activityFailed = false
+	// A fresh attempt starts a fresh viewport — a stale offset would point past
+	// the (now empty) buffer.
+	current.boxScroll[boxActivity] = 0
 }
 
 // hasPendingPrompt reports whether the run is blocked on a question that has
@@ -609,6 +619,17 @@ func (current model) scrollTarget() mainBox {
 		return boxFeed
 	}
 	return current.normalizedFocus()
+}
+
+// preserveReading keeps a paused box on the same absolute lines when new content
+// arrives. The offset is measured from the newest line, so it has to grow by the
+// number of rows added; leaving it alone made the window slide one row per line
+// and the user lost their place mid-read (T14 W1 · review T14a f2). A box that is
+// following the live edge (offset 0) is untouched.
+func (current *model) preserveReading(box mainBox, added int) {
+	if added > 0 && current.boxScroll[box] > 0 {
+		current.boxScroll[box] += added
+	}
 }
 
 // shiftMainFocus cycles focus through the boxes that are actually on screen.
