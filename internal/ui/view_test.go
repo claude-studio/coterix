@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image/color"
@@ -1958,25 +1959,7 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 			attempts: pressureAttemptsToCap,
 			seed: func(t *testing.T, currentRun *pipeline.Run, taskID string) {
 				t.Helper()
-				// This mirrors task_cycle.go:167-190 exactly: the *next* attempt is what
-				// reports the cap, and that CapError is what pauses. Pausing at an
-				// arbitrary attempt count would be well-formed but unreachable, so the
-				// cap has to be observed rather than assumed.
-				var capErr *state.CapError
-				err := currentRun.State.BeginTaskAttempt(
-					taskID,
-					currentRun.Config.MaxTaskAttempts,
-					nil,
-				)
-				if !errors.As(err, &capErr) {
-					t.Fatalf("the next attempt did not report the cap: %v", err)
-				}
-				if capErr.Current != currentRun.Config.MaxTaskAttempts ||
-					capErr.Maximum != currentRun.Config.MaxTaskAttempts {
-					t.Fatalf("cap reported %d/%d, want the configured %d",
-						capErr.Current, capErr.Maximum,
-						currentRun.Config.MaxTaskAttempts)
-				}
+				capErr := observePressureCap(t, currentRun, taskID)
 				if err := currentRun.State.PauseForTaskCap(
 					taskID,
 					fmt.Sprintf(
@@ -1993,45 +1976,67 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 			signals: []string{"PENDING · task_cap"},
 		},
 		{
-			name:     "failed with an error",
+			// The abort branch of task_cap: the operator answers "abort", ResumePending
+			// fails the run and writes its own LastError (transition.go:230-240). Using
+			// that instead of a hand-written string is what makes the message causally
+			// consistent with the attempt counter — a string saying "second attempt" at
+			// Attempt=1 was not something the cycle could have produced
+			// (review T13b b4 f3). It is 41 cells, so it still hardwraps to the two rows
+			// this case exists to spend.
+			name:     "aborted after the attempt cap",
+			attempts: pressureAttemptsToCap,
+			seed: func(t *testing.T, currentRun *pipeline.Run, taskID string) {
+				t.Helper()
+				observePressureCap(t, currentRun, taskID)
+				if err := currentRun.State.PauseForTaskCap(
+					taskID,
+					"Task T1 attempt cap reached. Respond with retry or abort.",
+				); err != nil {
+					t.Fatal(err)
+				}
+				abort := "abort"
+				if _, err := currentRun.State.ResumePending(&abort); err != nil {
+					t.Fatal(err)
+				}
+			},
+			signals: []string{
+				"task T1 aborted after reaching attempt cap",
+				"T1 · failed",
+			},
+		},
+		{
+			// The fixer HEAD mismatch (task_evidence.go:510-521), reached before the next
+			// BeginTaskAttempt when HEAD no longer matches the recorded candidate. Its
+			// length is not invented: two full 40-character SHAs make it ~131 cells, which
+			// hardwraps to six rows and leaves fewer than three for the section. That is
+			// the other half of the R2 contract — the section is dropped entirely rather
+			// than pushing a signal off — and it was previously only ever checked by
+			// calling renderChangedFiles directly.
+			name:     "fixer HEAD mismatch long enough to drop the section",
 			attempts: 1,
 			seed: func(t *testing.T, currentRun *pipeline.Run, taskID string) {
 				t.Helper()
-				if err := currentRun.State.Fail(
-					"gate failed on the second attempt",
-				); err != nil {
+				task := currentRun.State.Tasks[taskID]
+				if err := currentRun.State.Fail(fmt.Sprintf(
+					"pipeline: fixer HEAD %s does not match candidate_sha %s",
+					*task.BaseSHA,
+					*task.CandidateSHA,
+				)); err != nil {
 					t.Fatal(err)
 				}
 			},
-			signals: []string{"gate failed on the second attempt"},
-		},
-		{
-			// Measured: a real pipeline failure message is far longer than a hand-written
-			// one — this is the shape cycle.fail produces, wrapping to enough rows that
-			// fewer than three are left. The section must then disappear completely, which
-			// until now was only ever checked by calling renderChangedFiles directly.
-			name:     "failure long enough to drop the section",
-			attempts: 1,
-			seed: func(t *testing.T, currentRun *pipeline.Run, _ string) {
-				t.Helper()
-				if err := currentRun.State.Fail(
-					"pipeline: implementation gate failed: runner: command exited with " +
-						"code 1 on attempt 3: go vet ./...: internal/ui/view.go:12: " +
-						"undefined identifier",
-				); err != nil {
-					t.Fatal(err)
-				}
-			},
-			signals: []string{"pipeline: implementation gate failed"},
+			signals: []string{"pipeline: fixer HEAD"},
 			yields:  true,
 		},
 	} {
-		// Witness note (measured, not assumed): only the **failed** case is the budget
-		// witness. Its error hardwraps to two rows, which is exactly the row that the
-		// wrong budget spends — both budget mutations (body-only, and chrome-not-charged)
-		// fail there. The task_cap chip is one row, so the wrong budget still happens to
-		// fit and that case passes both mutations. It is kept because it witnesses
-		// something else the failed case cannot: that a *pending* signal is not displaced.
+		// Witness note (measured, not assumed). Both budget mutations — body-only budget,
+		// and chrome-not-charged — are caught by the **abort** case and by the **fixer HEAD
+		// mismatch** case, and by neither of them alone would be enough: the first spends
+		// two error rows and still expects the section, the second spends six and expects
+		// it gone, so together they pin both sides of the R2 boundary. The task_cap chip is
+		// a single row, so a wrong budget still happens to fit and that case passes both
+		// mutations; it is kept because it witnesses what the other two cannot — that a
+		// *pending* signal is not displaced.
 		t.Run("signals survive: "+pressure.name, func(t *testing.T) {
 			candidate := pressureModelFromRealRun(t, pressure.attempts, pressure.seed)
 
@@ -2132,23 +2137,10 @@ func pressureModelFromRealRun(
 	// The files have to exist in the base commit: a brand-new file reports `1\t0`, and the
 	// totals need deletions too so a swapped additions/deletions pair cannot pass.
 	for index := 0; index < pressureChangedFileCount; index++ {
-		writePressureFile(t, root, index, "one\ntwo\n")
+		writePressureFile(t, root, index, pressureFileBody(index, 0))
 	}
 	integrationGit(t, root, "add", "-A")
 	commitPressureTree(t, root, "test: pressure base")
-	baseSHA := integrationGit(t, root, "rev-parse", "HEAD")
-
-	for index := 0; index < pressureChangedFileCount; index++ {
-		// Every file gains a line; the odd ones also lose one, giving +9/-4 in total.
-		body := "one\ntwo\nthree\n"
-		if index%2 == 1 {
-			body = "one\nthree\n"
-		}
-		writePressureFile(t, root, index, body)
-	}
-	integrationGit(t, root, "add", "-A")
-	commitPressureTree(t, root, "test: pressure candidate")
-	candidateSHA := integrationGit(t, root, "rev-parse", "HEAD")
 
 	currentRun := createIntegrationRun(t, root, runID, config)
 	currentRun.State.TaskOrder = []string{taskID}
@@ -2172,7 +2164,17 @@ func pressureModelFromRealRun(
 	// invariant rather than merely looking plausible.
 	approved := *currentRun.State.PlanHash
 	currentRun.State.ApprovedPlanHash = &approved
-	if err := os.Chmod(filepath.Join(currentRun.Dir, "plan.md"), 0o444); err != nil {
+	// freezePlan clears the write bits and preserves the rest — `originalMode &^ 0o222`,
+	// which is 0o400 for the 0o600 plan createIntegrationRun writes (control.go:515-518).
+	// Chmod'ing to a flat 0o444 would also *grant* group and other read, which
+	// VerifyApprovedPlan does not check because it only looks for write bits
+	// (review T13b b4 f2).
+	planPath := filepath.Join(currentRun.Dir, "plan.md")
+	planInfo, err := os.Stat(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(planPath, planInfo.Mode().Perm()&^0o222); err != nil {
 		t.Fatal(err)
 	}
 	if err := pipeline.VerifyApprovedPlan(currentRun); err != nil {
@@ -2196,7 +2198,12 @@ func pressureModelFromRealRun(
 	// by the task_cap seed above, is that the API refuses the next attempt with a CapError
 	// of exactly MaxTaskAttempts. That assertion is the witness for cap enforcement; this
 	// loop uses the real call for fidelity, not because a mutation can catch it.
-	for attempt := 0; attempt < attempts; attempt++ {
+	for attempt := 1; attempt <= attempts; attempt++ {
+		// BaseSHA is HEAD at the start of the attempt, set before BeginTaskAttempt exactly
+		// as the cycle does (task_cycle.go:164-168).
+		attemptBase := integrationGit(t, root, "rev-parse", "HEAD")
+		task := currentRun.State.Tasks[taskID]
+		task.BaseSHA = &attemptBase
 		if err := currentRun.State.BeginTaskAttempt(
 			taskID,
 			currentRun.Config.MaxTaskAttempts,
@@ -2204,37 +2211,28 @@ func pressureModelFromRealRun(
 		); err != nil {
 			t.Fatal(err)
 		}
-		// BaseSHA and CandidateSHA are written as direct fields because that is exactly
-		// what the task cycle does (task_cycle.go:165, :264).
-		task := currentRun.State.Tasks[taskID]
-		task.BaseSHA = &baseSHA
-		task.CandidateSHA = &candidateSHA
+		// Each repair produces a **different** commit: the fixer postcondition requires
+		// HEAD to differ from the previous candidate, so reusing one SHA for every attempt
+		// described a repair that changed nothing (review T13b b4 f1). The per-file
+		// transformation is chosen so *every* attempt's diff against its own parent is the
+		// same +9/-4, which is what the rail total asserts.
+		for index := 0; index < pressureChangedFileCount; index++ {
+			writePressureFile(t, root, index, pressureFileBody(index, attempt))
+		}
+		integrationGit(t, root, "add", "-A")
+		commitPressureTree(t, root, fmt.Sprintf("test: pressure attempt %d", attempt))
+		attemptCandidate := integrationGit(t, root, "rev-parse", "HEAD")
+		if attemptCandidate == attemptBase {
+			t.Fatal("the attempt produced no new commit")
+		}
+		task.CandidateSHA = &attemptCandidate
 		if err := currentRun.State.TransitionTask(
 			taskID,
 			state.TaskCandidate,
 		); err != nil {
 			t.Fatal(err)
 		}
-		// A repairing task always carries its evidence: the cycle reaches repairing either
-		// after a failed gate (GateResult set) or after a dirty review (both set), and the
-		// only code that clears them resets the task for a fresh attempt
-		// (task_evidence.go:82, :116, :944). Leaving them nil described a task that had
-		// been sent back for repair without anything having judged it.
-		gatePath := filepath.Join("tasks", taskID, "gate.json")
-		reviewPath := filepath.Join("tasks", taskID, "review.json")
-		writeArtifactTestFile(
-			t,
-			filepath.Join(currentRun.Dir, gatePath),
-			[]byte(`{"exit":0,"timed_out":false}`),
-		)
-		writeArtifactTestFile(
-			t,
-			filepath.Join(currentRun.Dir, reviewPath),
-			[]byte(`{"schema_version":1,"task_id":"`+taskID+
-				`","candidate_sha":"`+candidateSHA+`","clean":false,"findings":[]}`),
-		)
-		task.GateResult = &gatePath
-		task.ReviewResult = &reviewPath
+		writePressureEvidence(t, currentRun, taskID, attemptCandidate)
 		if err := currentRun.State.TransitionTask(
 			taskID,
 			state.TaskRepairing,
@@ -2297,9 +2295,9 @@ func pressureModelFromRealRun(
 		t.Fatalf("the rendered task is on attempt %d, want the %d the cycle ran",
 			rendered.Attempt, attempts)
 	}
-	if rendered.Status != state.TaskRepairing {
-		t.Fatalf("the rendered task is %s, want repairing", rendered.Status)
-	}
+	// The task's final status is the *case's* business — abort legitimately ends on
+	// `failed` while a cap pause ends on `repairing` — so each case asserts it on the rail
+	// instead of the helper insisting on one of them.
 	if rendered.BaseSHA == nil || rendered.CandidateSHA == nil ||
 		rendered.GateResult == nil || rendered.ReviewResult == nil {
 		t.Fatalf("the rendered task lost its evidence: %#v", rendered)
@@ -2308,6 +2306,119 @@ func pressureModelFromRealRun(
 		t.Fatalf("the rendered status is not the seeded run: %#v", ready.status)
 	}
 	return ready
+}
+
+// observePressureCap runs the attempt that must report the cap and returns the CapError,
+// mirroring task_cycle.go:167-190: the *next* attempt is what reports the cap, and that
+// CapError is what pauses. Pausing at an arbitrary attempt count would be well-formed but
+// unreachable, so the cap is observed rather than assumed.
+func observePressureCap(
+	t *testing.T,
+	currentRun *pipeline.Run,
+	taskID string,
+) *state.CapError {
+	t.Helper()
+	var capErr *state.CapError
+	err := currentRun.State.BeginTaskAttempt(
+		taskID,
+		currentRun.Config.MaxTaskAttempts,
+		nil,
+	)
+	if !errors.As(err, &capErr) {
+		t.Fatalf("the next attempt did not report the cap: %v", err)
+	}
+	if capErr.Current != currentRun.Config.MaxTaskAttempts ||
+		capErr.Maximum != currentRun.Config.MaxTaskAttempts {
+		t.Fatalf("cap reported %d/%d, want the configured %d",
+			capErr.Current, capErr.Maximum, currentRun.Config.MaxTaskAttempts)
+	}
+	return capErr
+}
+
+// pressureFileBody is the content of one pressure file after `attempt` repairs (attempt 0
+// is the base commit). Even files gain a line each time (+1/-0) and odd files replace their
+// second line (+1/-1), so **every** attempt's diff against its own parent is the same
+// +9/-4 that the rail total asserts — which is what lets each repair be a distinct commit
+// without changing what the test measures.
+func pressureFileBody(index, attempt int) string {
+	if index%2 == 1 {
+		if attempt == 0 {
+			return "one\ntwo\n"
+		}
+		return fmt.Sprintf("one\nrepair-%d\n", attempt)
+	}
+	body := "one\ntwo\n"
+	for round := 0; round < attempt; round++ {
+		body += "added\n"
+	}
+	return body
+}
+
+// writePressureEvidence writes the gate and review artefacts a completed dirty attempt
+// leaves behind, in the schema production actually requires — not the abbreviated one the
+// UI decoder happens to accept (review T13b b4 f1).
+//
+//   - gate.json needs all seven fields; readGateEvidence rejects a missing one
+//     (task_evidence.go:1030-1043), and the two log paths must name real regular files
+//     inside the run directory (runRelativeRegularFile, task_evidence.go:1104-1125).
+//   - review.json needs schema_version, plan_hash, task_id, candidate_sha, clean and
+//     findings, and `clean` must be false **only** with at least one blocking finding —
+//     `clean != (blocking == 0)` is rejected (internal/cli/result.go:286-318, :426-437).
+//     A finding needs id, severity (critical|major|minor), a path:line location, issue and
+//     requested_change (result.go:340-401).
+//
+// No exported decoder reaches either schema from this package, so the shapes are pinned by
+// construction against those references rather than by re-decoding here.
+func writePressureEvidence(
+	t *testing.T,
+	currentRun *pipeline.Run,
+	taskID string,
+	candidateSHA string,
+) {
+	t.Helper()
+	logPrefix := fmt.Sprintf("task-%s-%s-gate", taskID, candidateSHA)
+	stdoutLog := filepath.Join("logs", logPrefix+".stdout.log")
+	stderrLog := filepath.Join("logs", logPrefix+".stderr.log")
+	writeArtifactTestFile(t, filepath.Join(currentRun.Dir, stdoutLog), []byte("ok\n"))
+	writeArtifactTestFile(t, filepath.Join(currentRun.Dir, stderrLog), nil)
+
+	gate, err := json.Marshal(map[string]any{
+		"command":       currentRun.Config.GateCommand,
+		"cwd":           currentRun.Config.GateCWD,
+		"candidate_sha": candidateSHA,
+		"exit":          0,
+		"timed_out":     false,
+		"stdout_log":    stdoutLog,
+		"stderr_log":    stderrLog,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	review, err := json.Marshal(map[string]any{
+		"schema_version": 1,
+		"plan_hash":      *currentRun.State.PlanHash,
+		"task_id":        taskID,
+		"candidate_sha":  candidateSHA,
+		"clean":          false,
+		"findings": []map[string]any{{
+			"id":               "f1",
+			"severity":         "major",
+			"location":         "internal/ui/view.go:1",
+			"issue":            "the candidate does not satisfy the task",
+			"requested_change": "make it satisfy the task",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	gatePath := filepath.Join("tasks", taskID, "gate.json")
+	reviewPath := filepath.Join("tasks", taskID, "review.json")
+	writeArtifactTestFile(t, filepath.Join(currentRun.Dir, gatePath), gate)
+	writeArtifactTestFile(t, filepath.Join(currentRun.Dir, reviewPath), review)
+	task := currentRun.State.Tasks[taskID]
+	task.GateResult = &gatePath
+	task.ReviewResult = &reviewPath
 }
 
 func writePressureFile(t *testing.T, root string, index int, body string) {
