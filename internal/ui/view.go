@@ -309,20 +309,69 @@ func artifactBody(current model) string {
 	)
 }
 
+// selectionGutter is the two cells every lifecycle row reserves on the left. It is
+// a column rather than a prefix on the selected row alone: prefixing would shift
+// that row's timestamp out of line with its neighbours (T14 W4).
+const selectionGutter = 2
+
 func lifecycleBody(current model, innerWidth int) string {
 	if len(current.logs) == 0 {
 		return current.theme.styles.Muted.Render(
 			"⋯ Waiting for the first pipeline step",
 		)
 	}
+	textWidth := max(1, innerWidth-selectionGutter)
 	lines := make([]string, 0, len(current.logs))
-	for _, line := range current.logs {
+	for index, line := range current.logs {
+		selected := current.hasSelection && index == current.selectedEntry
+		gutter := strings.Repeat(" ", selectionGutter)
+		if selected {
+			// `▌` and `▸` carry the cue without colour; the strip takes the focused
+			// border token (color-system.md: never state by colour alone). This is
+			// option B of design-plan W4 — no background, so T12's "chips only carry
+			// a background" policy needs no amendment.
+			gutter = current.theme.styles.BorderFocus.Render("▌") +
+				current.theme.styles.TabActive.Render("▸")
+		}
+		if selected && current.entryExpanded {
+			lines = append(lines, expandedEntryLines(current, line, gutter, textWidth)...)
+			continue
+		}
 		lines = append(
 			lines,
-			renderLogLine(current.theme, line, innerWidth, false),
+			gutter+renderLogLine(current.theme, line, textWidth, false),
 		)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// expandedEntryLines renders the cursor's entry in full instead of truncating it to
+// one row: the columns stay on the first line and the wrapped remainder is indented
+// under the message column (T14 W4).
+func expandedEntryLines(
+	current model,
+	line logEntry,
+	gutter string,
+	textWidth int,
+) []string {
+	head := line
+	head.Text = ""
+	rows := []string{
+		gutter + strings.TrimRight(
+			renderLogLine(current.theme, head, textWidth, false),
+			" ",
+		),
+	}
+	indent := strings.Repeat(" ", selectionGutter+2)
+	wrapped := ansi.HardwrapWc(
+		remapANSI16(line.Text, current.theme.tokens.ANSI),
+		max(1, textWidth-2),
+		false,
+	)
+	for _, row := range strings.Split(wrapped, "\n") {
+		rows = append(rows, indent+current.theme.styles.Value.Render(row))
+	}
+	return rows
 }
 
 func activityBody(current model, innerWidth, limit int) string {

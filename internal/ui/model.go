@@ -134,7 +134,13 @@ type model struct {
 	artifactRenderErr   error
 	artifactRenderWidth int
 	artifactTab         artifactTab
-	focus               mainBox
+	// selectedEntry is the lifecycle entry `j/k` moves while LIVE OUTPUT has the
+	// focus (T14 W4). hasSelection is the zero-value-friendly "none" flag: a fresh
+	// model follows the live edge with no cursor showing.
+	selectedEntry int
+	hasSelection  bool
+	entryExpanded bool
+	focus         mainBox
 	// boxScroll is each box's distance from its newest line. 0 means "follow the
 	// live edge". A paused box (>0) is nudged by preserveReading when content
 	// arrives, which keeps the same absolute lines on screen — without that the
@@ -378,16 +384,28 @@ func (current model) updateKey(
 	case "ctrl+c", "q":
 		return current.requestStop()
 	case "up", "k":
-		// Scrolling drives the focused box only (T14 W2).
+		// Scrolling drives the focused box only (T14 W2) — unless the focused box is
+		// LIVE OUTPUT, where the same keys move the entry cursor (T14 W4).
+		if current.selectionDrivesKeys() {
+			current.moveSelection(-1)
+			break
+		}
 		for _, target := range current.scrollTargets() {
 			current.boxScroll[target]++
 		}
 	case "down", "j":
+		if current.selectionDrivesKeys() {
+			current.moveSelection(1)
+			break
+		}
 		for _, target := range current.scrollTargets() {
 			if current.boxScroll[target] > 0 {
 				current.boxScroll[target]--
 			}
 		}
+	case "esc":
+		// Drop the cursor and follow again (T14 W4).
+		current.clearSelection()
 	case "home":
 		for _, target := range current.scrollTargets() {
 			current.boxScroll[target] = maxScrollSentinel
@@ -418,6 +436,22 @@ func (current model) updateKey(
 		if isWide(current.width, current.height) {
 			current.focus = shiftMainFocus(current, -1)
 		}
+	}
+
+	// `enter` expands the selected entry, but only while LIVE OUTPUT is focused: it
+	// is also the pending-action submit key, and moving focus away has to hand it
+	// back to the run rather than keep it captured by a stale cursor (T14 W4).
+	if key.String() == "enter" && current.selectionDrivesKeys() &&
+		current.hasSelection {
+		current.entryExpanded = !current.entryExpanded
+		if current.entryExpanded {
+			// Expanding a step entry also opens the artifact that step produced, so
+			// the evidence is one keypress away instead of a tab hunt (T14 W4).
+			if tab, ok := evidenceTab(current.logs[current.selectedEntry].Step); ok {
+				current.selectArtifactTab(tab)
+			}
+		}
+		return current, nil
 	}
 
 	if !current.hasStatus || current.operation != "" {
@@ -603,6 +637,15 @@ func (current *model) appendLog(entry logEntry) {
 	if overflow := len(current.logs) - maxLogLines; overflow > 0 {
 		copy(current.logs, current.logs[overflow:])
 		current.logs = current.logs[:maxLogLines]
+		// Eviction renumbers the entries, so the cursor has to follow its own row
+		// down — or let go when that row is the one being dropped (T14 W4).
+		if current.hasSelection {
+			if current.selectedEntry < overflow {
+				current.clearSelection()
+			} else {
+				current.selectedEntry -= overflow
+			}
+		}
 	}
 }
 
@@ -706,6 +749,63 @@ func (current *model) preserveReading(box mainBox, added int) {
 	if added > 0 && current.boxScroll[box] > 0 {
 		current.boxScroll[box] += added
 	}
+}
+
+// selectionDrivesKeys reports whether `j/k` move the lifecycle cursor instead of a
+// raw offset. Only LIVE OUTPUT gets the cursor: FEED holds a rendered document and
+// ACTIVITY is a live tail, neither of which has entries to select. compact has no
+// focus at all, so it keeps the single-scroll contract (T14 W2/W4 — this is the
+// `j/k` reconciliation design-plan v2 deferred to D3).
+func (current model) selectionDrivesKeys() bool {
+	return isWide(current.width, current.height) &&
+		current.normalizedFocus() == boxLiveOutput &&
+		len(current.logs) > 0
+}
+
+// moveSelection walks the cursor and drags the viewport with it: selection *is*
+// the scroll (T14 W4). The cursor parks on the window's last row, so the rows
+// above it are the entry's history — the same shape as scrolling back, plus a
+// marker. The first press only reveals the cursor on the newest entry.
+func (current *model) moveSelection(delta int) {
+	if len(current.logs) == 0 {
+		return
+	}
+	next := len(current.logs) - 1
+	if current.hasSelection {
+		next = current.selectedEntry + delta
+	}
+	next = min(max(next, 0), len(current.logs)-1)
+	if current.hasSelection && next != current.selectedEntry {
+		// Walking off an entry collapses it; `enter` re-expands.
+		current.entryExpanded = false
+	}
+	current.selectedEntry = next
+	current.hasSelection = true
+	// Expanding the cursor's entry adds rows *at* the cursor, so the count of rows
+	// below it — which is what the offset measures — does not change.
+	current.boxScroll[boxLiveOutput] = len(current.logs) - 1 - next
+}
+
+// evidenceTab maps a pipeline step to the artifact it produces (T14 W4). Steps with
+// no artifact of their own — gate, fix — report false and leave the tab alone
+// rather than yanking the reader to an unrelated document.
+func evidenceTab(step string) (artifactTab, bool) {
+	switch step {
+	case pipeline.StepPlan:
+		return tabPlan, true
+	case pipeline.StepImplementation:
+		return tabDiff, true
+	case pipeline.StepPlanReview, pipeline.StepImplementationReview:
+		return tabVerdict, true
+	}
+	return tabPlan, false
+}
+
+func (current *model) clearSelection() {
+	current.hasSelection = false
+	current.selectedEntry = 0
+	current.entryExpanded = false
+	current.boxScroll[boxLiveOutput] = 0
 }
 
 // shiftMainFocus cycles focus through the boxes that are actually on screen.

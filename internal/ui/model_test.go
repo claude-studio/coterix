@@ -1653,3 +1653,196 @@ func operationDoneFromMessage(t *testing.T, message tea.Msg) operationDoneMsg {
 	}
 	return operationDoneMsg{}
 }
+
+// The lifecycle cursor: `j/k` move it while LIVE OUTPUT is focused (selection *is*
+// the scroll), `enter` expands and opens that step's artifact, `esc` lets go, and
+// the other boxes keep the raw offset (T14 W4).
+func TestLifecycleCursorMovesSelectsAndExpands(t *testing.T) {
+	current := populatedViewModel(t)
+	for index := 0; index < 12; index++ {
+		current.appendLog(logEntry{
+			Step: pipeline.StepPlan,
+			Role: fmt.Sprintf("role-%02d", index),
+			CLI:  "claude",
+			Text: strings.Repeat("a long diagnostic sentence ", 6),
+		})
+	}
+	current.focus = boxLiveOutput
+
+	// The first press only reveals the cursor on the newest entry.
+	updated, _ := current.Update(printableKey('k'))
+	current = updated.(model)
+	if !current.hasSelection || current.selectedEntry != len(current.logs)-1 {
+		t.Fatalf("first k did not reveal the cursor on the newest entry: %d/%v",
+			current.selectedEntry, current.hasSelection)
+	}
+	if current.boxScroll[boxLiveOutput] != 0 {
+		t.Fatalf("the newest entry is not at the live edge: %d",
+			current.boxScroll[boxLiveOutput])
+	}
+
+	// Then it walks, dragging the viewport: the cursor sits on the window's last row.
+	for step := 1; step <= 3; step++ {
+		updated, _ = current.Update(printableKey('k'))
+		current = updated.(model)
+		wantIndex := len(current.logs) - 1 - step
+		if current.selectedEntry != wantIndex {
+			t.Fatalf("k step %d: cursor=%d want=%d", step, current.selectedEntry, wantIndex)
+		}
+		if got := current.boxScroll[boxLiveOutput]; got != step {
+			t.Fatalf("k step %d: offset=%d want=%d — selection must drive the scroll",
+				step, got, step)
+		}
+	}
+	updated, _ = current.Update(printableKey('j'))
+	current = updated.(model)
+	if current.selectedEntry != len(current.logs)-3 {
+		t.Fatalf("j did not walk back down: cursor=%d", current.selectedEntry)
+	}
+
+	// The cursor is marked without a background, and without colour alone.
+	body := ansi.Strip(lifecycleBody(current, 100))
+	rows := strings.Split(body, "\n")
+	marked := 0
+	for _, row := range rows {
+		if strings.HasPrefix(row, "▌▸") {
+			marked++
+		}
+	}
+	if marked != 1 {
+		t.Fatalf("expected exactly one marked row, got %d:\n%s", marked, body)
+	}
+	// Every other row keeps the gutter, so the columns stay aligned.
+	for _, row := range rows {
+		if !strings.HasPrefix(row, "▌▸") && !strings.HasPrefix(row, "  ") {
+			t.Fatalf("row lost the gutter column, columns will not line up: %q", row)
+		}
+	}
+
+	// enter expands the entry to its full text and opens the step's artifact.
+	current.artifactTab = tabVerdict
+	updated, _ = current.Update(specialKey(tea.KeyEnter))
+	current = updated.(model)
+	if !current.entryExpanded {
+		t.Fatal("enter did not expand the selected entry")
+	}
+	if current.artifactTab != tabPlan {
+		t.Fatalf("expanding a plan step opened tab %d, want Plan", current.artifactTab)
+	}
+	expanded := ansi.Strip(lifecycleBody(current, 60))
+	if countRows(expanded) <= len(current.logs) {
+		t.Fatalf("the expanded entry did not wrap onto extra rows:\n%s", expanded)
+	}
+	// Only the cursor's rows are expanded — the rest stay truncated to one row — so
+	// assert against the block that starts at the marker.
+	block := make([]string, 0, 8)
+	for _, row := range strings.Split(expanded, "\n") {
+		if strings.HasPrefix(row, "▌▸") {
+			block = append(block, row)
+			continue
+		}
+		if len(block) > 0 {
+			if !strings.HasPrefix(row, "    ") {
+				break
+			}
+			block = append(block, row)
+		}
+	}
+	if len(block) < 3 {
+		t.Fatalf("the cursor's block is %d rows, expected the text to wrap:\n%s",
+			len(block), expanded)
+	}
+	joined := strings.Join(block, "\n")
+	if strings.Contains(joined, "…") {
+		t.Fatalf("the expanded entry is still truncated:\n%s", joined)
+	}
+	// A hard wrap can break mid-word, so compare with the spacing removed: what
+	// matters is that no characters were dropped.
+	squeeze := func(text string) string {
+		return strings.ReplaceAll(strings.Join(strings.Fields(text), ""), "…", "")
+	}
+	if want := squeeze(current.logs[current.selectedEntry].Text); !strings.Contains(
+		squeeze(joined),
+		want,
+	) {
+		t.Fatalf("the expanded entry does not show its full text:\n%s", joined)
+	}
+
+	// esc lets go and follows again.
+	updated, _ = current.Update(specialKey(tea.KeyEscape))
+	current = updated.(model)
+	if current.hasSelection || current.entryExpanded ||
+		current.boxScroll[boxLiveOutput] != 0 {
+		t.Fatalf("esc did not return to following: %#v",
+			[]any{current.hasSelection, current.entryExpanded,
+				current.boxScroll[boxLiveOutput]})
+	}
+}
+
+// j/k keep their raw-offset meaning everywhere the cursor does not apply: the other
+// boxes, and compact (which has no focus at all) — T14 W2/W4 reconciliation.
+func TestCursorDoesNotHijackTheOtherBoxes(t *testing.T) {
+	base := populatedViewModel(t)
+	for index := 0; index < 6; index++ {
+		base.appendLog(logEntry{Role: fmt.Sprintf("role-%02d", index), Text: "x"})
+	}
+
+	for _, box := range []mainBox{boxFeed, boxActivity, boxSidebar} {
+		current := base
+		current.focus = box
+		if current.selectionDrivesKeys() {
+			t.Fatalf("box %d claimed the lifecycle cursor", box)
+		}
+		updated, _ := current.Update(printableKey('k'))
+		moved := updated.(model)
+		if moved.hasSelection {
+			t.Fatalf("k selected an entry while box %d was focused", box)
+		}
+		if moved.boxScroll[moved.normalizedFocus()] != 1 {
+			t.Fatalf("k did not scroll the focused box %d", box)
+		}
+	}
+
+	compact := base
+	compact.width = 80
+	compact.height = 24
+	compact.focus = boxLiveOutput
+	if compact.selectionDrivesKeys() {
+		t.Fatal("compact has no focus concept, so it must not grow a cursor")
+	}
+	updated, _ := compact.Update(printableKey('k'))
+	scrolled := updated.(model)
+	for _, box := range mainBoxOrder(scrolled) {
+		if scrolled.boxScroll[box] != 1 {
+			t.Fatalf("compact k left box %d at %d", box, scrolled.boxScroll[box])
+		}
+	}
+}
+
+// The cursor names an entry, not a row number: eviction at the buffer cap has to
+// renumber it, and drop it when its own row is the one evicted (T14 W4).
+func TestCursorSurvivesEvictionAndLetsGoWhenItsRowIsDropped(t *testing.T) {
+	current := populatedViewModel(t)
+	current.logs = nil
+	for index := 0; index < maxLogLines; index++ {
+		current.appendLog(logEntry{Text: fmt.Sprintf("entry-%04d", index)})
+	}
+	current.focus = boxLiveOutput
+	current.selectedEntry = 500
+	current.hasSelection = true
+	target := current.logs[500].Text
+
+	current.appendLog(logEntry{Text: "fresh"})
+	if !current.hasSelection {
+		t.Fatal("the cursor let go of a row that is still in the buffer")
+	}
+	if got := current.logs[current.selectedEntry].Text; got != target {
+		t.Fatalf("the cursor drifted to %q, want %q", got, target)
+	}
+
+	current.selectedEntry = 0
+	current.appendLog(logEntry{Text: "evicts the cursor's row"})
+	if current.hasSelection {
+		t.Fatal("the cursor kept pointing at an evicted row")
+	}
+}
