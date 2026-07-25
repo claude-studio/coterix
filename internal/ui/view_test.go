@@ -1942,33 +1942,37 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 	// pause and a failure, and each is produced here through the state API that validates
 	// it.
 	for _, pressure := range []struct {
-		name    string
-		seed    func(*testing.T, *pipeline.Run, string)
-		signals []string
+		name string
+		// attempts is how many full dirty-review attempts run before seed applies the
+		// final transition. task_cap needs exactly MaxTaskAttempts so the next
+		// BeginTaskAttempt is the one that caps.
+		attempts int
+		seed     func(*testing.T, *pipeline.Run, string)
+		signals  []string
 	}{
 		{
-			name: "task_cap pause",
+			name:     "task_cap pause",
+			attempts: pressureAttemptsToCap,
 			seed: func(t *testing.T, currentRun *pipeline.Run, taskID string) {
 				t.Helper()
-				// This mirrors task_cycle.go: attempts are begun until BeginTaskAttempt
-				// reports the cap, and *that* is what pauses. Pausing at an arbitrary
-				// attempt count would be well-formed but not reachable.
+				// This mirrors task_cycle.go:167-190 exactly: the *next* attempt is what
+				// reports the cap, and that CapError is what pauses. Pausing at an
+				// arbitrary attempt count would be well-formed but unreachable, so the
+				// cap has to be observed rather than assumed.
 				var capErr *state.CapError
-				for attempt := 0; ; attempt++ {
-					err := currentRun.State.BeginTaskAttempt(
-						taskID,
-						currentRun.Config.MaxTaskAttempts,
-						nil,
-					)
-					if errors.As(err, &capErr) {
-						break
-					}
-					if err != nil {
-						t.Fatal(err)
-					}
-					if attempt > currentRun.Config.MaxTaskAttempts+1 {
-						t.Fatal("the attempt cap was never reached")
-					}
+				err := currentRun.State.BeginTaskAttempt(
+					taskID,
+					currentRun.Config.MaxTaskAttempts,
+					nil,
+				)
+				if !errors.As(err, &capErr) {
+					t.Fatalf("the next attempt did not report the cap: %v", err)
+				}
+				if capErr.Current != currentRun.Config.MaxTaskAttempts ||
+					capErr.Maximum != currentRun.Config.MaxTaskAttempts {
+					t.Fatalf("cap reported %d/%d, want the configured %d",
+						capErr.Current, capErr.Maximum,
+						currentRun.Config.MaxTaskAttempts)
 				}
 				if err := currentRun.State.PauseForTaskCap(
 					taskID,
@@ -1986,16 +1990,10 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 			signals: []string{"PENDING · task_cap"},
 		},
 		{
-			name: "failed with an error",
+			name:     "failed with an error",
+			attempts: 1,
 			seed: func(t *testing.T, currentRun *pipeline.Run, taskID string) {
 				t.Helper()
-				if err := currentRun.State.BeginTaskAttempt(
-					taskID,
-					currentRun.Config.MaxTaskAttempts,
-					nil,
-				); err != nil {
-					t.Fatal(err)
-				}
 				if err := currentRun.State.Fail(
 					"gate failed on the second attempt",
 				); err != nil {
@@ -2012,7 +2010,7 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 		// fit and that case passes both mutations. It is kept because it witnesses
 		// something else the failed case cannot: that a *pending* signal is not displaced.
 		t.Run("signals survive: "+pressure.name, func(t *testing.T) {
-			candidate := pressureModelFromRealRun(t, pressure.seed)
+			candidate := pressureModelFromRealRun(t, pressure.attempts, pressure.seed)
 
 			rail := ansi.Strip(renderSidebar(
 				candidate,
@@ -2074,6 +2072,11 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 // inner cells — a wider total would be truncated and could not be asserted whole.
 const pressureChangedFileCount = 9
 
+// pressureAttemptsToCap is how many completed attempts leave the next BeginTaskAttempt at
+// the cap. integrationConfig sets MaxTaskAttempts to 3, and the seed asserts the cap it
+// actually observes rather than trusting this number.
+const pressureAttemptsToCap = 3
+
 // pressureModelFromRealRun builds the model the way production does and nothing else:
 // a real repository with a real candidate commit, a task driven to repairing through the
 // state API, `seed` applying the state transition under test, a real
@@ -2082,6 +2085,7 @@ const pressureChangedFileCount = 9
 // pipeline cannot reach cannot be tested by accident (review T13b/W5 f1).
 func pressureModelFromRealRun(
 	t *testing.T,
+	attempts int,
 	seed func(*testing.T, *pipeline.Run, string),
 ) model {
 	t.Helper()
@@ -2143,41 +2147,65 @@ func pressureModelFromRealRun(
 	}
 	active := taskID
 	currentRun.State.CurrentTaskID = &active
-	for _, status := range []state.TaskStatus{
-		state.TaskCandidate,
-		state.TaskRepairing,
-	} {
-		if err := currentRun.State.TransitionTask(taskID, status); err != nil {
+
+	// One dirty-review attempt, repeated as the cycle repeats it: BeginTaskAttempt (the
+	// only thing that moves Attempt, and the thing that enforces the cap) -> the candidate
+	// commit and its SHAs -> candidate -> gate and review evidence -> repairing. Calling
+	// BeginTaskAttempt several times in a row instead would reach the same Attempt without
+	// ever passing through the statuses production passes through.
+	//
+	// Measured limit of this witness: replacing this call with a bare `Attempt++` still
+	// passes, because the state it leaves is identical — going through the cap-enforcing
+	// API is not observable in the resulting state. What *is* observable, and is asserted
+	// by the task_cap seed above, is that the API refuses the next attempt with a CapError
+	// of exactly MaxTaskAttempts. That assertion is the witness for cap enforcement; this
+	// loop uses the real call for fidelity, not because a mutation can catch it.
+	for attempt := 0; attempt < attempts; attempt++ {
+		if err := currentRun.State.BeginTaskAttempt(
+			taskID,
+			currentRun.Config.MaxTaskAttempts,
+			nil,
+		); err != nil {
+			t.Fatal(err)
+		}
+		// BaseSHA and CandidateSHA are written as direct fields because that is exactly
+		// what the task cycle does (task_cycle.go:165, :264).
+		task := currentRun.State.Tasks[taskID]
+		task.BaseSHA = &baseSHA
+		task.CandidateSHA = &candidateSHA
+		if err := currentRun.State.TransitionTask(
+			taskID,
+			state.TaskCandidate,
+		); err != nil {
+			t.Fatal(err)
+		}
+		// A repairing task always carries its evidence: the cycle reaches repairing either
+		// after a failed gate (GateResult set) or after a dirty review (both set), and the
+		// only code that clears them resets the task for a fresh attempt
+		// (task_evidence.go:82, :116, :944). Leaving them nil described a task that had
+		// been sent back for repair without anything having judged it.
+		gatePath := filepath.Join("tasks", taskID, "gate.json")
+		reviewPath := filepath.Join("tasks", taskID, "review.json")
+		writeArtifactTestFile(
+			t,
+			filepath.Join(currentRun.Dir, gatePath),
+			[]byte(`{"exit":0,"timed_out":false}`),
+		)
+		writeArtifactTestFile(
+			t,
+			filepath.Join(currentRun.Dir, reviewPath),
+			[]byte(`{"schema_version":1,"task_id":"`+taskID+
+				`","candidate_sha":"`+candidateSHA+`","clean":false,"findings":[]}`),
+		)
+		task.GateResult = &gatePath
+		task.ReviewResult = &reviewPath
+		if err := currentRun.State.TransitionTask(
+			taskID,
+			state.TaskRepairing,
+		); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// BaseSHA and CandidateSHA are written as direct fields because that is exactly what
-	// the task cycle does (task_cycle.go:165, :264). Attempt is **not** written here: the
-	// cycle only ever moves it through State.BeginTaskAttempt, which enforces the cap, so
-	// each seed drives it through that API instead.
-	task := currentRun.State.Tasks[taskID]
-	task.BaseSHA = &baseSHA
-	task.CandidateSHA = &candidateSHA
-	// A repairing task always carries its evidence: the cycle reaches repairing either
-	// after a failed gate (GateResult set) or after a dirty review (both set), and the
-	// only code that clears them resets the task for a fresh attempt
-	// (task_evidence.go:82, :116, :944). Leaving them nil described a task that had been
-	// sent back for repair without anything having judged it.
-	gatePath := filepath.Join("tasks", taskID, "gate.json")
-	reviewPath := filepath.Join("tasks", taskID, "review.json")
-	writeArtifactTestFile(
-		t,
-		filepath.Join(currentRun.Dir, gatePath),
-		[]byte(`{"exit":0,"timed_out":false}`),
-	)
-	writeArtifactTestFile(
-		t,
-		filepath.Join(currentRun.Dir, reviewPath),
-		[]byte(`{"schema_version":1,"task_id":"`+taskID+
-			`","candidate_sha":"`+candidateSHA+`","clean":false,"findings":[]}`),
-	)
-	task.GateResult = &gatePath
-	task.ReviewResult = &reviewPath
 
 	seed(t, currentRun, taskID)
 	if err := currentRun.SaveState(); err != nil {
@@ -2220,6 +2248,28 @@ func pressureModelFromRealRun(
 		t.Fatalf("the real artifact load produced %d changed files, want %d: %#v",
 			len(ready.artifacts.ChangedFiles), pressureChangedFileCount,
 			ready.artifacts.ChangedFiles)
+	}
+	// The attempt count the cycle produced has to survive all the way into the rendered
+	// status, otherwise the fixture proves nothing about the state it claims to be in
+	// (review T13b b3 f1). It is `attempts` because BeginTaskAttempt ran once per attempt
+	// and the capped call does not increment.
+	rendered, exists := ready.status.Tasks[taskID]
+	if !exists {
+		t.Fatalf("the rendered status lost task %s: %#v", taskID, ready.status.Tasks)
+	}
+	if rendered.Attempt != attempts {
+		t.Fatalf("the rendered task is on attempt %d, want the %d the cycle ran",
+			rendered.Attempt, attempts)
+	}
+	if rendered.Status != state.TaskRepairing {
+		t.Fatalf("the rendered task is %s, want repairing", rendered.Status)
+	}
+	if rendered.BaseSHA == nil || rendered.CandidateSHA == nil ||
+		rendered.GateResult == nil || rendered.ReviewResult == nil {
+		t.Fatalf("the rendered task lost its evidence: %#v", rendered)
+	}
+	if ready.status.PlanRound == 0 || ready.status.RunID != runID {
+		t.Fatalf("the rendered status is not the seeded run: %#v", ready.status)
 	}
 	return ready
 }
