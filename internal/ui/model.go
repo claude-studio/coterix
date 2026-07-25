@@ -158,6 +158,10 @@ type model struct {
 	selectedEntry int
 	hasSelection  bool
 	entryExpanded bool
+	// expandScroll walks the expanded block row by row. The block can be taller than
+	// the rows LIVE OUTPUT is given — PENDING outranks it — so bounding the block was
+	// not enough on its own to keep its head reachable (review T14c-r2 f2).
+	expandScroll int
 	// helpOpen shows the key overlay (T14 W6). It is the only overlay — there is no
 	// dialog stack, so a bool is the whole state.
 	helpOpen bool
@@ -433,6 +437,12 @@ func (current model) updateKey(
 		// Scrolling drives the focused box only (T14 W2) — unless the focused box is
 		// LIVE OUTPUT, where the same keys move the entry cursor (T14 W4).
 		if current.selectionDrivesKeys() {
+			if current.expandedCursor() {
+				// Walk up through the expanded block before leaving it.
+				current.expandScroll = min(current.expandScroll+1, maxExpandedBlockRows)
+				current.syncCursorViewport()
+				break
+			}
 			current.moveSelection(-1)
 			break
 		}
@@ -441,6 +451,11 @@ func (current model) updateKey(
 		}
 	case "down", "j":
 		if current.selectionDrivesKeys() {
+			if current.expandedCursor() && current.expandScroll > 0 {
+				current.expandScroll--
+				current.syncCursorViewport()
+				break
+			}
 			current.moveSelection(1)
 			break
 		}
@@ -456,11 +471,23 @@ func (current model) updateKey(
 		// modal branch above, so it cannot be open here.
 		current.clearSelection()
 	case "home":
+		if current.selectionDrivesKeys() && current.hasSelection {
+			// A cursor and a raw offset cannot both own the viewport: park the cursor
+			// on the oldest entry instead of scrolling out from under it
+			// (review T14c-r2 f1).
+			current.moveSelectionTo(0)
+			break
+		}
 		for _, target := range current.scrollTargets() {
 			current.boxScroll[target] = maxScrollSentinel
 		}
 	case "end":
-		// Back to the live edge, which also clears the `↓ new` indicator.
+		// Back to the live edge, which also clears the `↓ new` indicator. With a
+		// cursor up, following again means letting the cursor go.
+		if current.selectionDrivesKeys() && current.hasSelection {
+			current.clearSelection()
+			break
+		}
 		for _, target := range current.scrollTargets() {
 			current.boxScroll[target] = 0
 		}
@@ -493,6 +520,8 @@ func (current model) updateKey(
 	if key.String() == "enter" && current.selectionDrivesKeys() &&
 		current.hasSelection {
 		current.entryExpanded = !current.entryExpanded
+		current.expandScroll = 0
+		current.syncCursorViewport()
 		if current.entryExpanded {
 			// Expanding a step entry also opens the artifact that step produced, so
 			// the evidence is one keypress away instead of a tab hunt (T14 W4).
@@ -793,7 +822,32 @@ func (current *model) syncCursorViewport() {
 		return
 	}
 	current.selectedEntry = min(max(current.selectedEntry, 0), len(current.logs)-1)
-	current.boxScroll[boxLiveOutput] = len(current.logs) - 1 - current.selectedEntry
+	if !current.entryExpanded {
+		current.expandScroll = 0
+	}
+	// Rows below the cursor plus however far up its own block has been walked.
+	// visibleLines clamps an offset that runs past the top, so the cap only has to
+	// bound the walk, not match the box height.
+	current.boxScroll[boxLiveOutput] =
+		len(current.logs) - 1 - current.selectedEntry + current.expandScroll
+}
+
+// expandedCursor reports whether the keys should walk inside the cursor's own block
+// rather than move between entries.
+func (current model) expandedCursor() bool {
+	return current.hasSelection && current.entryExpanded
+}
+
+// moveSelectionTo parks the cursor on a specific entry.
+func (current *model) moveSelectionTo(index int) {
+	if len(current.logs) == 0 {
+		return
+	}
+	current.selectedEntry = min(max(index, 0), len(current.logs)-1)
+	current.hasSelection = true
+	current.entryExpanded = false
+	current.expandScroll = 0
+	current.syncCursorViewport()
 }
 
 // appendActivity feeds the pinned activity tail instead of the lifecycle feed:
@@ -950,6 +1004,7 @@ func (current *model) clearSelection() {
 	current.hasSelection = false
 	current.selectedEntry = 0
 	current.entryExpanded = false
+	current.expandScroll = 0
 	current.boxScroll[boxLiveOutput] = 0
 }
 

@@ -913,6 +913,7 @@ func wantRowsFor(current model, order []mainBox, innerWidth int) []int {
 			box,
 			mainBoxBody(current, box, innerWidth, 10),
 			30,
+			2,
 		)
 	}
 	return wants
@@ -2158,5 +2159,149 @@ func TestHelpOverlaySwallowsActionKeys(t *testing.T) {
 		if updated.(model).helpOpen {
 			t.Fatalf("esc did not close the overlay after %q", key)
 		}
+	}
+}
+
+// r2-f1: home/end and the cursor cannot both own the viewport. With a cursor up,
+// home parks it on the oldest entry and end lets it go — offsets alone left the
+// marker off screen and the next log jumped the view back (review T14c-r2 f1).
+func TestHomeAndEndAgreeWithTheCursor(t *testing.T) {
+	base := populatedViewModel(t)
+	for index := 0; index < 12; index++ {
+		base.appendLog(logEntry{Role: fmt.Sprintf("role-%02d", index), Text: "x"})
+	}
+	base.focus = boxLiveOutput
+	withCursor := func() model {
+		current := base
+		for press := 0; press < 3; press++ {
+			updated, _ := current.Update(printableKey('k'))
+			current = updated.(model)
+		}
+		return current
+	}
+	// The cursor normally parks on the window's last row, but at the top of the
+	// buffer the window cannot scroll further up — there the rule is simply that the
+	// cursor is on screen.
+	markerVisible := func(t *testing.T, current model) {
+		t.Helper()
+		rows := strings.Split(ansi.Strip(visibleLines(
+			lifecycleBody(current, 100),
+			4,
+			current.boxScroll[boxLiveOutput],
+		)), "\n")
+		for _, row := range rows {
+			if strings.HasPrefix(row, "▌▸") {
+				return
+			}
+		}
+		t.Fatalf("the cursor is not in the window:\n%s", strings.Join(rows, "\n"))
+	}
+
+	t.Run("home parks the cursor on the oldest entry", func(t *testing.T) {
+		current := withCursor()
+		updated, _ := current.Update(specialKey(tea.KeyHome))
+		current = updated.(model)
+		if !current.hasSelection || current.selectedEntry != 0 {
+			t.Fatalf("home left the cursor at %d (selection=%v)",
+				current.selectedEntry, current.hasSelection)
+		}
+		markerVisible(t, current)
+
+		// A new log must not jump the view: the cursor still owns it.
+		oldest := current.logs[0].Role
+		current.appendLog(logEntry{Role: "fresh", Text: "x"})
+		if current.logs[current.selectedEntry].Role != oldest {
+			t.Fatal("a new log moved the cursor off the oldest entry")
+		}
+		markerVisible(t, current)
+	})
+
+	t.Run("end lets the cursor go and really follows", func(t *testing.T) {
+		current := withCursor()
+		updated, _ := current.Update(specialKey(tea.KeyEnd))
+		current = updated.(model)
+		if current.hasSelection {
+			t.Fatal("end kept a cursor while claiming to follow")
+		}
+		if current.boxScroll[boxLiveOutput] != 0 {
+			t.Fatalf("end left offset=%d", current.boxScroll[boxLiveOutput])
+		}
+		// And it stays at the live edge as logs arrive.
+		current.appendLog(logEntry{Role: "fresh", Text: "x"})
+		if current.boxScroll[boxLiveOutput] != 0 {
+			t.Fatalf("the view jumped back to a stale cursor: offset=%d",
+				current.boxScroll[boxLiveOutput])
+		}
+	})
+}
+
+// r2-f2: PENDING outranks LIVE OUTPUT for rows, so a bounded block is still taller
+// than its box in the normal blocked state. `j/k` walk the block so its head and
+// marker are always reachable (review T14c-r2 f2).
+func TestExpandedBlockIsWalkableUnderPendingPressure(t *testing.T) {
+	current := populatedViewModel(t)
+	current.width = wideBreakpointWidth
+	current.height = wideBreakpointHeight
+	current.status.Phase = state.PhasePausedForInput
+	current.status.PendingAction = &state.PendingAction{
+		Kind: state.PendingPlanQuestion,
+		Prompt: strings.Repeat(
+			"which package should own the retry feedback loop and why ", 6),
+	}
+	for index := 0; index < 6; index++ {
+		current.appendLog(logEntry{Role: fmt.Sprintf("role-%02d", index), Text: "short"})
+	}
+	current.appendLog(logEntry{
+		Step: pipeline.StepGate,
+		Role: "gate",
+		Text: strings.Repeat("a long gate failure explanation ", 40),
+	})
+	current.focus = boxLiveOutput
+
+	updated, _ := current.Update(printableKey('k'))
+	current = updated.(model)
+	updated, _ = current.Update(specialKey(tea.KeyEnter))
+	current = updated.(model)
+
+	frame := func(model model) string {
+		return ansi.Strip(renderDashboard(model))
+	}
+	// The block starts out bottom-anchored, so its tail shows first.
+	if !strings.Contains(frame(current), "more rows in logs/") {
+		t.Fatalf("the withheld tail is not accounted for:\n%s", frame(current))
+	}
+
+	// Walking up must bring the head — marker and columns — into view.
+	found := false
+	for press := 0; press < maxExpandedBlockRows && !found; press++ {
+		updated, _ = current.Update(printableKey('k'))
+		current = updated.(model)
+		if strings.Contains(frame(current), "▌▸") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the expanded block's head is unreachable under PENDING:\n%s",
+			frame(current))
+	}
+	if current.expandScroll == 0 {
+		t.Fatal("k did not walk inside the block")
+	}
+	// Walking back down returns to the block's tail without moving the cursor.
+	anchored := current.selectedEntry
+	for press := current.expandScroll; press > 0; press-- {
+		updated, _ = current.Update(printableKey('j'))
+		current = updated.(model)
+	}
+	if current.expandScroll != 0 || current.selectedEntry != anchored {
+		t.Fatalf("j left expandScroll=%d cursor=%d (want 0, %d)",
+			current.expandScroll, current.selectedEntry, anchored)
+	}
+	// Collapsing resets the walk.
+	updated, _ = current.Update(specialKey(tea.KeyEnter))
+	current = updated.(model)
+	if current.entryExpanded || current.expandScroll != 0 {
+		t.Fatalf("collapse left expanded=%v scroll=%d",
+			current.entryExpanded, current.expandScroll)
 	}
 }

@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -1546,4 +1547,63 @@ func progressRow(t *testing.T, rows []string) string {
 	}
 	t.Fatalf("no progress row in:\n%s", strings.Join(rows, "\n"))
 	return ""
+}
+
+// r2-f3: the share caps bound the final box height, not the content rows. Applying
+// them to content alone let LIVE OUTPUT grow chrome rows past its third of the pane
+// and take them from FEED (review T14c-r2 f3).
+func TestBoxSharesCapTheFinalHeightNotTheContent(t *testing.T) {
+	current := populatedViewModel(t)
+	current.status.PendingAction = &state.PendingAction{
+		Kind:   state.PendingPlanQuestion,
+		Prompt: strings.Repeat("a long pending question ", 20),
+	}
+	for index := 0; index < 60; index++ {
+		current.appendLog(logEntry{Role: fmt.Sprintf("role-%02d", index), Text: "x"})
+	}
+
+	for _, layout := range []struct {
+		name   string
+		total  int
+		chrome int
+	}{
+		{name: "wide", total: 23, chrome: 2},
+		{name: "compact", total: 20, chrome: 1},
+	} {
+		t.Run(layout.name, func(t *testing.T) {
+			order := mainBoxOrder(current)
+			wants := make([]int, len(order))
+			for index, box := range order {
+				wants[index] = mainBoxWantRows(
+					current,
+					box,
+					mainBoxBody(current, box, 90, layout.total),
+					layout.total,
+					layout.chrome,
+				)
+			}
+			heights := distributeMainBoxHeights(
+				order,
+				wants,
+				layout.total,
+				layout.chrome,
+			)
+			for index, box := range order {
+				limit := 0
+				switch box {
+				case boxPending:
+					limit = layout.total / 2
+				case boxLiveOutput:
+					limit = layout.total / 3
+				default:
+					continue
+				}
+				// FEED absorbs the slack, so only the capped boxes are checked.
+				if heights[index] > limit {
+					t.Fatalf("box %d got %d rows, its share is %d",
+						box, heights[index], limit)
+				}
+			}
+		})
+	}
 }

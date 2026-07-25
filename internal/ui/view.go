@@ -198,7 +198,7 @@ func renderMain(current model, width, height int) string {
 	wants := make([]int, len(order))
 	for index, box := range order {
 		bodies[index] = mainBoxBody(current, box, innerWidth, max(1, total/2-2))
-		wants[index] = mainBoxWantRows(current, box, bodies[index], total)
+		wants[index] = mainBoxWantRows(current, box, bodies[index], total, 2)
 	}
 	heights := distributeMainBoxHeights(order, wants, total, 2)
 
@@ -265,7 +265,7 @@ func renderMainCompact(current model, width, height int) string {
 			bodyWidth,
 			max(1, innerHeight/2-1),
 		)
-		wants[index] = mainBoxWantRows(current, box, bodies[index], innerHeight)
+		wants[index] = mainBoxWantRows(current, box, bodies[index], innerHeight, 1)
 	}
 	// One row of chrome per section (its title). Sharing one budget is what keeps
 	// the bottom section from being clipped without a marker at 80x24, where a
@@ -331,10 +331,16 @@ func artifactBody(current model) string {
 // that row's timestamp out of line with its neighbours (T14 W4).
 const selectionGutter = 2
 
-// maxExpandedTextRows bounds an expanded entry so the whole block — marker, columns
-// and text — fits the rows LIVE OUTPUT can be given (review T14c f3). One header row
-// plus this plus the withheld marker has to stay inside the box's half-pane cap.
-const maxExpandedTextRows = 6
+// maxExpandedTextRows bounds an expanded entry's wrapped body; the untruncated text
+// stays in the run's logs/ files (review T14c f3). Bounding alone does not guarantee
+// the block fits — PENDING outranks LIVE OUTPUT for rows — so `j/k` also walk the
+// block (maxExpandedBlockRows, review T14c-r2 f2).
+const (
+	maxExpandedTextRows = 6
+	// maxExpandedBlockRows is the header, the body and the withheld marker: the
+	// furthest `k` can usefully walk up inside one block.
+	maxExpandedBlockRows = maxExpandedTextRows + 2
+)
 
 func lifecycleBody(current model, innerWidth int) string {
 	if len(current.logs) == 0 {
@@ -512,22 +518,31 @@ func activityRenderLimit(current model) int {
 // for a paused ACTIVITY, which renders its whole retained buffer: letting that
 // body set the height would grow the box (and shrink FEED) the moment the reader
 // scrolled back (review T14a-r2 f1).
-func mainBoxWantRows(current model, box mainBox, body string, total int) int {
+// The share caps bound the *final box height*, so chrome has to come out of the
+// content budget here — distribute adds it back. Applying the share to content rows
+// alone let LIVE OUTPUT grow chrome rows past its third of the pane and take them
+// from FEED (review T14c-r2 f3).
+func mainBoxWantRows(
+	current model,
+	box mainBox,
+	body string,
+	total, chrome int,
+) int {
 	rows := countRows(body)
+	share := func(limit int) int { return max(1, limit-chrome) }
 	switch box {
 	case boxActivity:
 		rows = min(rows, activityTailLimit(current))
 	case boxPending:
-		rows = min(rows, max(1, total/2))
+		rows = min(rows, share(total/2))
 	case boxLiveOutput:
 		// Normally a third of the pane. An expanded entry is a deliberate request to
-		// read one entry in full, so the box may take half — otherwise the block is
-		// clipped and its head is unreachable (review T14c f3).
-		share := total / 3
-		if current.hasSelection && current.entryExpanded {
-			share = total / 2
+		// read one entry in full, so the box may take half.
+		limit := total / 3
+		if current.expandedCursor() {
+			limit = total / 2
 		}
-		rows = min(rows, max(1, share))
+		rows = min(rows, share(limit))
 	}
 	return rows
 }
