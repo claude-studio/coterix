@@ -2,7 +2,10 @@ package ui
 
 import (
 	"fmt"
+	"image/color"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1791,20 +1794,93 @@ func TestWorkingTextShimmerAdvancesWithTheSpinner(t *testing.T) {
 	}
 }
 
+// The "no extra render cost" half of W7 is a claim about the blend, so it is measured:
+// sliding the window over a full cycle must not blend again (review T13b/W7 f2).
+func TestWorkingTextShimmerBlendsOncePerTextAndTheme(t *testing.T) {
+	blends := 0
+	original := blend1D
+	blend1D = func(size int, stops ...color.Color) []color.Color {
+		blends++
+		return original(size, stops...)
+	}
+	// The palette is memoized process-wide, so a populated cache would make any count
+	// look right. Both the restore and the reset have to happen for the next test too.
+	reset := func() {
+		shimmerPalettes.Clear()
+	}
+	t.Cleanup(func() {
+		blend1D = original
+		reset()
+	})
+	reset()
+
+	current := populatedViewModel(t)
+	current.activeRole = "impl_writer"
+	current.activeStep = pipeline.StepImplementation
+	width := ansi.StringWidth(" " + strings.ToUpper("impl_writer") + " WORKING")
+
+	frames := make(map[string]bool, width)
+	for phase := 0; phase <= width; phase++ {
+		frame := current
+		frame.shimmerPhase = phase
+		frames[statusSignal(frame)] = true
+	}
+	if blends != 1 {
+		t.Fatalf("%d blends over %d phases, want 1", blends, width+1)
+	}
+	// And the memo did not flatten the animation into one frame.
+	if len(frames) != width {
+		t.Fatalf("%d distinct frames over a %d-cell cycle", len(frames), width)
+	}
+
+	// A different step is a different rune count, so it earns exactly one more blend.
+	other := current
+	other.activeRole = "reviewer"
+	if statusSignal(other) == "" {
+		t.Fatal("the reviewer chip did not render")
+	}
+	if blends != 2 {
+		t.Fatalf("a new text length caused %d blends in total, want 2", blends)
+	}
+	// Re-rendering it does not.
+	statusSignal(other)
+	if blends != 2 {
+		t.Fatalf("a repeated text length blended again: %d", blends)
+	}
+
+	// A theme with different stops is a different palette at the same width, so the memo
+	// must not answer for it — otherwise a theme swap would keep the old brand colours.
+	restyled := current.theme
+	restyled.tokens.Gradient.BrandLeftToRight = []string{"#112233", "#445566"}
+	sameWidth := " " + strings.ToUpper("impl_writer") + " WORKING"
+	recoloured := workingGradientText(restyled, sameWidth, 0)
+	if blends != 3 {
+		t.Fatalf("a new gradient caused %d blends in total, want 3", blends)
+	}
+	if recoloured == workingGradientText(current.theme, sameWidth, 0) {
+		t.Fatal("the two themes rendered the same frame")
+	}
+	if blends != 3 {
+		t.Fatalf("re-rendering either theme blended again: %d", blends)
+	}
+}
+
 // T13 W5: the changed-files list is last in the rail and only uses rows the signals did
 // not need. The budget contract (R2) is that intervention signals are never pushed off.
 func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
+	// The totals stay single-digit on purpose: `N files (M hidden) · +A/-D` has to fit
+	// the rail's 26 inner cells for the complete row to be assertable at all, and +45/-36
+	// does not. Additions and deletions still differ so a swapped pair fails.
 	files := make([]changedFile, 0, 9)
 	for index := 0; index < 9; index++ {
 		files = append(files, changedFile{
 			Path:      fmt.Sprintf("internal/ui/file-%02d.go", index),
-			Additions: index + 1,
-			Deletions: index,
+			Additions: 1,
+			Deletions: index % 2,
 		})
 	}
 	current := populatedViewModel(t)
 	current.artifacts.ChangedFiles = files
-	data := deriveSidebar(current)
 
 	t.Run("it renders with room and reports the total", func(t *testing.T) {
 		body := ansi.Strip(renderChangedFiles(current.theme, files, 26, 12))
@@ -1833,70 +1909,158 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 
 	// Approval and pending_action are mutually exclusive by design — approval is a
 	// phase, not a pending_action (spec) — so each pressure case is checked on its own.
+	//
+	// Both cases go through the production render at the minimum wide size, never
+	// renderSidebarBody: the budget the list has to respect is the *rail's* — the
+	// PIPELINE card and both cards' borders spend the same 26 rows, and renderSidebar
+	// is what truncates the overflow. Measuring the body alone handed the list a budget
+	// it did not have, and the total row it appended fell off the card unseen
+	// (review T13b/W5 f1).
 	for _, pressure := range []struct {
 		name    string
-		mutate  func(sidebarData) sidebarData
+		mutate  func(model) model
 		signals []string
 	}{
 		{
 			name: "approval needed plus an error",
-			mutate: func(in sidebarData) sidebarData {
-				in.AwaitingApproval = true
-				in.LastError = "gate failed on the second attempt"
+			mutate: func(in model) model {
+				in.status.Phase = state.PhaseAwaitingApproval
+				in.status.LastError = pointerTo("gate failed on the second attempt")
 				return in
 			},
 			signals: []string{
 				"APPROVAL NEEDED",
+				"a approve · r reject",
 				"gate failed on the second attempt",
 			},
 		},
 		{
 			name: "pending question plus an error",
-			mutate: func(in sidebarData) sidebarData {
-				// Approval wins over pending in the render, so this case has to clear it
-				// — the two are mutually exclusive states, not stacked ones.
-				in.AwaitingApproval = false
-				in.PendingKind = state.PendingTaskCap
-				in.PendingPrompt = "attempt cap reached"
-				in.LastError = "gate failed on the second attempt"
+			mutate: func(in model) model {
+				// Approval wins over pending in the render, so this case has to leave the
+				// approval phase — the two are mutually exclusive states, not stacked.
+				in.status.Phase = state.PhasePausedForInput
+				in.status.PendingAction = &state.PendingAction{
+					Kind:   state.PendingTaskCap,
+					Prompt: "attempt cap reached",
+				}
+				in.status.LastError = pointerTo("gate failed on the second attempt")
 				return in
 			},
 			signals: []string{
-				"attempt cap reached",
+				"PENDING · task_cap",
 				"gate failed on the second attempt",
 			},
 		},
 	} {
 		t.Run("signals survive: "+pressure.name, func(t *testing.T) {
-			body := ansi.Strip(renderSidebarBody(
-				current.theme,
-				pressure.mutate(data),
-				26,
-				true,
-				true,
+			candidate := pressure.mutate(populatedViewModel(t))
+			candidate.artifacts.ChangedFiles = files
+			candidate.width, candidate.height = wideBreakpointWidth, wideBreakpointHeight
+
+			rail := ansi.Strip(renderSidebar(
+				candidate,
+				sidebarWidth,
+				candidate.height-topBarHeight-2,
 			))
-			rows := strings.Split(strings.TrimRight(body, "\n"), "\n")
-			if len(rows) > sidebarRowBudget {
-				t.Fatalf("the rail overflowed to %d rows:\n%s", len(rows), body)
-			}
-			// Signals are hardwrapped to the rail width, and a wrap can fall *inside* a
-			// word ("secon" / "d attempt"). Joining on spaces would not rejoin that, so
-			// compare with the whitespace removed entirely.
-			squeeze := func(text string) string {
-				return strings.Join(strings.Fields(text), "")
-			}
-			flat := squeeze(body)
-			for _, signal := range pressure.signals {
-				if !strings.Contains(flat, squeeze(signal)) {
-					t.Fatalf("the file list displaced %q:\n%s", signal, body)
+			frame := ansi.Strip(renderDashboard(candidate))
+			for _, surface := range []struct {
+				name     string
+				rendered string
+			}{{"rail", rail}, {"composed rail", railColumn(frame)}} {
+				// Signals are hardwrapped to the rail width, and a wrap can fall *inside*
+				// a word ("secon" / "d attempt"). Joining on spaces would not rejoin that,
+				// so compare with the whitespace and the card's own verticals removed.
+				flat := flattenRail(surface.rendered)
+				for _, signal := range pressure.signals {
+					if !strings.Contains(flat, flattenRail(signal)) {
+						t.Fatalf("%s: the file list displaced %q:\n%s",
+							surface.name, signal, surface.rendered)
+					}
+				}
+				// And the section itself is present — otherwise this proves nothing about
+				// yielding.
+				if !strings.Contains(surface.rendered, "CHANGED") {
+					t.Fatalf("%s: the file list is absent, so the budget was not "+
+						"exercised:\n%s", surface.name, surface.rendered)
+				}
+				shown, hidden := changedFilesAccounting(t, surface.name, surface.rendered)
+				if shown < 1 || shown+hidden != len(files) {
+					t.Fatalf("%s: %d shown + %d hidden does not account for %d files:\n%s",
+						surface.name, shown, hidden, len(files), surface.rendered)
+				}
+				// And the card still closes after the section. 26 rows is the whole rail,
+				// borders included, so a list that only fits by pushing the STATUS card's
+				// bottom edge past the cut has not fit — it just moved the damage.
+				if _, after, found := strings.Cut(
+					surface.rendered,
+					"hidden) · +9/-4",
+				); !found || !strings.Contains(after, "╰") {
+					t.Fatalf("%s: the STATUS card does not close after the file list:\n%s",
+						surface.name, surface.rendered)
 				}
 			}
-			// And the section itself is present — otherwise this proves nothing about
-			// yielding.
-			if !strings.Contains(body, "CHANGED") {
-				t.Fatalf("the file list is absent, so the budget was not exercised:\n%s",
-					body)
+			if rows := countRows(rail); rows > sidebarRowBudget {
+				t.Fatalf("the rail overflowed to %d rows:\n%s", rows, rail)
+			}
+			if rows := countRows(frame); rows != candidate.height {
+				t.Fatalf("the frame is %d rows, want %d:\n%s",
+					rows, candidate.height, frame)
 			}
 		})
 	}
+}
+
+// railColumn cuts the sidebar out of a composed frame. Without it the main pane's cells
+// sit between two halves of a wrapped rail row, so a signal that wrapped cannot be
+// rejoined — and what composeUV actually clipped into the rail column is what the
+// operator sees.
+func railColumn(frame string) string {
+	lines := strings.Split(frame, "\n")
+	column := make([]string, 0, len(lines))
+	for _, line := range lines {
+		column = append(column, ansi.TruncateLeftWc(
+			line,
+			max(0, ansi.StringWidth(line)-sidebarWidth),
+			"",
+		))
+	}
+	return strings.Join(column, "\n")
+}
+
+// flattenRail drops whitespace and the card's verticals so a row that hardwrapped
+// mid-word compares as one string.
+func flattenRail(text string) string {
+	return strings.Join(strings.Fields(strings.ReplaceAll(text, "│", "")), "")
+}
+
+// changedFilesAccounting reads the rendered CHANGED section back: how many file rows
+// survived, and how many the total row says were hidden. A truncated or clipped total
+// row has no match and fails here, which is the whole point — the hidden count is the
+// only place the capped files are accounted for.
+func changedFilesAccounting(t *testing.T, surface, rendered string) (int, int) {
+	t.Helper()
+	total := regexp.MustCompile(`(\d+) files \((\d+) hidden\) · \+9/-4`)
+	shown := 0
+	for _, line := range strings.Split(rendered, "\n") {
+		if match := total.FindStringSubmatch(line); match != nil {
+			all, err := strconv.Atoi(match[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			hidden, err := strconv.Atoi(match[2])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if all != 9 {
+				t.Fatalf("%s: the total row counts %d files, want 9", surface, all)
+			}
+			return shown, hidden
+		}
+		if strings.Contains(line, "ui/file-") {
+			shown++
+		}
+	}
+	t.Fatalf("%s: the complete total row is missing:\n%s", surface, rendered)
+	return 0, 0
 }

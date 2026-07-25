@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
@@ -24,6 +25,8 @@ const (
 	sidebarRowBudget = 26
 	// maxChangedFilesShown caps the T13 W5 list before the budget does.
 	maxChangedFilesShown = 5
+	// statusCardChrome is the STATUS card's own top and bottom border rows.
+	statusCardChrome = 2
 )
 
 // THESIS: Make a synchronous multi-agent pipeline readable as one live
@@ -1139,17 +1142,33 @@ func renderSidebar(current model, width, height int) string {
 		cardWidth,
 		focused,
 	)
+	data := deriveSidebar(current)
+	statusBody := renderSidebarBody(
+		current.theme,
+		data,
+		innerWidth,
+		true,
+		false, // the main pane's PENDING box owns the question body
+	)
+	// The changed-files list is appended here, not inside the body, because the budget it
+	// has to respect is the *rail's*: the PIPELINE card's rows and both cards' borders
+	// count against the same height, and renderSidebar truncates the overflow. Measuring
+	// only the STATUS body let the list push its own total row off the card
+	// (review T13b/W5 f1).
+	used := countRows(pipelineCard) + statusCardChrome + countRows(statusBody)
+	if section := renderChangedFiles(
+		current.theme,
+		data.ChangedFiles,
+		innerWidth,
+		max(1, height)-used,
+	); section != "" {
+		statusBody = strings.TrimSuffix(statusBody, "\n") + "\n" + section + "\n"
+	}
 	statusCard := renderBoxCard(
 		current.theme,
 		"STATUS",
 		"",
-		renderSidebarBody(
-			current.theme,
-			deriveSidebar(current),
-			innerWidth,
-			true,
-			false, // the main pane's PENDING box owns the question body
-		),
+		statusBody,
 		cardWidth,
 		focused,
 	)
@@ -1285,20 +1304,6 @@ func renderSidebarBody(
 				),
 			),
 		)
-		content.WriteString("\n")
-	}
-
-	// The file list is last on purpose: the rail is a fixed 26-row budget and
-	// renderSidebar silently truncates the overflow, so anything appended here must only
-	// use rows the intervention signals and the fixed fields did not need. `budget <= 0`
-	// drops the section entirely rather than pushing a signal off the card (T13 W5 · R2).
-	if body := renderChangedFiles(
-		currentTheme,
-		data.ChangedFiles,
-		innerWidth,
-		sidebarRowBudget-countRows(strings.TrimSuffix(content.String(), "\n")),
-	); body != "" {
-		content.WriteString(body)
 		content.WriteString("\n")
 	}
 
@@ -2001,25 +2006,51 @@ func gradientText(currentTheme theme, text string) string {
 	return output.String()
 }
 
+// blend1D is lipgloss.Blend1D behind a variable so a test can count how often the
+// shimmer actually blends (T13 W7 · review f2).
+var blend1D = lipgloss.Blend1D
+
+// shimmerPalettes memoizes the doubled-width gradient. The blend depends only on the
+// theme's stops and the rune count — never on the phase — so blending inside the render
+// put a fresh allocation on every spinner tick, which is the per-frame cost W7 is
+// contractually not allowed to add (review T13b/W7 f2). The key set is bounded by the
+// step names, and sync.Map keeps the concurrent renders the -race gate exercises safe.
+var shimmerPalettes sync.Map
+
+type shimmerKey struct {
+	stops string
+	width int
+}
+
+func shimmerPalette(currentTheme theme, width int) []color.Color {
+	tokens := currentTheme.tokens.Gradient.BrandLeftToRight
+	key := shimmerKey{stops: strings.Join(tokens, ","), width: width}
+	if cached, found := shimmerPalettes.Load(key); found {
+		return cached.([]color.Color)
+	}
+	stops := make([]color.Color, 0, len(tokens))
+	for _, token := range tokens {
+		stops = append(stops, lipgloss.Color(token))
+	}
+	// Blend across twice the width so the phase can slide a window along it.
+	colors := blend1D(width*2, stops...)
+	if len(colors) != width*2 {
+		return nil
+	}
+	shimmerPalettes.Store(key, colors)
+	return colors
+}
+
 func workingGradientText(currentTheme theme, text string, phase int) string {
 	runes := []rune(text)
 	if len(runes) == 0 {
 		return ""
 	}
-	stops := make(
-		[]color.Color,
-		0,
-		len(currentTheme.tokens.Gradient.BrandLeftToRight),
-	)
-	for _, token := range currentTheme.tokens.Gradient.BrandLeftToRight {
-		stops = append(stops, lipgloss.Color(token))
-	}
-	// Blend across twice the width and slide the window by the shimmer phase: the
-	// gradient appears to travel along the text without recomputing anything per frame
-	// (T13 W7 — the spinner already animates; this is the *text* shimmer, and the spec
-	// asks for the minimum).
-	colors := lipgloss.Blend1D(len(runes)*2, stops...)
-	if len(colors) != len(runes)*2 {
+	// The window slides by the shimmer phase, so the gradient appears to travel along the
+	// text while the palette behind it is computed once (T13 W7 — the spinner already
+	// animates; this is the *text* shimmer, and the spec asks for the minimum).
+	colors := shimmerPalette(currentTheme, len(runes))
+	if colors == nil {
 		return currentTheme.styles.Busy.Render(text)
 	}
 	offset := 0
