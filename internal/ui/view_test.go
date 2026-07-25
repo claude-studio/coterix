@@ -1981,8 +1981,8 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 			// that instead of a hand-written string is what makes the message causally
 			// consistent with the attempt counter — a string saying "second attempt" at
 			// Attempt=1 was not something the cycle could have produced
-			// (review T13b b4 f3). It is 41 cells, so it still hardwraps to the two rows
-			// this case exists to spend.
+			// (review T13b b4 f3). Measured at 42 cells, so it still hardwraps to the two
+			// rows this case exists to spend.
 			name:     "aborted after the attempt cap",
 			attempts: pressureAttemptsToCap,
 			seed: func(t *testing.T, currentRun *pipeline.Run, taskID string) {
@@ -2123,7 +2123,8 @@ const pressureAttemptsToCap = 3
 // state API, `seed` applying the state transition under test, a real
 // controller.Status, and then the real EventStateSnapshot → loadArtifactsCommand →
 // artifactsLoadedMsg chain. Nothing is assigned into the model by hand, so a state the
-// pipeline cannot reach cannot be tested by accident (review T13b/W5 f1).
+// pipeline cannot reach cannot be tested by accident (review T13b/W5 f1). What it does
+// **not** do is re-run TaskCycle — see the scope note in the attempt loop.
 func pressureModelFromRealRun(
 	t *testing.T,
 	attempts int,
@@ -2137,7 +2138,7 @@ func pressureModelFromRealRun(
 	// The files have to exist in the base commit: a brand-new file reports `1\t0`, and the
 	// totals need deletions too so a swapped additions/deletions pair cannot pass.
 	for index := 0; index < pressureChangedFileCount; index++ {
-		writePressureFile(t, root, index, pressureFileBody(index, 0))
+		writePressureFile(t, root, index, pressureFileBody(index, 0, attempts))
 	}
 	integrationGit(t, root, "add", "-A")
 	commitPressureTree(t, root, "test: pressure base")
@@ -2186,24 +2187,31 @@ func pressureModelFromRealRun(
 	active := taskID
 	currentRun.State.CurrentTaskID = &active
 
-	// One dirty-review attempt, repeated as the cycle repeats it: BeginTaskAttempt (the
-	// only thing that moves Attempt, and the thing that enforces the cap) -> the candidate
-	// commit and its SHAs -> candidate -> gate and review evidence -> repairing. Calling
-	// BeginTaskAttempt several times in a row instead would reach the same Attempt without
-	// ever passing through the statuses production passes through.
+	// SCOPE (settled in review T13b b5): this is a **view** test, and what it owes is a
+	// status the pipeline could have persisted — validated by the real state API, with real
+	// artifacts loaded from a real repository. It does *not* claim to reproduce TaskCycle's
+	// own sequencing; driving the real cycle with a fake executor belongs in
+	// internal/pipeline, and the reviewer ruled it out of scope here.
 	//
-	// Measured limit of this witness: replacing this call with a bare `Attempt++` still
-	// passes, because the state it leaves is identical — going through the cap-enforcing
-	// API is not observable in the resulting state. What *is* observable, and is asserted
-	// by the task_cap seed above, is that the API refuses the next attempt with a CapError
-	// of exactly MaxTaskAttempts. That assertion is the witness for cap enforcement; this
-	// loop uses the real call for fidelity, not because a mutation can catch it.
+	// So each round below is a stand-in for a completed dirty attempt, not a replay of one:
+	// Attempt moves only through BeginTaskAttempt (the cap-enforcing API), the task walks
+	// open -> candidate -> repairing through TransitionTask, and every round commits
+	// something different because the fixer postcondition requires a new candidate.
+	//
+	// Measured limit of this witness: replacing the BeginTaskAttempt call with a bare
+	// `Attempt++` still passes, because the state it leaves is identical — going through the
+	// cap-enforcing API is not observable in the resulting state. What *is* observable, and
+	// is asserted by the task_cap seed above, is that the API refuses the next attempt with
+	// a CapError of exactly MaxTaskAttempts.
+	// BaseSHA is written **once**, before the first attempt, as implementTask does
+	// (task_cycle.go:163-168). The repair path never touches it — task_evidence.go only
+	// reads BaseSHA and assigns CandidateSHA (:633) — so rewriting it per attempt described
+	// a chain production cannot produce, and made the cumulative diff look smaller than it
+	// was (review T13b b5 f1).
+	firstBase := integrationGit(t, root, "rev-parse", "HEAD")
+	currentRun.State.Tasks[taskID].BaseSHA = &firstBase
 	for attempt := 1; attempt <= attempts; attempt++ {
-		// BaseSHA is HEAD at the start of the attempt, set before BeginTaskAttempt exactly
-		// as the cycle does (task_cycle.go:164-168).
-		attemptBase := integrationGit(t, root, "rev-parse", "HEAD")
 		task := currentRun.State.Tasks[taskID]
-		task.BaseSHA = &attemptBase
 		if err := currentRun.State.BeginTaskAttempt(
 			taskID,
 			currentRun.Config.MaxTaskAttempts,
@@ -2214,15 +2222,19 @@ func pressureModelFromRealRun(
 		// Each repair produces a **different** commit: the fixer postcondition requires
 		// HEAD to differ from the previous candidate, so reusing one SHA for every attempt
 		// described a repair that changed nothing (review T13b b4 f1). The per-file
-		// transformation is chosen so *every* attempt's diff against its own parent is the
-		// same +9/-4, which is what the rail total asserts.
+		// transformation converts one slice of files per round, so the **cumulative**
+		// base..candidate diff stays the nine files at +9/-4 the rail total asserts, with
+		// BaseSHA left at the first attempt's base as production leaves it.
 		for index := 0; index < pressureChangedFileCount; index++ {
-			writePressureFile(t, root, index, pressureFileBody(index, attempt))
+			writePressureFile(t, root, index, pressureFileBody(index, attempt, attempts))
 		}
 		integrationGit(t, root, "add", "-A")
 		commitPressureTree(t, root, fmt.Sprintf("test: pressure attempt %d", attempt))
 		attemptCandidate := integrationGit(t, root, "rev-parse", "HEAD")
-		if attemptCandidate == attemptBase {
+		if task.CandidateSHA != nil && attemptCandidate == *task.CandidateSHA {
+			t.Fatal("the repair produced no new commit")
+		}
+		if attemptCandidate == firstBase {
 			t.Fatal("the attempt produced no new commit")
 		}
 		task.CandidateSHA = &attemptCandidate
@@ -2335,23 +2347,26 @@ func observePressureCap(
 	return capErr
 }
 
-// pressureFileBody is the content of one pressure file after `attempt` repairs (attempt 0
-// is the base commit). Even files gain a line each time (+1/-0) and odd files replace their
-// second line (+1/-1), so **every** attempt's diff against its own parent is the same
-// +9/-4 that the rail total asserts — which is what lets each repair be a distinct commit
-// without changing what the test measures.
-func pressureFileBody(index, attempt int) string {
+// pressureFileBody is the content of one pressure file after `attempt` commits, out of
+// `attempts` in total. Each commit converts the next slice of files from their base content
+// to their final content, so every commit differs from the one before it while the
+// **cumulative** base..candidate diff is always the same nine files at +9/-4.
+//
+// Accumulating a change in every file on every commit instead would make the cumulative
+// diff grow with the attempt count (+19/-4 at three attempts), which is what the fixture
+// used to report only because it also rewrote BaseSHA on each repair — something production
+// never does (review T13b b5 f1).
+func pressureFileBody(index, attempt, attempts int) string {
+	converted := index*max(1, attempts)/pressureChangedFileCount + 1
+	if attempt < converted {
+		return "one\ntwo\n"
+	}
 	if index%2 == 1 {
-		if attempt == 0 {
-			return "one\ntwo\n"
-		}
-		return fmt.Sprintf("one\nrepair-%d\n", attempt)
+		// One line added and one replaced: +1/-1.
+		return "one\nthree\n"
 	}
-	body := "one\ntwo\n"
-	for round := 0; round < attempt; round++ {
-		body += "added\n"
-	}
-	return body
+	// One line added: +1/-0.
+	return "one\ntwo\nthree\n"
 }
 
 // writePressureEvidence writes the gate and review artefacts a completed dirty attempt
@@ -2367,8 +2382,12 @@ func pressureFileBody(index, attempt int) string {
 //     A finding needs id, severity (critical|major|minor), a path:line location, issue and
 //     requested_change (result.go:340-401).
 //
-// No exported decoder reaches either schema from this package, so the shapes are pinned by
-// construction against those references rather than by re-decoding here.
+// Neither shape is re-decoded here, and that is a layering decision rather than a
+// limitation: gate decoding is private to internal/pipeline, but the review verdict *is*
+// reachable through the exported cli.NewOutputAdapter(...).NewAttempt().ValidateReviewResult
+// path (review T13b b5 f5). A schema round-trip belongs in internal/cli or
+// internal/pipeline, where the schema lives; here the shapes are pinned by construction
+// against the references above so that this test stays about rendering.
 func writePressureEvidence(
 	t *testing.T,
 	currentRun *pipeline.Run,
