@@ -1946,7 +1946,10 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 	// a candidate exists and loadArtifactData will load its changed files
 	// (task_evidence.go:449-480, artifacts.go:103-125) — so it renders a PENDING chip
 	// alongside the list exactly as task_cap does (review T13b b7 f1). It is not repeated
-	// here because it spends the same single chip row task_cap already covers.
+	// here because it spends the same single chip row task_cap already covers: measured,
+	// `◇ PENDING · auth` is 16 cells and `▶ PENDING · task_cap` is 20, both one row at the
+	// rail's 26. These come from pendingChipText constants, so unlike the fixture-dependent
+	// figures elsewhere they do not move when the seeding changes.
 	for _, pressure := range []struct {
 		name string
 		// attempts is how many full dirty-review attempts run before seed applies the
