@@ -111,11 +111,13 @@ func TestInstalledCLIsWriteDesignatedJSON(t *testing.T) {
 			})
 			if runErr != nil {
 				stderr, _ := os.ReadFile(result.StderrLog)
+				stdout, _ := os.ReadFile(result.StdoutLog)
+				classified := ClassifyFailure(test.name, runErr, stderr, stdout)
 				t.Fatalf(
 					"%s smoke run failed: %T %v",
 					test.name,
-					ClassifyFailure(test.name, runErr, stderr),
-					ClassifyFailure(test.name, runErr, stderr),
+					classified,
+					classified,
 				)
 			}
 

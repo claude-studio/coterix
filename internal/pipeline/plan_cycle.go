@@ -497,7 +497,10 @@ func (cycle *PlanCycle) handleStepFailure(
 	if !errors.As(runErr, &authErr) {
 		cliName := currentRun.Config.Roles[role]
 		stderr, _ := readLogTail(result.StderrLog, 64<<10)
-		classified = cli.ClassifyFailure(cliName, runErr, stderr)
+		// stream-json puts the auth marker in stdout only (T13a-2), so both
+		// streams go to the classifier.
+		stdout, _ := readLogTail(result.StdoutLog, 64<<10)
+		classified = cli.ClassifyFailure(cliName, runErr, stderr, stdout)
 		_ = errors.As(classified, &authErr)
 	}
 	if authErr != nil {

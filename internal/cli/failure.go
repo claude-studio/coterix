@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -55,12 +56,19 @@ func (failure *GenericFailure) Unwrap() error {
 
 // ClassifyFailure distinguishes known CLI authentication exits from generic
 // failures. It does not probe credentials or create a separate auth subsystem.
-func ClassifyFailure(cliName string, err error, stderr []byte) error {
+//
+// Both streams are inspected because neither alone is sufficient. Measured
+// 2026-07-25: under `--output-format stream-json` claude reports an auth failure
+// only inside a stdout JSON envelope (`"error":"authentication_failed"`) and leaves
+// stderr empty, so a stderr-only classifier silently lost the whole
+// paused_for_input{auth} path. Plain-text mode still writes to stderr, and codex
+// always does — hence OR, not a replacement.
+func ClassifyFailure(cliName string, err error, stderr, stdout []byte) error {
 	if err == nil {
 		return nil
 	}
 	kind := runnerFailureKind(err)
-	if kind == FailureExit && knownAuthFailure(cliName, stderr) {
+	if kind == FailureExit && knownAuthFailure(cliName, stderr, stdout) {
 		return &AuthFailure{CLI: cliName, Kind: kind, Err: err}
 	}
 	return &GenericFailure{Kind: kind, Err: err}
@@ -94,12 +102,13 @@ func runnerFailureKind(err error) FailureKind {
 	return FailureUnknown
 }
 
-func knownAuthFailure(cliName string, stderr []byte) bool {
-	const maxSignatureBytes = 64 << 10
-	if len(stderr) > maxSignatureBytes {
-		stderr = stderr[len(stderr)-maxSignatureBytes:]
-	}
-	cleaned := ansiSequencePattern.ReplaceAllString(string(stderr), "")
+func knownAuthFailure(cliName string, stderr, stdout []byte) bool {
+	return stderrAuthFailure(cliName, stderr) ||
+		jsonAuthFailure(cliName, stdout)
+}
+
+func stderrAuthFailure(cliName string, stderr []byte) bool {
+	cleaned := ansiSequencePattern.ReplaceAllString(string(tailBytes(stderr)), "")
 	lines := strings.Split(cleaned, "\n")
 	for _, line := range lines {
 		normalized := strings.ToLower(strings.TrimSpace(line))
@@ -117,6 +126,101 @@ func knownAuthFailure(cliName string, stderr []byte) bool {
 				return true
 			}
 		}
+	}
+	return false
+}
+
+const maxSignatureBytes = 64 << 10
+
+func tailBytes(data []byte) []byte {
+	if len(data) > maxSignatureBytes {
+		return data[len(data)-maxSignatureBytes:]
+	}
+	return data
+}
+
+// jsonAuthFailure looks for an auth marker inside a JSONL stream (claude's
+// stream-json stdout). Only *error envelopes* are examined — an object carrying
+// `is_error`, an `error` field, or an error subtype — so a plan or diff that merely
+// quotes "invalid api key" cannot be mistaken for a credential problem.
+func jsonAuthFailure(cliName string, stdout []byte) bool {
+	for _, line := range strings.Split(string(tailBytes(stdout)), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var envelope map[string]any
+		if err := json.Unmarshal([]byte(line), &envelope); err != nil {
+			continue
+		}
+		if !isErrorEnvelope(envelope) {
+			continue
+		}
+		for _, text := range envelopeStrings(envelope) {
+			if authSignalText(cliName, text) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isErrorEnvelope(envelope map[string]any) bool {
+	if flag, ok := envelope["is_error"].(bool); ok && flag {
+		return true
+	}
+	if _, ok := envelope["error"]; ok {
+		return true
+	}
+	for _, field := range []string{"subtype", "type", "status"} {
+		if text, ok := envelope[field].(string); ok &&
+			strings.Contains(strings.ToLower(text), "error") {
+			return true
+		}
+	}
+	return false
+}
+
+// envelopeStrings flattens every string in the envelope, at any depth: the marker
+// can sit in `error`, in `result`, or nested inside a message object depending on
+// which layer refused the request.
+func envelopeStrings(value any) []string {
+	switch typed := value.(type) {
+	case string:
+		return []string{typed}
+	case map[string]any:
+		texts := make([]string, 0, len(typed))
+		for _, nested := range typed {
+			texts = append(texts, envelopeStrings(nested)...)
+		}
+		return texts
+	case []any:
+		texts := make([]string, 0, len(typed))
+		for _, nested := range typed {
+			texts = append(texts, envelopeStrings(nested)...)
+		}
+		return texts
+	}
+	return nil
+}
+
+// authSignalText matches the machine-readable codes and the human sentences with
+// the same vocabulary the stderr classifier uses, so the two paths cannot drift.
+func authSignalText(cliName, text string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(text))
+	if normalized == "" {
+		return false
+	}
+	switch normalized {
+	case "authentication_failed", "unauthorized", "invalid_api_key":
+		return true
+	}
+	normalized = strings.TrimSpace(strings.TrimPrefix(normalized, "error:"))
+	switch strings.ToLower(cliName) {
+	case "claude":
+		return claudeAuthLine(normalized)
+	case "codex":
+		return codexAuthLine(normalized)
 	}
 	return false
 }

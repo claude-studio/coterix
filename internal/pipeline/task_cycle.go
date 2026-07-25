@@ -483,7 +483,9 @@ func (cycle *TaskCycle) handleMutationFailure(
 			stderrLog = result.StderrLog
 		}
 		stderr, _ := readLogTail(stderrLog, 64<<10)
-		classified = cli.ClassifyFailure(cliName, runErr, stderr)
+		// stream-json puts the auth marker in stdout only (T13a-2).
+		stdout, _ := readLogTail(result.StdoutLog, 64<<10)
+		classified = cli.ClassifyFailure(cliName, runErr, stderr, stdout)
 		_ = errors.As(classified, &authErr)
 	}
 	if authErr == nil {

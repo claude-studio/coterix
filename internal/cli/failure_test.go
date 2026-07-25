@@ -62,7 +62,7 @@ func TestClassifyFailureRecognizesKnownAuthSignatures(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			classified := ClassifyFailure(test.cli, exitErr, []byte(test.stderr))
+			classified := ClassifyFailure(test.cli, exitErr, []byte(test.stderr), nil)
 			var authErr *AuthFailure
 			if !errors.As(classified, &authErr) {
 				t.Fatalf("ClassifyFailure() = %T %v, want *AuthFailure", classified, classified)
@@ -165,7 +165,7 @@ func TestClassifyFailureFallsBackForNonAuthAndNonExitFailures(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			classified := ClassifyFailure(test.cli, test.err, []byte(test.stderr))
+			classified := ClassifyFailure(test.cli, test.err, []byte(test.stderr), nil)
 			var authErr *AuthFailure
 			if errors.As(classified, &authErr) {
 				t.Fatalf("ClassifyFailure() returned auth error: %v", classified)
@@ -182,7 +182,130 @@ func TestClassifyFailureFallsBackForNonAuthAndNonExitFailures(t *testing.T) {
 }
 
 func TestClassifyFailureIgnoresAuthTextOnSuccess(t *testing.T) {
-	if got := ClassifyFailure("claude", nil, []byte("Not logged in")); got != nil {
+	if got := ClassifyFailure("claude", nil, []byte("Not logged in"), nil); got != nil {
 		t.Fatalf("ClassifyFailure(nil) = %v, want nil", got)
+	}
+}
+
+// Measured 2026-07-25 against the real CLI: under `--output-format stream-json`
+// claude reports an auth failure only inside a stdout JSON envelope and leaves
+// stderr empty. A stderr-only classifier returned *GenericFailure, so the run never
+// reached paused_for_input{auth} and just burned its retries (T13a-2).
+func TestClassifyFailureFindsAuthMarkersInStreamJSONStdout(t *testing.T) {
+	exitErr := &runner.ExitError{
+		Attempt: 1,
+		Result:  runner.RunResult{Exit: 1},
+		Err:     errors.New("exit status 1"),
+	}
+
+	for _, test := range []struct {
+		name   string
+		cli    string
+		stdout string
+	}{
+		{
+			name: "machine readable code",
+			cli:  "claude",
+			stdout: `{"type":"system","subtype":"init","session_id":"s1"}` + "\n" +
+				`{"type":"result","subtype":"success","is_error":true,` +
+				`"error":"authentication_failed"}`,
+		},
+		{
+			name: "human sentence nested in a message",
+			cli:  "claude",
+			stdout: `{"type":"result","is_error":true,"message":` +
+				`{"content":[{"type":"text","text":"Invalid API key · Please run /login"}]}}`,
+		},
+		{
+			name:   "codex error envelope",
+			cli:    "codex",
+			stdout: `{"type":"error","error":{"message":"Not logged in"}}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// stderr is empty on purpose — that is the whole defect.
+			classified := ClassifyFailure(test.cli, exitErr, nil, []byte(test.stdout))
+			var authErr *AuthFailure
+			if !errors.As(classified, &authErr) {
+				t.Fatalf(
+					"ClassifyFailure() = %T %v, want *AuthFailure",
+					classified,
+					classified,
+				)
+			}
+			if authErr.CLI != test.cli || authErr.Kind != FailureExit {
+				t.Fatalf("auth failure = %#v", authErr)
+			}
+		})
+	}
+}
+
+// The stdout signal must not fire on ordinary output that merely mentions
+// credentials: only error envelopes are inspected, so a plan or diff quoting
+// "invalid api key" stays a generic failure (T13a-2).
+func TestClassifyFailureIgnoresAuthWordsOutsideErrorEnvelopes(t *testing.T) {
+	exitErr := &runner.ExitError{
+		Attempt: 1,
+		Result:  runner.RunResult{Exit: 1},
+		Err:     errors.New("exit status 1"),
+	}
+
+	for _, test := range []struct {
+		name   string
+		stdout string
+	}{
+		{
+			// The exact phrase, verbatim, in a *non-error* envelope: an assistant
+			// echoing the string it is asked to handle. Only the error-envelope
+			// guard separates this from a real credential failure.
+			name: "assistant echoes the phrase verbatim",
+			stdout: `{"type":"assistant","message":{"content":[{"type":"text",` +
+				`"text":"Not logged in"}]}}`,
+		},
+		{
+			name: "tool result carrying the exact phrase",
+			stdout: `{"type":"user","message":{"content":[{"type":"tool_result",` +
+				`"content":"invalid api key"}]}}`,
+		},
+		{
+			name: "successful result that happens to quote the phrase",
+			stdout: `{"type":"result","subtype":"success","is_error":false,` +
+				`"result":"added a test for not logged in"}`,
+		},
+		{
+			name:   "plain text, not JSON at all",
+			stdout: "invalid api key\nnot logged in\n",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			classified := ClassifyFailure("claude", exitErr, nil, []byte(test.stdout))
+			var authErr *AuthFailure
+			if errors.As(classified, &authErr) {
+				t.Fatalf("ordinary stdout was classified as an auth failure: %v", classified)
+			}
+			var generic *GenericFailure
+			if !errors.As(classified, &generic) {
+				t.Fatalf("ClassifyFailure() = %T, want *GenericFailure", classified)
+			}
+		})
+	}
+}
+
+// Both signals stay live: the stderr path is what plain-text mode and codex use.
+func TestClassifyFailureKeepsTheStderrSignal(t *testing.T) {
+	exitErr := &runner.ExitError{
+		Attempt: 1,
+		Result:  runner.RunResult{Exit: 1},
+		Err:     errors.New("exit status 1"),
+	}
+	classified := ClassifyFailure(
+		"claude",
+		exitErr,
+		[]byte("Invalid API key · Please run /login"),
+		[]byte(`{"type":"result","is_error":false,"result":"fine"}`),
+	)
+	var authErr *AuthFailure
+	if !errors.As(classified, &authErr) {
+		t.Fatalf("the stderr signal stopped working: %T %v", classified, classified)
 	}
 }
