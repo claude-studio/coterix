@@ -667,6 +667,256 @@ func TestPausedBoxKeepsItsLinesWhenContentArrives(t *testing.T) {
 	}
 }
 
+// The LIVE OUTPUT fix was not enough: FEED's body is replaced wholesale and
+// ACTIVITY renders a rolling tail, so a bumped offset still landed on different
+// lines in both boxes. Each path is pinned separately (review T14a-r2 f1).
+func TestPausedFeedAndActivityKeepTheirLinesToo(t *testing.T) {
+	const windowHeight = 3
+
+	t.Run("feed follows an appended artifact", func(t *testing.T) {
+		current := populatedViewModel(t)
+		previous := strings.Join([]string{
+			"plan-00", "plan-01", "plan-02", "plan-03",
+			"plan-04", "plan-05", "plan-06", "plan-07",
+		}, "\n")
+		current.artifactRender = previous
+		current.boxScroll[boxFeed] = 2
+		before := visibleLines(previous, windowHeight, 2)
+
+		next := previous + "\nplan-08\nplan-09"
+		current.artifactRender = next
+		current.reanchorFeed(previous, next)
+
+		if got := current.boxScroll[boxFeed]; got != 4 {
+			t.Fatalf("feed offset=%d want 4 — it must grow with the appended rows", got)
+		}
+		after := visibleLines(next, windowHeight, current.boxScroll[boxFeed])
+		if after != before {
+			t.Fatalf(
+				"paused feed drifted when an artifact was appended:\nbefore:\n%s\nafter:\n%s",
+				before,
+				after,
+			)
+		}
+	})
+
+	// A re-wrap or an edited artifact shares no line identity with the old body,
+	// so the offset must not park the window at an arbitrary new position.
+	t.Run("feed returns to the live edge on a real replacement", func(t *testing.T) {
+		current := populatedViewModel(t)
+		current.boxScroll[boxFeed] = 5
+		current.reanchorFeed("plan-00\nplan-01", "rewrapped-00\nrewrapped-01\nrewrapped-02")
+		if got := current.boxScroll[boxFeed]; got != 0 {
+			t.Fatalf("feed offset=%d want 0 after an incompatible replacement", got)
+		}
+	})
+
+	// The width change that re-renders the markdown goes through the same path.
+	t.Run("a width change re-anchors the feed", func(t *testing.T) {
+		current := populatedViewModel(t)
+		current.artifacts.PlanMarkdown = strings.Repeat("plan body text ", 40)
+		current.refreshArtifactRender()
+		current.boxScroll[boxFeed] = 6
+
+		current.width = wideBreakpointWidth + 40
+		current.refreshArtifactRender()
+		if got := current.boxScroll[boxFeed]; got != 0 {
+			t.Fatalf("feed offset=%d want 0 after a re-wrap at a new width", got)
+		}
+	})
+
+	t.Run("activity keeps its lines while the tail rolls", func(t *testing.T) {
+		current := feedNumberedActivity(t, populatedViewModel(t), 0, 10)
+		current.focus = boxActivity
+		for index := 0; index < 2; index++ {
+			updated, _ := current.Update(printableKey('k'))
+			current = updated.(model)
+		}
+		window := func() string {
+			return ansi.Strip(visibleLines(
+				mainBoxBody(current, boxActivity, 100, 10),
+				windowHeight,
+				current.boxScroll[boxActivity],
+			))
+		}
+		before := window()
+		if !strings.Contains(before, "line-05") {
+			t.Fatalf("paused activity window is not in history:\n%s", before)
+		}
+
+		current = feedNumberedActivity(t, current, 10, 1)
+		if after := window(); after != before {
+			t.Fatalf(
+				"paused activity drifted when the tail rolled:\nbefore:\n%s\nafter:\n%s",
+				before,
+				after,
+			)
+		}
+	})
+
+	// Scrolling back must not resize the box: the paused body is longer than the
+	// tail, and letting it set the height would steal FEED's rows mid-read.
+	t.Run("a paused activity does not grow its box", func(t *testing.T) {
+		current := feedNumberedActivity(t, populatedViewModel(t), 0, 12)
+		current.status.PendingAction = nil
+		order := mainBoxOrder(current)
+		rest := distributeMainBoxHeights(order, wantRowsFor(current, order, 100), 30, 2)
+
+		current.boxScroll[boxActivity] = 4
+		paused := distributeMainBoxHeights(order, wantRowsFor(current, order, 100), 30, 2)
+		for index := range order {
+			if rest[index] != paused[index] {
+				t.Fatalf("heights changed on scroll: rest=%v paused=%v", rest, paused)
+			}
+		}
+	})
+
+	// At the ring buffer's cap every arrival also evicts the oldest line, so the
+	// offset has to survive the shift, not just the append.
+	t.Run("offsets survive buffer eviction", func(t *testing.T) {
+		current := populatedViewModel(t)
+		current.logs = make([]logEntry, 0, maxLogLines)
+		for index := 0; index < maxLogLines; index++ {
+			current.appendLog(logEntry{Text: fmt.Sprintf("evict-%04d", index)})
+		}
+		current.focus = boxLiveOutput
+		current.boxScroll[boxLiveOutput] = 7
+		window := func() string {
+			return ansi.Strip(visibleLines(
+				lifecycleBody(current, 100),
+				windowHeight,
+				current.boxScroll[boxLiveOutput],
+			))
+		}
+		before := window()
+
+		current.appendLog(logEntry{Text: "evict-1000"})
+		if len(current.logs) != maxLogLines {
+			t.Fatalf("buffer len=%d want the cap %d", len(current.logs), maxLogLines)
+		}
+		if after := window(); after != before {
+			t.Fatalf(
+				"paused view drifted when the buffer evicted:\nbefore:\n%s\nafter:\n%s",
+				before,
+				after,
+			)
+		}
+	})
+}
+
+// The tab order is the contract's order, not the render order: PENDING renders
+// first but comes last in the cycle (review T14a-r2 f2).
+func TestFocusCycleOrderIsIndependentOfRenderOrder(t *testing.T) {
+	current := feedNumberedActivity(t, populatedViewModel(t), 0, 4)
+	current.status.PendingAction = &state.PendingAction{
+		Kind:   state.PendingTaskCap,
+		Prompt: "raise the cap or abort",
+	}
+	if first := mainBoxOrder(current)[0]; first != boxPending {
+		t.Fatalf("render order no longer leads with PENDING (got %d)", first)
+	}
+	current.focus = boxFeed
+
+	forward := []mainBox{boxLiveOutput, boxActivity, boxPending, boxSidebar, boxFeed}
+	for step, want := range forward {
+		updated, _ := current.Update(specialKey(tea.KeyTab))
+		current = updated.(model)
+		if current.focus != want {
+			t.Fatalf("tab step %d: focus=%d want=%d", step+1, current.focus, want)
+		}
+	}
+
+	backward := []mainBox{boxSidebar, boxPending, boxActivity, boxLiveOutput, boxFeed}
+	for step, want := range backward {
+		updated, _ := current.Update(tea.KeyPressMsg(tea.Key{
+			Code: tea.KeyTab,
+			Mod:  tea.ModShift,
+		}))
+		current = updated.(model)
+		if current.focus != want {
+			t.Fatalf("shift+tab step %d: focus=%d want=%d", step+1, current.focus, want)
+		}
+	}
+}
+
+// Compact has no focus, so one scroll gesture has to reach every section. Driving
+// FEED alone left the rows a squeezed ACTIVITY or LIVE OUTPUT hid unreachable —
+// a regression from the T13 single feed (review T14a-r2 f2).
+func TestCompactSingleScrollReachesEverySection(t *testing.T) {
+	current := feedNumberedActivity(t, populatedViewModel(t), 0, 10)
+	current.width = 80
+	current.height = 24
+	current.status.PendingAction = &state.PendingAction{
+		Kind:   state.PendingTaskCap,
+		Prompt: strings.Repeat("the cap was reached and the run needs a decision ", 3),
+	}
+	frame := func() string { return ansi.Strip(renderMainCompact(current, 80, 20)) }
+	if rest := frame(); strings.Contains(rest, "line-00") {
+		t.Fatalf("the oldest activity line was already visible at rest:\n%s", rest)
+	}
+
+	updated, _ := current.Update(printableKey('k'))
+	scrolled := updated.(model)
+	for _, box := range mainBoxOrder(scrolled) {
+		if scrolled.boxScroll[box] != 1 {
+			t.Fatalf(
+				"box %d offset=%d — one compact gesture must move every section",
+				box,
+				scrolled.boxScroll[box],
+			)
+		}
+	}
+
+	updated, _ = current.Update(specialKey(tea.KeyHome))
+	current = updated.(model)
+	if parked := frame(); !strings.Contains(parked, "line-00") {
+		t.Fatalf("compact scrolling cannot reach the activity history:\n%s", parked)
+	}
+
+	updated, _ = current.Update(specialKey(tea.KeyEnd))
+	current = updated.(model)
+	for _, box := range mainBoxOrder(current) {
+		if current.boxScroll[box] != 0 {
+			t.Fatalf("end left box %d at offset %d", box, current.boxScroll[box])
+		}
+	}
+}
+
+// feedNumberedActivity streams `count` distinctly numbered stdout lines starting
+// at `from`, so a test can tell an appended line from a re-sent one.
+func feedNumberedActivity(t *testing.T, current model, from, count int) model {
+	t.Helper()
+	for index := from; index < from+count; index++ {
+		line := runner.Line{
+			Attempt: 1,
+			Stream:  runner.StreamStdout,
+			Text:    fmt.Sprintf("line-%02d", index),
+		}
+		updated, _ := current.Update(pipelineEventMsg{Event: pipeline.Event{
+			Kind:  pipeline.EventStepLog,
+			RunID: "run-1",
+			Step:  pipeline.StepPlan,
+			Role:  "plan_writer",
+			CLI:   "claude",
+			Line:  &line,
+		}})
+		current = updated.(model)
+	}
+	return current
+}
+
+func wantRowsFor(current model, order []mainBox, innerWidth int) []int {
+	wants := make([]int, len(order))
+	for index, box := range order {
+		wants[index] = mainBoxWantRows(
+			current,
+			box,
+			mainBoxBody(current, box, innerWidth, 10),
+		)
+	}
+	return wants
+}
+
 // The focus contract: compact has no focus concept, focus never rests on a box
 // that is off screen, and the focused box carries a non-color cue as well as the
 // focused border color (review T14a f3).
@@ -710,8 +960,10 @@ func TestFocusContractCompactHiddenBoxesAndCues(t *testing.T) {
 		if got := resumed.normalizedFocus(); got == boxPending {
 			t.Fatal("focus stayed on the vanished PENDING box")
 		}
-		if got := resumed.scrollTarget(); got == boxPending {
-			t.Fatal("j/k would drive an off-screen offset")
+		for _, target := range resumed.scrollTargets() {
+			if target == boxPending {
+				t.Fatal("j/k would drive an off-screen offset")
+			}
 		}
 		// Some box must still be drawn as focused.
 		frame := ansi.Strip(renderMain(resumed, 140, 40))

@@ -178,10 +178,12 @@ func renderMain(current model, width, height int) string {
 	total := max(1, height-3)
 
 	bodies := make([]string, len(order))
+	wants := make([]int, len(order))
 	for index, box := range order {
 		bodies[index] = mainBoxBody(current, box, innerWidth, max(1, total/2-2))
+		wants[index] = mainBoxWantRows(current, box, bodies[index])
 	}
-	heights := distributeMainBoxHeights(order, bodies, total, 2)
+	heights := distributeMainBoxHeights(order, wants, total, 2)
 
 	parts := make([]string, 0, len(order)+1)
 	parts = append(parts, renderMainHeader(current, boxWidth))
@@ -238,6 +240,7 @@ func renderMainCompact(current model, width, height int) string {
 	innerHeight := max(1, height-2)
 	order := mainBoxOrder(current)
 	bodies := make([]string, len(order))
+	wants := make([]int, len(order))
 	for index, box := range order {
 		bodies[index] = mainBoxBody(
 			current,
@@ -245,12 +248,13 @@ func renderMainCompact(current model, width, height int) string {
 			bodyWidth,
 			max(1, innerHeight/2-1),
 		)
+		wants[index] = mainBoxWantRows(current, box, bodies[index])
 	}
 	// One row of chrome per section (its title). Sharing one budget is what keeps
 	// the bottom section from being clipped without a marker at 80x24, where a
 	// widened failure tail and a PENDING question compete for 18 rows
 	// (review round-3 f1).
-	heights := distributeMainBoxHeights(order, bodies, innerHeight, 1)
+	heights := distributeMainBoxHeights(order, wants, innerHeight, 1)
 
 	parts := make([]string, 0, len(order)*2)
 	for index, box := range order {
@@ -377,9 +381,33 @@ func mainBoxBody(current model, box mainBox, innerWidth, maxRows int) string {
 	case boxLiveOutput:
 		return lifecycleBody(current, innerWidth)
 	case boxActivity:
-		return activityBody(current, innerWidth, activityTailLimit(current))
+		return activityBody(current, innerWidth, activityRenderLimit(current))
 	}
 	return ""
+}
+
+// activityRenderLimit is how many retained lines the ACTIVITY body exposes. While
+// the box follows the live edge only the tail is rendered (T13 W2), but a paused
+// box has to render the retained buffer: rolling a 5-line tail underneath a fixed
+// offset slid the window one line per arrival, so the reader still drifted
+// (review T14a-r2 f1).
+func activityRenderLimit(current model) int {
+	if current.boxScroll[boxActivity] > 0 {
+		return 0
+	}
+	return activityTailLimit(current)
+}
+
+// mainBoxWantRows is the height a box asks for. It is the body's row count except
+// for a paused ACTIVITY, which renders its whole retained buffer: letting that
+// body set the height would grow the box (and shrink FEED) the moment the reader
+// scrolled back (review T14a-r2 f1).
+func mainBoxWantRows(current model, box mainBox, body string) int {
+	rows := countRows(body)
+	if box == boxActivity {
+		rows = min(rows, activityTailLimit(current))
+	}
+	return rows
 }
 
 // pausedBelow reports whether a box is scrolled away from its newest line *and*
@@ -420,9 +448,12 @@ func indexOfBox(order []mainBox, box mainBox) int {
 // chrome is the per-section overhead: 2 for the wide layout's box border, 1 for
 // the compact layout's section title. Both layouts must budget from the same real
 // row count or the bottom section is silently clipped (review round-3 f1).
+// wants is each box's requested content rows, parallel to order — not the body
+// itself, because a paused ACTIVITY renders more rows than it may claim
+// (mainBoxWantRows, review T14a-r2 f1).
 func distributeMainBoxHeights(
 	order []mainBox,
-	bodies []string,
+	wants []int,
 	total, chrome int,
 ) []int {
 	minRows := chrome + 1 // chrome + one content row
@@ -460,7 +491,7 @@ func distributeMainBoxHeights(
 		if index < 0 || !survivors[box] {
 			continue
 		}
-		want := countRows(bodies[index]) + chrome
+		want := wants[index] + chrome
 		switch box {
 		case boxPending:
 			want = min(want, max(minRows, total/2))

@@ -365,16 +365,24 @@ func (current model) updateKey(
 		return current.requestStop()
 	case "up", "k":
 		// Scrolling drives the focused box only (T14 W2).
-		current.boxScroll[current.scrollTarget()]++
+		for _, target := range current.scrollTargets() {
+			current.boxScroll[target]++
+		}
 	case "down", "j":
-		if target := current.scrollTarget(); current.boxScroll[target] > 0 {
-			current.boxScroll[target]--
+		for _, target := range current.scrollTargets() {
+			if current.boxScroll[target] > 0 {
+				current.boxScroll[target]--
+			}
 		}
 	case "home":
-		current.boxScroll[current.scrollTarget()] = maxScrollSentinel
+		for _, target := range current.scrollTargets() {
+			current.boxScroll[target] = maxScrollSentinel
+		}
 	case "end":
 		// Back to the live edge, which also clears the `↓ new` indicator.
-		current.boxScroll[current.scrollTarget()] = 0
+		for _, target := range current.scrollTargets() {
+			current.boxScroll[target] = 0
+		}
 	case "tab":
 		// compact has no focus concept (T14 W2) — the whole column scrolls as one.
 		if isWide(current.width, current.height) {
@@ -514,18 +522,37 @@ func (current *model) clearPrompt() {
 
 func (current *model) refreshArtifactRender() {
 	width := dashboardMainInnerWidth(current.width, current.height)
+	previous := current.artifactRender
 	current.artifactRenderWidth = width
 	current.artifactRender = ""
 	current.artifactRenderErr = nil
 	artifacts := markdownArtifacts(current.artifacts)
-	if len(artifacts) == 0 {
+	if len(artifacts) > 0 {
+		current.artifactRender, current.artifactRenderErr = renderMarkdown(
+			current.theme,
+			width,
+			artifacts,
+		)
+	}
+	current.reanchorFeed(previous, current.artifactRender)
+}
+
+// reanchorFeed keeps a paused FEED on the lines it was showing when the artifact
+// render is replaced wholesale. The body is rendered markdown with no per-line
+// identity, so the only sound test is whether the new render *extends* the old
+// one: an appended artifact keeps the reader in place, while anything else (a
+// re-wrap at a new width, an edited artifact) returns the box to the live edge
+// rather than leaving the old offset pointing at an arbitrary new position
+// (review T14a-r2 f1).
+func (current *model) reanchorFeed(previous, next string) {
+	if current.boxScroll[boxFeed] == 0 {
 		return
 	}
-	current.artifactRender, current.artifactRenderErr = renderMarkdown(
-		current.theme,
-		width,
-		artifacts,
-	)
+	if previous == "" || next == "" || !strings.HasPrefix(next, previous) {
+		current.boxScroll[boxFeed] = 0
+		return
+	}
+	current.preserveReading(boxFeed, countRows(next)-countRows(previous))
 }
 
 func (current *model) appendLog(entry logEntry) {
@@ -591,10 +618,17 @@ func mainBoxOrder(current model) []mainBox {
 	return append(order, boxFeed, boxLiveOutput, boxActivity)
 }
 
-// focusCycle is the tab order: the main pane's boxes top-to-bottom, then the
-// sidebar (T14 W2). Only boxes that are actually on screen take part.
+// focusCycle is the tab order. It is deliberately *not* mainBoxOrder: the
+// contract fixes FEED → LIVE OUTPUT → ACTIVITY → PENDING → sidebar (design-plan
+// v3 W2 line 76) while PENDING *renders* first because the run is blocked on it.
+// Reusing the render order put PENDING ahead of FEED, so `tab` from ACTIVITY
+// jumped to the sidebar (review T14a-r2 f2). Only on-screen boxes take part.
 func focusCycle(current model) []mainBox {
-	return append(mainBoxOrder(current), boxSidebar)
+	cycle := []mainBox{boxFeed, boxLiveOutput, boxActivity}
+	if hasPendingPrompt(current) {
+		cycle = append(cycle, boxPending)
+	}
+	return append(cycle, boxSidebar)
 }
 
 // normalizedFocus keeps focus on something visible. PENDING disappears when the
@@ -611,14 +645,17 @@ func (current model) normalizedFocus() mainBox {
 	return cycle[0]
 }
 
-// scrollTarget is the box j/k drives: the focused box on wide layouts, and always
-// FEED on compact, where the contract says there is no focus concept and one
-// scroll drives the single column (review T14a f3).
-func (current model) scrollTarget() mainBox {
+// scrollTargets are the boxes j/k drives. Wide layouts move the focused box
+// alone (T14 W2). Compact has no focus concept, so one gesture moves *every*
+// section of the single column: driving FEED alone left the rows that a squeezed
+// LIVE OUTPUT or ACTIVITY hid unreachable, which is a regression from the T13
+// single feed (review T14a-r2 f2). Each box keeps its own offset so a section
+// that grows still preserves its own reading position.
+func (current model) scrollTargets() []mainBox {
 	if !isWide(current.width, current.height) {
-		return boxFeed
+		return mainBoxOrder(current)
 	}
-	return current.normalizedFocus()
+	return []mainBox{current.normalizedFocus()}
 }
 
 // preserveReading keeps a paused box on the same absolute lines when new content

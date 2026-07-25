@@ -402,6 +402,32 @@ func TestLifecycleEntriesNameSourceAndStep(t *testing.T) {
 			t.Fatalf("lifecycle feed lacks %q:\n%s", want, feed)
 		}
 	}
+
+	// The role belongs to the meta column *only*. Asserting mere presence let a
+	// row read `plan_writer · plan_writer · claude started` — exactly the
+	// duplication W11 removes (review T14a-r2 f3).
+	rows := map[string]string{}
+	for _, line := range strings.Split(feed, "\n") {
+		switch {
+		case strings.Contains(line, "claude started"):
+			rows["step started"] = line
+		case strings.Contains(line, "attempt 2 exited 1"):
+			rows["attempt finished"] = line
+		}
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected one started row and one attempt row, got %v", rows)
+	}
+	for name, line := range rows {
+		if got := strings.Count(line, "plan_writer"); got != 1 {
+			t.Fatalf(
+				"the %s row names the role %d times, want exactly 1:\n%s",
+				name,
+				got,
+				line,
+			)
+		}
+	}
 }
 
 // The artifact markdown is cached at one width, so that width must equal the real
@@ -435,7 +461,7 @@ func TestArtifactCacheWidthMatchesBoxBodyWidth(t *testing.T) {
 // ACTIVITY (the live edge) must outlive FEED (review T14a f5).
 func TestBoxHeightPriorityDecidesSurvivors(t *testing.T) {
 	order := []mainBox{boxPending, boxFeed, boxLiveOutput, boxActivity}
-	bodies := []string{"question", "artifacts", "lifecycle", "activity"}
+	wants := []int{1, 1, 1, 1}
 
 	for _, testCase := range []struct {
 		name   string
@@ -456,7 +482,7 @@ func TestBoxHeightPriorityDecidesSurvivors(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			heights := distributeMainBoxHeights(
 				order,
-				bodies,
+				wants,
 				testCase.total,
 				testCase.chrome,
 			)
