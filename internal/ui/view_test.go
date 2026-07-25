@@ -133,14 +133,13 @@ func TestMainPaneRendersPlanDiffVerdictAndSplitFeed(t *testing.T) {
 	current.refreshArtifactRender()
 
 	plain := ansi.Strip(renderMain(current, 100, 80))
+	// One artifact at a time now: the tab strip names all three, the body shows
+	// the selected one (T14 W3).
 	for _, expected := range []string{
-		"Plan",
+		"1 Plan",
+		"2 Diff",
+		"3 Verdict",
 		"implement dashboard",
-		"Current diff",
-		"-old",
-		"+new",
-		"Verdict",
-		"clean",
 		"LIVE OUTPUT",
 		"impl_writer · codex started",
 		"ACTIVITY",
@@ -151,6 +150,218 @@ func TestMainPaneRendersPlanDiffVerdictAndSplitFeed(t *testing.T) {
 			t.Fatalf("main pane lacks %q:\n%s", expected, plain)
 		}
 	}
+	for _, unexpected := range []string{"-old", "+new", "clean"} {
+		if strings.Contains(plain, unexpected) {
+			t.Fatalf(
+				"the Plan tab showed another tab's artifact %q:\n%s",
+				unexpected,
+				plain,
+			)
+		}
+	}
+}
+
+// The FEED box shows one artifact at a time: `1/2/3` select and `[/]` cycle, the
+// strip lives in the box heading, and switching returns the box to the live edge
+// because the offset now measures into a different document (T14 W3).
+func TestArtifactTabsSelectCycleAndResetScroll(t *testing.T) {
+	current := tabbedViewModel(t)
+	body := func(model model) string {
+		return ansi.Strip(mainBoxBody(model, boxFeed, 90, 20))
+	}
+	if got := body(current); !strings.Contains(got, "implement dashboard") {
+		t.Fatalf("the default tab is not Plan:\n%s", got)
+	}
+
+	// The strip belongs to the heading, so it must survive into the box chrome and
+	// not cost a body row.
+	heading := ansi.Strip(strings.SplitN(
+		renderBoxCard(
+			current.theme,
+			mainBoxTitle(current, boxFeed),
+			mainBoxTitleSuffix(current, boxFeed, false),
+			"body",
+			90,
+			false,
+		),
+		"\n",
+		2,
+	)[0])
+	if !containsAll(heading, "PIPELINE FEED", "1 Plan", "2 Diff", "3 Verdict") {
+		t.Fatalf("the tab strip is not in the box heading: %q", heading)
+	}
+
+	for _, testCase := range []struct {
+		key  rune
+		want string
+	}{
+		{'2', "+new"},
+		{'3', "clean"},
+		{'1', "implement dashboard"},
+	} {
+		updated, _ := current.Update(printableKey(testCase.key))
+		current = updated.(model)
+		if got := body(current); !strings.Contains(got, testCase.want) {
+			t.Fatalf("key %q did not select its artifact:\n%s", testCase.key, got)
+		}
+	}
+
+	// `]` cycles forward and wraps; `[` cycles back.
+	for _, want := range []artifactTab{tabDiff, tabVerdict, tabPlan} {
+		updated, _ := current.Update(printableKey(']'))
+		current = updated.(model)
+		if current.artifactTab != want {
+			t.Fatalf("] moved to tab %d want %d", current.artifactTab, want)
+		}
+	}
+	for _, want := range []artifactTab{tabVerdict, tabDiff, tabPlan} {
+		updated, _ := current.Update(printableKey('['))
+		current = updated.(model)
+		if current.artifactTab != want {
+			t.Fatalf("[ moved to tab %d want %d", current.artifactTab, want)
+		}
+	}
+
+	current.boxScroll[boxFeed] = 6
+	updated, _ := current.Update(printableKey('2'))
+	current = updated.(model)
+	if current.boxScroll[boxFeed] != 0 {
+		t.Fatalf(
+			"switching tabs left the box at offset %d in a different document",
+			current.boxScroll[boxFeed],
+		)
+	}
+}
+
+// A heading too narrow for both drops the tab strip whole and keeps the title.
+// Truncating into the strip would cut between a colour and its reset, and the row
+// must still be exactly `width` cells so the border closes (T14 W3).
+func TestNarrowBoxHeadingDropsTheTabStripNotTheTitle(t *testing.T) {
+	current := tabbedViewModel(t)
+	suffix := mainBoxTitleSuffix(current, boxFeed, false)
+
+	for _, width := range []int{24, 30, 34, 90} {
+		heading := strings.SplitN(renderBoxCard(
+			current.theme,
+			mainBoxTitle(current, boxFeed),
+			suffix,
+			"body",
+			width,
+			false,
+		), "\n", 2)[0]
+		plain := ansi.Strip(heading)
+		if got := ansi.StringWidth(plain); got != width {
+			t.Fatalf("width=%d heading spans %d cells: %q", width, got, plain)
+		}
+		// Partial tabs are the failure mode: either the whole strip is there or
+		// none of it.
+		labels := 0
+		for _, label := range []string{"1 Plan", "2 Diff", "3 Verdict"} {
+			if strings.Contains(plain, label) {
+				labels++
+			}
+		}
+		if labels != 0 && labels != 3 {
+			t.Fatalf("width=%d kept %d of 3 tabs: %q", width, labels, plain)
+		}
+		if labels == 0 && !strings.Contains(plain, "PIPELINE") {
+			t.Fatalf("width=%d dropped the title instead of the strip: %q", width, plain)
+		}
+	}
+}
+
+// An empty tab stays selectable and says what is missing; the strip marks it
+// without relying on colour (color-system.md) — T14 W3.
+func TestEmptyArtifactTabStaysSelectableAndNamesWhatIsMissing(t *testing.T) {
+	current := populatedViewModel(t)
+	current.artifacts = artifactData{PlanMarkdown: "# Plan\n\n- only a plan\n"}
+	current.refreshArtifactRender()
+
+	strip := ansi.Strip(renderArtifactTabs(current))
+	if !containsAll(strip, "(2 Diff)", "(3 Verdict)") {
+		t.Fatalf("empty tabs carry no non-color cue: %q", strip)
+	}
+	if strings.Contains(strip, "(1 Plan)") {
+		t.Fatalf("the populated tab was marked empty: %q", strip)
+	}
+
+	updated, _ := current.Update(printableKey('2'))
+	current = updated.(model)
+	if current.artifactTab != tabDiff {
+		t.Fatal("an empty tab refused selection")
+	}
+	if got := ansi.Strip(mainBoxBody(current, boxFeed, 90, 20)); !strings.Contains(
+		got,
+		"No diff yet",
+	) {
+		t.Fatalf("the empty tab does not name what is missing: %q", got)
+	}
+}
+
+// The active tab carries Primary *and* bold, so the selection survives a terminal
+// that drops colour (color-system.md: never state by colour alone) — T14 W3.
+func TestActiveArtifactTabCarriesColorAndWeight(t *testing.T) {
+	current := tabbedViewModel(t)
+	strip := renderArtifactTabs(current)
+
+	// Lowercase letters are unique to the strip: the box heading around it is all
+	// caps, so "l" can only come from "Plan" and "i" from "Diff".
+	active := findStyledCell(t, strip, "l")
+	assertSameColor(
+		t,
+		active.Style.Fg,
+		lipgloss.Color(current.theme.tokens.Theme.Primary),
+	)
+	if active.Style.Attrs&uv.AttrBold == 0 {
+		t.Fatal("the active tab is signalled by colour alone")
+	}
+
+	inactive := findStyledCell(t, strip, "i")
+	assertSameColor(
+		t,
+		inactive.Style.Fg,
+		lipgloss.Color(current.theme.tokens.Theme.FGMostSubtle),
+	)
+	if inactive.Style.Attrs&uv.AttrBold != 0 {
+		t.Fatal("an inactive tab is bold, so weight no longer marks the active one")
+	}
+
+	// The same has to hold *inside the box heading*: the strip is multi-colour, so
+	// putting it through the heading's single style would flatten it.
+	heading := strings.SplitN(renderBoxCard(
+		current.theme,
+		mainBoxTitle(current, boxFeed),
+		mainBoxTitleSuffix(current, boxFeed, false),
+		"body",
+		90,
+		false,
+	), "\n", 2)[0]
+	assertSameColor(
+		t,
+		findStyledCell(t, heading, "l").Style.Fg,
+		lipgloss.Color(current.theme.tokens.Theme.Primary),
+	)
+	assertSameColor(
+		t,
+		findStyledCell(t, heading, "i").Style.Fg,
+		lipgloss.Color(current.theme.tokens.Theme.FGMostSubtle),
+	)
+}
+
+func tabbedViewModel(t *testing.T) model {
+	t.Helper()
+	current := populatedViewModel(t)
+	diff := "@@ file.go @@\n-old\n+new\n"
+	current.artifacts = artifactData{
+		PlanMarkdown: "# Plan\n\n- implement dashboard\n",
+		DiffContent:  &diff,
+		Verdicts: []namedVerdict{{
+			Name: "review.json",
+			JSON: `{"clean":true}`,
+		}},
+	}
+	current.refreshArtifactRender()
+	return current
 }
 
 // The header's right slot names what is running rather than showing a fixed

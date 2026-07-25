@@ -208,14 +208,14 @@ func renderMain(current model, width, height int) string {
 			}
 			body = strings.Join(lines, "\n")
 		}
-		title := mainBoxTitle(current, box)
-		if pausedBelow(bodies[index], heights[index]-2, current.boxScroll[box]) {
-			// The box is parked in history: say so, and `end` brings it back.
-			title += " · ↓ new"
-		}
 		parts = append(parts, renderBoxCard(
 			current.theme,
-			title,
+			mainBoxTitle(current, box),
+			mainBoxTitleSuffix(
+				current,
+				box,
+				pausedBelow(bodies[index], heights[index]-2, current.boxScroll[box]),
+			),
 			body,
 			boxWidth,
 			current.normalizedFocus() == box,
@@ -261,13 +261,19 @@ func renderMainCompact(current model, width, height int) string {
 		if heights[index] < 2 {
 			continue
 		}
-		title := "╱╱╱ " + mainBoxTitle(current, box)
-		if pausedBelow(bodies[index], heights[index]-1, current.boxScroll[box]) {
-			title += " · ↓ new"
+		title := current.theme.styles.SectionTitle.Render(
+			"╱╱╱ " + mainBoxTitle(current, box),
+		)
+		if suffix := mainBoxTitleSuffix(
+			current,
+			box,
+			pausedBelow(bodies[index], heights[index]-1, current.boxScroll[box]),
+		); suffix != "" {
+			title += "  " + suffix
 		}
 		parts = append(
 			parts,
-			current.theme.styles.SectionTitle.Render(title),
+			title,
 			visibleLines(
 				bodies[index],
 				heights[index]-1,
@@ -295,7 +301,12 @@ func artifactBody(current model) string {
 	if current.artifactRender != "" {
 		return current.artifactRender
 	}
-	return current.theme.styles.Muted.Render("⋯ No artifacts yet")
+	// An empty tab stays selectable, so it has to say what is missing rather than
+	// leave the box blank (T14 W3).
+	return current.theme.styles.Muted.Render(
+		"⋯ No " + strings.ToLower(artifactTabLabels[current.artifactTab]) +
+			" yet",
+	)
 }
 
 func lifecycleBody(current model, innerWidth int) string {
@@ -370,6 +381,20 @@ func mainBoxTitle(current model, box mainBox) string {
 		return "ACTIVITY"
 	}
 	return ""
+}
+
+// mainBoxTitleSuffix is the styled trailing chrome of a box heading: FEED carries
+// the artifact tab strip (T14 W3), and any parked box carries the `↓ new` cue.
+func mainBoxTitleSuffix(current model, box mainBox, paused bool) string {
+	parts := make([]string, 0, 2)
+	if box == boxFeed {
+		parts = append(parts, renderArtifactTabs(current))
+	}
+	if paused {
+		// The box is parked in history: say so, and `end` brings it back.
+		parts = append(parts, current.theme.styles.Muted.Render("↓ new"))
+	}
+	return strings.Join(parts, current.theme.styles.Muted.Render(" · "))
 }
 
 func mainBoxBody(current model, box mainBox, innerWidth, maxRows int) string {
@@ -694,29 +719,62 @@ func renderMainHeader(current model, width int) string {
 	return alignStatusLine(left, right, max(1, width))
 }
 
-func markdownArtifacts(data artifactData) []markdownArtifact {
-	artifacts := make([]markdownArtifact, 0, 2+len(data.Verdicts))
-	if strings.TrimSpace(data.PlanMarkdown) != "" {
-		artifacts = append(artifacts, markdownArtifact{
-			Title:   "Plan",
-			Content: data.PlanMarkdown,
-		})
+// markdownArtifacts returns only the selected tab's artifacts: the FEED box shows
+// one kind at a time instead of stacking all three (T14 W3).
+func markdownArtifacts(data artifactData, tab artifactTab) []markdownArtifact {
+	switch tab {
+	case tabPlan:
+		if strings.TrimSpace(data.PlanMarkdown) != "" {
+			return []markdownArtifact{{
+				Title:   "Plan",
+				Content: data.PlanMarkdown,
+			}}
+		}
+	case tabDiff:
+		if data.DiffContent != nil && strings.TrimSpace(*data.DiffContent) != "" {
+			return []markdownArtifact{{
+				Title:    "Current diff",
+				Content:  *data.DiffContent,
+				Language: "diff",
+			}}
+		}
+	case tabVerdict:
+		artifacts := make([]markdownArtifact, 0, len(data.Verdicts))
+		for _, verdict := range data.Verdicts {
+			artifacts = append(artifacts, markdownArtifact{
+				Title:    "Verdict · " + verdict.Name,
+				Content:  verdict.JSON,
+				Language: "json",
+			})
+		}
+		return artifacts
 	}
-	if data.DiffContent != nil && strings.TrimSpace(*data.DiffContent) != "" {
-		artifacts = append(artifacts, markdownArtifact{
-			Title:    "Current diff",
-			Content:  *data.DiffContent,
-			Language: "diff",
-		})
+	return nil
+}
+
+var artifactTabLabels = [artifactTabCount]string{"Plan", "Diff", "Verdict"}
+
+// renderArtifactTabs draws the FEED box's tab strip. The active tab is Primary and
+// bold — bold is the non-color half of the cue — and a tab with nothing behind it
+// is wrapped in parentheses so "empty" does not rely on the Muted colour alone
+// (color-system.md: never state by colour alone). T14 W3.
+func renderArtifactTabs(current model) string {
+	parts := make([]string, 0, artifactTabCount)
+	for tab := artifactTab(0); tab < artifactTabCount; tab++ {
+		label := fmt.Sprintf("%d %s", tab+1, artifactTabLabels[tab])
+		if len(markdownArtifacts(current.artifacts, tab)) == 0 {
+			label = "(" + label + ")"
+		}
+		style := current.theme.styles.Muted
+		if tab == current.artifactTab {
+			style = current.theme.styles.TabActive
+		}
+		parts = append(parts, style.Render(label))
 	}
-	for _, verdict := range data.Verdicts {
-		artifacts = append(artifacts, markdownArtifact{
-			Title:    "Verdict · " + verdict.Name,
-			Content:  verdict.JSON,
-			Language: "json",
-		})
-	}
-	return artifacts
+	return strings.Join(
+		parts,
+		current.theme.styles.Muted.Render(" · "),
+	)
 }
 
 // renderLogLine renders one columnar feed row:
@@ -817,6 +875,7 @@ func renderSidebar(current model, width, height int) string {
 	pipelineCard := renderBoxCard(
 		current.theme,
 		"PIPELINE",
+		"",
 		renderStepper(current.theme, deriveStepper(current), innerWidth),
 		cardWidth,
 		focused,
@@ -824,6 +883,7 @@ func renderSidebar(current model, width, height int) string {
 	statusCard := renderBoxCard(
 		current.theme,
 		"STATUS",
+		"",
 		renderSidebarBody(
 			current.theme,
 			deriveSidebar(current),

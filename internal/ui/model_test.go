@@ -989,7 +989,7 @@ func TestFocusContractCompactHiddenBoxesAndCues(t *testing.T) {
 			t,
 			findStyledCell(
 				t,
-				renderBoxCard(focused.theme, "T", "body", 20, true),
+				renderBoxCard(focused.theme, "T", "", "body", 20, true),
 				"╭",
 			).Style.Fg,
 			lipgloss.Color(focused.theme.tokens.Component.BorderFocused),
@@ -998,7 +998,7 @@ func TestFocusContractCompactHiddenBoxesAndCues(t *testing.T) {
 			t,
 			findStyledCell(
 				t,
-				renderBoxCard(focused.theme, "T", "body", 20, false),
+				renderBoxCard(focused.theme, "T", "", "body", 20, false),
 				"╭",
 			).Style.Fg,
 			lipgloss.Color(focused.theme.tokens.Theme.Separator),

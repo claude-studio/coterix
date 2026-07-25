@@ -295,14 +295,22 @@ func renderSidebarCard(
 	body string,
 	width int,
 ) string {
-	return renderBoxCard(currentTheme, title, body, width, false)
+	return renderBoxCard(currentTheme, title, "", body, width, false)
 }
 
 // renderBoxCard is renderSidebarCard generalized over focus so the main pane can
 // draw the same chrome and mark which box `j/k` currently drives (T14 W1/W2).
+//
+// suffix is already-styled trailing chrome for the heading — the artifact tab
+// strip and the `↓ new` cue. It is separate from `title` so the two can lose room
+// differently: the title is truncated to fit, but the suffix is dropped whole,
+// because `ansi.TruncateWc` through a multi-colour strip cuts between a colour and
+// its reset. (Passing it inside `title` would *not* flatten its colours —
+// lipgloss keeps nested sequences; measured, T14 W3.)
 func renderBoxCard(
 	currentTheme theme,
 	title string,
+	suffix string,
 	body string,
 	width int,
 	focused bool,
@@ -317,16 +325,26 @@ func renderBoxCard(
 		title = "▸ " + title
 	}
 
-	// Top border cells: "╭─ " + title + " " + fill + "╮" == width.
+	// Top border cells: "╭─ " + heading + " " + fill + "╮" == width, where the
+	// heading is `title` plus, if it fits, "  " + suffix. The suffix is dropped
+	// whole rather than truncated: cutting into its styling would leave a dangling
+	// escape sequence, and the title is the part that must survive.
+	heading := currentTheme.styles.SectionTitle.Render(title)
 	titleWidth := ansi.StringWidth(title)
+	if suffixWidth := ansi.StringWidth(suffix); suffixWidth > 0 &&
+		width-5-titleWidth-2-suffixWidth >= 0 {
+		heading += "  " + suffix
+		titleWidth += 2 + suffixWidth
+	}
 	fill := width - 5 - titleWidth
 	if fill < 0 {
-		title = ansi.TruncateWc(title, max(1, titleWidth+fill), "…")
+		title = ansi.TruncateWc(title, max(1, ansi.StringWidth(title)+fill), "…")
+		heading = currentTheme.styles.SectionTitle.Render(title)
 		titleWidth = ansi.StringWidth(title)
 		fill = max(0, width-5-titleWidth)
 	}
 	top := border.Render("╭─ ") +
-		currentTheme.styles.SectionTitle.Render(title) +
+		heading +
 		border.Render(" "+strings.Repeat("─", fill)+"╮")
 
 	lines := strings.Split(strings.TrimSuffix(body, "\n"), "\n")

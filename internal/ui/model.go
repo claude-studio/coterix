@@ -53,6 +53,19 @@ const (
 // maxScrollSentinel parks a box at its oldest line; visibleLines clamps it.
 const maxScrollSentinel = 1 << 20
 
+// artifactTab selects which artifact the FEED box shows. Stacking plan, diff and
+// verdicts vertically made the box a scrolling wall, so they became tabs (T14 W3).
+type artifactTab uint8
+
+const (
+	tabPlan artifactTab = iota
+	tabDiff
+	// tabVerdict holds *every* verdict. A run can produce several, and one tab per
+	// verdict would make the count dynamic — `1/2/3` could no longer name them.
+	tabVerdict
+	artifactTabCount
+)
+
 type promptMode uint8
 
 const (
@@ -120,6 +133,7 @@ type model struct {
 	artifactRender      string
 	artifactRenderErr   error
 	artifactRenderWidth int
+	artifactTab         artifactTab
 	focus               mainBox
 	// boxScroll is each box's distance from its newest line. 0 means "follow the
 	// live edge". A paused box (>0) is nudged by preserveReading when content
@@ -383,6 +397,18 @@ func (current model) updateKey(
 		for _, target := range current.scrollTargets() {
 			current.boxScroll[target] = 0
 		}
+	case "1":
+		current.selectArtifactTab(tabPlan)
+	case "2":
+		current.selectArtifactTab(tabDiff)
+	case "3":
+		current.selectArtifactTab(tabVerdict)
+	case "]":
+		current.selectArtifactTab((current.artifactTab + 1) % artifactTabCount)
+	case "[":
+		current.selectArtifactTab(
+			(current.artifactTab + artifactTabCount - 1) % artifactTabCount,
+		)
 	case "tab":
 		// compact has no focus concept (T14 W2) — the whole column scrolls as one.
 		if isWide(current.width, current.height) {
@@ -520,13 +546,26 @@ func (current *model) clearPrompt() {
 	current.promptError = ""
 }
 
+// selectArtifactTab switches which artifact the FEED box shows. The offset is
+// reset because it measures a distance into a *different* document now — carrying
+// it over would park the reader at an arbitrary place in the new one (T14 W3).
+// An empty tab is still selectable: it renders its own "nothing here yet" body.
+func (current *model) selectArtifactTab(tab artifactTab) {
+	if tab == current.artifactTab {
+		return
+	}
+	current.artifactTab = tab
+	current.boxScroll[boxFeed] = 0
+	current.refreshArtifactRender()
+}
+
 func (current *model) refreshArtifactRender() {
 	width := dashboardMainInnerWidth(current.width, current.height)
 	previous := current.artifactRender
 	current.artifactRenderWidth = width
 	current.artifactRender = ""
 	current.artifactRenderErr = nil
-	artifacts := markdownArtifacts(current.artifacts)
+	artifacts := markdownArtifacts(current.artifacts, current.artifactTab)
 	if len(artifacts) > 0 {
 		current.artifactRender, current.artifactRenderErr = renderMarkdown(
 			current.theme,
