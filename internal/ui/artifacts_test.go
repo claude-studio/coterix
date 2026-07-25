@@ -454,26 +454,29 @@ func TestLoadChangedFilesRefusesUnsafeInput(t *testing.T) {
 	valid := strings.Repeat("a", 40)
 	other := strings.Repeat("b", 40)
 
+	// `wantErrContains` matters: a malformed id makes git fail too, so asserting merely
+	// "an error happened" passes with or without the guard. The message is what proves the
+	// input was rejected *before* exec (self-correction — the mutation passed until this).
 	for _, test := range []struct {
-		name      string
-		base      *string
-		candidate *string
-		wantErr   bool
+		name            string
+		base            *string
+		candidate       *string
+		wantErrContains string
 	}{
 		{name: "no base"},
 		{name: "no candidate", base: &valid},
 		{name: "identical", base: &valid, candidate: &valid},
 		{
-			name:      "malformed base",
-			base:      pointerTo("../../etc/passwd"),
-			candidate: &other,
-			wantErr:   true,
+			name:            "malformed base",
+			base:            pointerTo("../../etc/passwd"),
+			candidate:       &other,
+			wantErrContains: "invalid base_sha",
 		},
 		{
-			name:      "malformed candidate",
-			base:      &valid,
-			candidate: pointerTo("HEAD; rm -rf /"),
-			wantErr:   true,
+			name:            "malformed candidate",
+			base:            &valid,
+			candidate:       pointerTo("HEAD; rm -rf /"),
+			wantErrContains: "invalid candidate_sha",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -483,9 +486,13 @@ func TestLoadChangedFilesRefusesUnsafeInput(t *testing.T) {
 				test.base,
 				test.candidate,
 			)
-			if test.wantErr {
+			if test.wantErrContains != "" {
 				if err == nil {
 					t.Fatal("an invalid object id was accepted")
+				}
+				if !strings.Contains(err.Error(), test.wantErrContains) {
+					t.Fatalf("err=%v, want it rejected by %q before reaching git",
+						err, test.wantErrContains)
 				}
 				return
 			}
