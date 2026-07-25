@@ -368,9 +368,16 @@ func loadChangedFiles(
 	statContext, cancel := context.WithTimeout(ctx, diffTimeout)
 	defer cancel()
 
+	// core.quotePath=false is what makes a CJK path readable. Measured (2026-07-25):
+	// with git's default, `한글.txt` arrives as `"\355\225\234\352\270\200.txt"` — octal
+	// escapes the operator cannot read. With the flag it arrives as raw UTF-8, while a
+	// path containing a tab is **still** quoted, so the tab-separated format stays
+	// unambiguous and the parse below stays safe.
 	command := exec.CommandContext(
 		statContext,
 		"git",
+		"-c",
+		"core.quotePath=false",
 		"diff",
 		"--no-color",
 		"--no-ext-diff",

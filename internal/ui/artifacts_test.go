@@ -389,6 +389,8 @@ func TestLoadChangedFilesParsesBinaryAndRenameShapes(t *testing.T) {
 	// Measured (2026-07-25): git writes a trailing-space path **unquoted**, as
 	// `1\t0\ttrail.txt \n`, so trimming the whole line renames the file (review T13b f3).
 	writeArtifactTestFile(t, filepath.Join(repoRoot, "trail.txt "), []byte("one\n"))
+	// And a CJK path is octal-escaped unless core.quotePath=false, which the loader sets.
+	writeArtifactTestFile(t, filepath.Join(repoRoot, "한글.txt"), []byte("one\n"))
 	git("add", ".")
 	git("commit", "--quiet", "-m", "base")
 	baseSHA := git("rev-parse", "HEAD")
@@ -406,6 +408,7 @@ func TestLoadChangedFilesParsesBinaryAndRenameShapes(t *testing.T) {
 		[]byte{7, 6, 5, 4, 3, 2, 1, 0},
 	)
 	writeArtifactTestFile(t, filepath.Join(repoRoot, "trail.txt "), []byte("one\ntwo\n"))
+	writeArtifactTestFile(t, filepath.Join(repoRoot, "한글.txt"), []byte("one\ntwo\n"))
 	git("add", "-A")
 	git("commit", "--quiet", "-m", "candidate")
 	candidateSHA := git("rev-parse", "HEAD")
@@ -419,8 +422,8 @@ func TestLoadChangedFilesParsesBinaryAndRenameShapes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) != 4 {
-		t.Fatalf("changed files = %#v, want four entries", files)
+	if len(files) != 5 {
+		t.Fatalf("changed files = %#v, want five entries", files)
 	}
 	byPath := make(map[string]changedFile, len(files))
 	for _, file := range files {
@@ -439,6 +442,10 @@ func TestLoadChangedFilesParsesBinaryAndRenameShapes(t *testing.T) {
 	// The path is what git said it was, byte for byte — the trailing space included.
 	if got, ok := byPath["trail.txt "]; !ok || got.Additions != 1 {
 		t.Fatalf("trailing-space path = %#v", byPath)
+	}
+	// A CJK path is readable, not octal-escaped: the loader passes core.quotePath=false.
+	if got, ok := byPath["한글.txt"]; !ok || got.Additions != 1 {
+		t.Fatalf("CJK path = %#v", byPath)
 	}
 	// The rename keeps git's own `old => new` rendering, which is what the operator wants
 	// to read; it must not be split into two bogus entries.
