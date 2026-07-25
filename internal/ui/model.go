@@ -326,7 +326,12 @@ func (current model) dispatchInitialOperation(
 // no answer — the operator logs in outside the dashboard and the run just resumes.
 func (current model) promptForPendingAction() (tea.Model, tea.Cmd) {
 	if current.status.PendingAction == nil {
-		return current, nil
+		// Nothing is waiting for an answer, so there is nothing to prompt for — but
+		// swallowing the request left `coterix resume <id>` on a done run sitting in a
+		// blank dashboard that then exited 0, while the headless command exits 1.
+		// Dispatching lets the controller return its own validation error, which the
+		// feed shows and ui.Open returns (review T15 f1).
+		return current.beginOperation(operationResume, nil)
 	}
 	if current.status.PendingAction.Kind == state.PendingAuth {
 		return current.beginOperation(operationResume, nil)

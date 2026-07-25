@@ -2698,8 +2698,12 @@ func TestOpenSeedsThroughTheSnapshotAndDispatchesOnce(t *testing.T) {
 				t.Fatalf("a second snapshot redispatched: %q -> %q",
 					before, again.operation)
 			}
-			if len(fake.calls) > 1 {
-				t.Fatalf("the control plane was called %d times", len(fake.calls))
+			// `beginOperation` starts the core call immediately — operationTracker.start
+			// launches its goroutine at construction, not when the Cmd is executed — so
+			// the call log has to be read after that goroutine is done, not racily
+			// alongside it (review T15 f2).
+			if current.operation != "" {
+				current.tracker.waitLatest()
 			}
 		})
 	}
