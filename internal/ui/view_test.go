@@ -2107,10 +2107,12 @@ func TestChangedFilesYieldToInterventionSignals(t *testing.T) {
 	}
 }
 
-// pressureChangedFileCount is how many files the pressure repository changes. Nine is
-// past maxChangedFilesShown, so the hidden count is always exercised, and one addition
-// plus alternating deletions keeps `9 files (M hidden) · +9/-4` inside the rail's 26
-// inner cells — a wider total would be truncated and could not be asserted whole.
+// pressureChangedFileCount is how many files the pressure repository changes. Nine is past
+// maxChangedFilesShown, so the hidden count is exercised whenever the section renders at all
+// — the yielding case drops the section and with it the count — and one addition plus
+// alternating deletions keeps `9 files (M hidden) · +9/-4` at exactly the rail's 26 inner
+// cells. A wider total would be truncated and could not be asserted whole: the +45/-36 the
+// first draft produced needs 28.
 const pressureChangedFileCount = 9
 
 // pressureAttemptsToCap is how many completed attempts leave the next BeginTaskAttempt at
